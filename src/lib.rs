@@ -29,6 +29,8 @@ pub struct Tableau {
 
     // LU factors of the basis matrix
     lu_factors: LUFactors,
+    lu_factors_transp: LUFactors,
+
     eta_matrices: Vec<EtaMatrix>,
     rhs: ScatteredVec,
     row_coeffs: ScatteredVec,
@@ -192,6 +194,7 @@ impl Tableau {
 
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
         let lu_factors = lu_factorize(&orig_constraints_csc, &basic_vars, 0.1, &mut scratch);
+        let lu_factors_transp = lu_factors.transpose();
 
         let cur_bounds = orig_bounds.clone();
         Tableau {
@@ -203,6 +206,7 @@ impl Tableau {
             orig_constraints_csc,
             orig_bounds,
             lu_factors,
+            lu_factors_transp,
             eta_matrices: vec![],
             rhs: ScatteredVec::empty(num_constraints),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
@@ -577,6 +581,7 @@ impl Tableau {
                 0.1,
                 &mut self.scratch,
             );
+            self.lu_factors_transp = self.lu_factors.transpose();
         }
     }
 
@@ -618,8 +623,8 @@ impl Tableau {
             *self.rhs.get_mut(eta.r_leaving) -= coeff;
         }
 
-        self.lu_factors
-            .solve_transp(&mut self.rhs, &mut self.scratch);
+        self.lu_factors_transp
+            .solve(&mut self.rhs, &mut self.scratch);
 
         self.row_coeffs.clear();
         for (r, &coeff) in self.rhs.to_csvec().iter() {
@@ -816,6 +821,7 @@ impl Tableau {
             0.1,
             &mut self.scratch,
         );
+        self.lu_factors_transp = self.lu_factors.transpose();
 
         let mut cur_bounds = self.orig_bounds.clone();
         for (&var, &val) in self.set_vars.iter() {
@@ -823,7 +829,7 @@ impl Tableau {
                 cur_bounds[r] -= val * coeff;
             }
         }
-        self.lu_factors.solve_dense(&mut cur_bounds);
+        self.lu_factors.solve_dense(&mut cur_bounds, &mut self.scratch);
         self.cur_bounds = cur_bounds;
         for b in &mut self.cur_bounds {
             if f64::abs(*b) < 1e-8 {
@@ -844,7 +850,7 @@ impl Tableau {
             for (c, &var) in self.basic_vars.iter().enumerate() {
                 obj_coeffs[c] = -self.orig_obj[var];
             }
-            self.lu_factors.solve_dense_transp(&mut obj_coeffs);
+            self.lu_factors_transp.solve_dense(&mut obj_coeffs, &mut self.scratch);
             ArrayVec::from(obj_coeffs)
         };
 
@@ -1039,8 +1045,8 @@ fn into_resized(vec: CsVec<f64>, len: usize) -> CsVec<f64> {
 
 #[cfg(test)]
 mod tests {
-    use helpers::{assert_matrix_eq, to_sparse};
     use super::*;
+    use helpers::{assert_matrix_eq, to_sparse};
 
     #[test]
     fn initialize() {

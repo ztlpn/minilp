@@ -1,17 +1,27 @@
-use sprs::{linalg::trisolve, CsMat, CsMatView, CsVec, CsVecView, TriMat};
 use crate::helpers::to_dense;
+use sprs::{linalg::trisolve, CsMat, CsMatView, CsVec, CsVecView, TriMat};
 
 #[derive(Clone)]
 pub struct LUFactors {
     lower: CsMat<f64>,
-    lower_transp_csc: CsMat<f64>,
-
     upper: CsMat<f64>,
-    upper_transp_csc: CsMat<f64>,
+    row_perm: Option<Perm>,
+    col_perm: Option<Perm>,
+}
 
-    orig2new_row: Box<[usize]>,
-    new2orig_row: Box<[usize]>,
-    swaps: Box<[usize]>,
+#[derive(Clone)]
+pub struct Perm {
+    orig2new: Vec<usize>,
+    new2orig: Vec<usize>,
+}
+
+impl Perm {
+    fn inv(self) -> Perm {
+        Perm {
+            orig2new: self.new2orig,
+            new2orig: self.orig2new,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +109,7 @@ impl ScatteredVec {
 #[derive(Clone, Debug)]
 pub struct ScratchSpace {
     rhs: ScatteredVec,
+    dense_rhs: Vec<f64>,
     mark_nonzero: MarkNonzero,
 }
 
@@ -106,6 +117,7 @@ impl ScratchSpace {
     pub fn with_capacity(n: usize) -> ScratchSpace {
         ScratchSpace {
             rhs: ScatteredVec::empty(n),
+            dense_rhs: vec![0.0; n],
             mark_nonzero: MarkNonzero::with_capacity(n),
         }
     }
@@ -121,7 +133,16 @@ impl std::fmt::Debug for LUFactors {
         for row in self.upper.to_csr().outer_iterator() {
             write!(f, "{:?}\n", to_dense(&row))?
         }
-        write!(f, "new2orig_row: {:?}\n", self.new2orig_row)?;
+        write!(
+            f,
+            "row_perm.new2orig: {:?}\n",
+            self.row_perm.as_ref().map(|p| &p.new2orig)
+        )?;
+        write!(
+            f,
+            "col_perm.new2orig: {:?}\n",
+            self.col_perm.as_ref().map(|p| &p.new2orig)
+        )?;
 
         Ok(())
     }
@@ -132,52 +153,63 @@ impl LUFactors {
         self.lower.nnz() + self.upper.nnz()
     }
 
-    pub fn solve_dense(&self, rhs: &mut [f64]) {
-        for i in 0..rhs.len() {
-            rhs.swap(i, self.swaps[i]);
-        }
-        trisolve::lsolve_csc_dense_rhs(self.lower.view(), rhs).unwrap();
-        trisolve::usolve_csc_dense_rhs(self.upper.view(), rhs).unwrap();
-    }
+    pub fn solve_dense(&self, rhs: &mut [f64], scratch: &mut ScratchSpace) {
+        scratch.dense_rhs.resize(rhs.len(), 0.0);
 
-    pub fn solve_dense_transp(&self, rhs: &mut [f64]) {
-        trisolve::lsolve_csr_dense_rhs(self.upper.transpose_view(), rhs).unwrap();
-        trisolve::usolve_csr_dense_rhs(self.lower.transpose_view(), rhs).unwrap();
-        for i in (0..rhs.len()).rev() {
-            rhs.swap(i, self.swaps[i]);
+        if let Some(row_perm) = &self.row_perm {
+            for i in 0..rhs.len() {
+                scratch.dense_rhs[row_perm.orig2new[i]] = rhs[i];
+            }
+        } else {
+            scratch.dense_rhs.copy_from_slice(rhs);
+        }
+
+        trisolve::lsolve_csc_dense_rhs(self.lower.view(), &mut scratch.dense_rhs).unwrap();
+        trisolve::usolve_csc_dense_rhs(self.upper.view(), &mut scratch.dense_rhs).unwrap();
+
+        if let Some(col_perm) = &self.col_perm {
+            for i in 0..rhs.len() {
+                rhs[col_perm.orig2new[i]] = scratch.dense_rhs[i];
+            }
+        } else {
+            rhs.copy_from_slice(&mut scratch.dense_rhs);
         }
     }
 
     pub fn solve(&self, rhs: &mut ScatteredVec, scratch: &mut ScratchSpace) {
-        scratch.rhs.clear();
-        for &i in &rhs.nonzero {
-            let new_i = self.orig2new_row[i];
-            scratch.rhs.nonzero.push(new_i);
-            scratch.rhs.is_nonzero[new_i] = true;
-            scratch.rhs.values[new_i] = rhs.values[i];
+        if let Some(row_perm) = &self.row_perm {
+            scratch.rhs.clear();
+            for &i in &rhs.nonzero {
+                let new_i = row_perm.orig2new[i];
+                scratch.rhs.nonzero.push(new_i);
+                scratch.rhs.is_nonzero[new_i] = true;
+                scratch.rhs.values[new_i] = rhs.values[i];
+            }
+        } else {
+            std::mem::swap(&mut scratch.rhs, rhs);
         }
 
         solve_sparse_csc(self.lower.view(), Triangle::Lower, scratch);
         solve_sparse_csc(self.upper.view(), Triangle::Upper, scratch);
 
-        std::mem::swap(rhs, &mut scratch.rhs);
-    }
-
-    pub fn solve_transp(&self, rhs: &mut ScatteredVec, scratch: &mut ScratchSpace) {
-        std::mem::swap(rhs, &mut scratch.rhs);
-
-        solve_sparse_csc(self.upper_transp_csc.view(), Triangle::Lower, scratch);
-        solve_sparse_csc(self.lower_transp_csc.view(), Triangle::Upper, scratch);
-
-        rhs.clear();
-        for &r in &scratch.rhs.nonzero {
-            let val = scratch.rhs.values[r];
-            if val != 0.0 {
-                let orig_r = self.new2orig_row[r];
-                rhs.is_nonzero[orig_r] = true;
-                rhs.nonzero.push(orig_r);
-                rhs.values[orig_r] = val;
+        if let Some(col_perm) = &self.col_perm {
+            rhs.clear();
+            for &i in &scratch.rhs.nonzero {
+                let new_i = col_perm.orig2new[i];
+                rhs.nonzero.push(new_i);
+                rhs.is_nonzero[new_i] = true;
+                rhs.values[new_i] = scratch.rhs.values[i];
             }
+        } else {
+            std::mem::swap(rhs, &mut scratch.rhs);
+        }
+    }
+    pub fn transpose(&self) -> LUFactors {
+        LUFactors {
+            lower: self.upper.transpose_view().to_csc(),
+            upper: self.lower.transpose_view().to_csc(),
+            row_perm: self.col_perm.as_ref().map(|p| p.clone().inv()),
+            col_perm: self.row_perm.as_ref().map(|p| p.clone().inv()),
         }
     }
 }
@@ -212,9 +244,8 @@ pub fn lu_factorize(
     let mut lower_cols: Vec<Col> = Vec::with_capacity(cols.len());
     let mut upper = TriMat::new((mat.rows(), cols.len()));
 
-    let mut new2orig_row = (0..mat.rows()).collect::<Vec<_>>().into_boxed_slice();
+    let mut new2orig_row = (0..mat.rows()).collect::<Vec<_>>();
     let mut orig2new_row = new2orig_row.clone();
-    let mut swaps = vec![];
 
     for i_col in 0..cols.len() {
         scratch.rhs.clear();
@@ -324,7 +355,6 @@ pub fn lu_factorize(
             let pivot_row = orig2new_row[orig_pivot_row];
             new2orig_row.swap(row, pivot_row);
             orig2new_row.swap(orig_row, orig_pivot_row);
-            swaps.push(pivot_row);
         }
 
         // 6, 7.
@@ -364,12 +394,12 @@ pub fn lu_factorize(
 
     LUFactors {
         lower: lower.to_csc(),
-        lower_transp_csc: lower.transpose_view().to_csc(),
         upper: upper.to_csc(),
-        upper_transp_csc: upper.transpose_view().to_csc(),
-        orig2new_row,
-        new2orig_row,
-        swaps: swaps.into_boxed_slice(),
+        row_perm: Some(Perm {
+            orig2new: orig2new_row,
+            new2orig: new2orig_row,
+        }),
+        col_perm: None,
     }
 }
 
@@ -560,6 +590,7 @@ mod tests {
         let mat = mat.to_csc();
         let mut scratch = ScratchSpace::with_capacity(mat.rows());
         let lu = lu_factorize(&mat, &[1, 0, 3], 0.9, &mut scratch);
+        let lu_transp = lu.transpose();
 
         let l_ref = [
             vec![1.0, 0.0, 0.0],
@@ -575,19 +606,18 @@ mod tests {
         ];
         assert_matrix_eq(&lu.upper, &u_ref);
 
-        assert_eq!(&*lu.orig2new_row, &[1, 2, 0]);
-        assert_eq!(&*lu.new2orig_row, &[2, 0, 1]);
-        assert_eq!(&*lu.swaps, &[2, 2, 2]);
+        assert_eq!(lu.row_perm.as_ref().unwrap().orig2new, &[1, 2, 0]);
+        assert_eq!(lu.row_perm.as_ref().unwrap().new2orig, &[2, 0, 1]);
 
         {
             let mut rhs_dense = [6.0, 3.0, 13.0];
-            lu.solve_dense(&mut rhs_dense);
+            lu.solve_dense(&mut rhs_dense, &mut scratch);
             assert_eq!(&rhs_dense, &[1.0, 2.0, 3.0]);
         }
 
         {
             let mut rhs_dense_t = [14.0, 11.0, 5.0];
-            lu.solve_dense_transp(&mut rhs_dense_t);
+            lu_transp.solve_dense(&mut rhs_dense_t, &mut scratch);
             assert_eq!(&rhs_dense_t, &[1.0, 2.0, 3.0]);
         }
 
@@ -601,7 +631,7 @@ mod tests {
         {
             let mut rhs = ScatteredVec::empty(3);
             rhs.set(to_sparse(&[0.0, -1.0, 1.0]).view());
-            lu.solve_transp(&mut rhs, &mut scratch);
+            lu_transp.solve(&mut rhs, &mut scratch);
             assert_eq!(to_dense(&rhs.to_csvec()), vec![-2.0, 0.0, 1.0]);
         }
     }
@@ -629,6 +659,7 @@ mod tests {
         let cols: Vec<_> = (0..size).collect();
 
         let lu = lu_factorize(&mat, &cols, 0.1, &mut scratch);
+        let lu_transp = lu.transpose();
 
         let multiplied = &lu.lower * &lu.upper;
         assert!(multiplied.is_csc());
@@ -637,7 +668,7 @@ mod tests {
                 let mut is = vec![];
                 let mut vs = vec![];
                 for (i, &val) in mat.outer_view(c).unwrap().iter() {
-                    is.push(lu.orig2new_row[i]);
+                    is.push(lu.row_perm.as_ref().unwrap().orig2new[i]);
                     vs.push(val);
                 }
                 CsVec::new(size, is, vs)
@@ -651,14 +682,14 @@ mod tests {
 
         {
             let mut dense_sol = dense_rhs.clone();
-            lu.solve_dense(&mut dense_sol);
+            lu.solve_dense(&mut dense_sol, &mut scratch);
             let diff = &ArrayVec::from(dense_rhs.clone()) - &(&mat * &ArrayVec::from(dense_sol));
             assert!(f64::sqrt(diff.dot(&diff)) < 1e-5);
         }
 
         {
             let mut dense_sol_t = dense_rhs.clone();
-            lu.solve_dense_transp(&mut dense_sol_t);
+            lu_transp.solve_dense(&mut dense_sol_t, &mut scratch);
             let diff = &ArrayVec::from(dense_rhs)
                 - &(&mat.transpose_view() * &ArrayVec::from(dense_sol_t));
             assert!(f64::sqrt(diff.dot(&diff)) < 1e-5);
@@ -685,7 +716,7 @@ mod tests {
         {
             let mut rhs_t = ScatteredVec::empty(size);
             rhs_t.set(sparse_rhs.view());
-            lu.solve_transp(&mut rhs_t, &mut scratch);
+            lu_transp.solve(&mut rhs_t, &mut scratch);
             let diff = &sparse_rhs - &(&mat.transpose_view() * &rhs_t.to_csvec());
             assert!(diff.norm(1.0) < 1e-5);
         }
