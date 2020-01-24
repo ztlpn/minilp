@@ -1,0 +1,16 @@
+[package]
+name = "minilp"
+version = "0.1.0"
+authors = ["Alexey Zatelepin <alex.zatelepin@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+sprs = "0.7.1"
+ndarray = "0.13.0"
+log = "0.4.8"
+
+[dev-dependencies]
+rand = "0.7"
+rand_pcg = "0.2.1"
