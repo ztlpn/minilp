@@ -6,8 +6,11 @@ pub use sprs::CsVec;
 use sprs::{CompressedStorage, CsMat};
 use std::collections::{BTreeSet, HashMap};
 
-mod linalg;
-use linalg::{lu_factorize, LUFactors, ScatteredVec, ScratchSpace};
+mod lu;
+use lu::{lu_factorize, LUFactors, ScatteredVec, ScratchSpace};
+
+mod helpers;
+use helpers::{resized_view, to_dense};
 
 type ArrayVec = ndarray::Array1<f64>;
 
@@ -1018,8 +1021,6 @@ struct EtaMatrix {
     entering_coeffs: CsVec<f64>,
 }
 
-use linalg::{resized_view, to_dense};
-
 fn into_resized(vec: CsVec<f64>, len: usize) -> CsVec<f64> {
     let (mut indices, mut data) = vec.into_raw_storage();
 
@@ -1038,7 +1039,7 @@ fn into_resized(vec: CsVec<f64>, len: usize) -> CsVec<f64> {
 
 #[cfg(test)]
 mod tests {
-    use linalg::{assert_matrix_eq, to_sparse};
+    use helpers::{assert_matrix_eq, to_sparse};
     use super::*;
 
     #[test]
