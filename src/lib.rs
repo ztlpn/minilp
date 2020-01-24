@@ -240,7 +240,6 @@ impl Tableau {
         values
     }
 
-    #[allow(dead_code)]
     pub fn move_to_solution(&mut self, solution: &[f64]) -> Result<(), Error> {
         assert_eq!(solution.len(), self.num_vars);
 

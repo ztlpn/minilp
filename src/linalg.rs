@@ -1,5 +1,5 @@
 use sprs::{
-    linalg::trisolve, CompressedStorage, CsMat, CsMatView, CsVec, CsVecBase, CsVecView, TriMat,
+    linalg::trisolve, CsMat, CsMatView, CsVec, CsVecBase, CsVecView, TriMat,
 };
 use std::ops::Deref;
 
@@ -375,63 +375,6 @@ pub fn lu_factorize(
     }
 }
 
-#[allow(dead_code)]
-pub fn invert_mat(mut mat: CsMat<f64>) -> CsMat<f64> {
-    assert!(mat.is_csr());
-    assert_eq!(mat.rows(), mat.cols());
-    let dim = mat.rows();
-    let mut inv = CsMat::empty(CompressedStorage::CSR, dim);
-    for i in 0..dim {
-        inv.insert(i, i, 1.0);
-    }
-
-    let mut next_mat = CsMat::empty(CompressedStorage::CSR, dim);
-    let mut next_inv = CsMat::empty(CompressedStorage::CSR, dim);
-
-    for r in 0..dim {
-        if r % 100 == 0 {
-            debug!(
-                "inverting: row {}, mat nnz: {}, inv nnz: {}",
-                r,
-                mat.nnz(),
-                inv.nnz()
-            );
-        }
-
-        let row = mat.outer_view(r).unwrap();
-        let coeff = row.get(r).unwrap();
-        let pivot_row = row.map(|x| x / coeff);
-        let pivot_row_inv = inv.outer_view(r).unwrap().map(|x| x / coeff);
-
-        for nr in 0..dim {
-            if nr == r {
-                next_mat = next_mat.append_outer_csvec(pivot_row.view());
-                next_inv = next_inv.append_outer_csvec(pivot_row_inv.view());
-            } else {
-                let row = mat.outer_view(nr).unwrap();
-                let row_inv = inv.outer_view(nr).unwrap();
-                if let Some(coeff) = row.get(r) {
-                    next_mat = next_mat
-                        .append_outer_csvec(mul_add_sparse(row, pivot_row.view(), -coeff).view());
-                    next_inv = next_inv.append_outer_csvec(
-                        mul_add_sparse(row_inv, pivot_row_inv.view(), -coeff).view(),
-                    );
-                } else {
-                    next_mat = next_mat.append_outer_csvec(row);
-                    next_inv = next_inv.append_outer_csvec(row_inv);
-                }
-            }
-        }
-
-        std::mem::swap(&mut mat, &mut next_mat);
-        std::mem::swap(&mut inv, &mut next_inv);
-        next_mat = into_cleared(&mut next_mat);
-        next_inv = into_cleared(&mut next_inv);
-    }
-
-    inv
-}
-
 pub(crate) fn resized_view<IStorage, DStorage>(
     vec: &CsVecBase<IStorage, DStorage>,
     len: usize,
@@ -455,7 +398,7 @@ where
     unsafe { CsVecView::new_view_raw(len, data.len(), indices.as_ptr(), data.as_ptr()) }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn to_sparse(slice: &[f64]) -> CsVec<f64> {
     let mut res = CsVec::empty(slice.len());
     for (i, &val) in slice.iter().enumerate() {
@@ -476,7 +419,7 @@ where
     dense
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn assert_matrix_eq(mat: &CsMat<f64>, reference: &[Vec<f64>]) {
     let mat = mat.to_csr();
     assert_eq!(mat.rows(), reference.len());
@@ -647,39 +590,6 @@ fn solve_sparse_csc(tri_mat: CsMatView<f64>, triangle: Triangle, scratch: &mut S
     }
 }
 
-fn mul_add_sparse(lhs: CsVecView<f64>, rhs: CsVecView<f64>, coeff: f64) -> CsVec<f64> {
-    assert_eq!(lhs.dim(), rhs.dim());
-    let mut res = CsVec::empty(lhs.dim());
-    // res = lhs + rhs * coeff
-    res.reserve_exact(lhs.nnz() + rhs.nnz());
-
-    use sprs::vec::NnzEither;
-    use sprs::vec::SparseIterTools;
-    for elem in lhs.iter().nnz_or_zip(rhs.iter()) {
-        let (ind, val) = match elem {
-            NnzEither::Left((ind, lval)) => (ind, *lval),
-            NnzEither::Right((ind, rval)) => (ind, rval * coeff),
-            NnzEither::Both((ind, lval, rval)) => (ind, lval + rval * coeff),
-        };
-
-        if val != 0.0 {
-            res.append(ind, val);
-        }
-    }
-    res
-}
-
-fn into_cleared(mat: &mut CsMat<f64>) -> CsMat<f64> {
-    let inner_dims = mat.inner_dims();
-    let moved = std::mem::replace(mat, CsMat::empty(CompressedStorage::CSR, inner_dims));
-    let (mut indptr, mut indices, mut data) = moved.into_raw_storage();
-    indptr.clear();
-    indptr.push(0);
-    indices.clear();
-    data.clear();
-    CsMat::new((0, inner_dims), indptr, indices, data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,32 +743,5 @@ mod tests {
             let diff = &sparse_rhs - &(&mat.transpose_view() * &rhs_t.to_csvec());
             assert!(diff.norm(1.0) < 1e-5);
         }
-    }
-
-    #[test]
-    fn inv_simple() {
-        let triplets = [
-            (0, 0, 2.0),
-            (0, 1, 2.0),
-            (1, 0, 4.0),
-            (1, 1, 3.0),
-            (1, 2, 1.0),
-            (2, 0, 3.0),
-            (2, 2, 1.0),
-        ];
-        let mut mat = TriMat::with_capacity((3, 3), triplets.len());
-        for (r, c, val) in &triplets {
-            mat.add_triplet(*r, *c, *val);
-        }
-        let mat = mat.to_csr();
-
-        let inv = invert_mat(mat);
-
-        let inv_ref = [
-            vec![0.75, -0.5, 0.5],
-            vec![-0.25, 0.5, -0.5],
-            vec![-2.25, 1.5, -0.5],
-        ];
-        assert_matrix_eq(&inv, &inv_ref);
     }
 }
