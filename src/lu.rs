@@ -95,10 +95,6 @@ impl ScatteredVec {
         CsVec::new(self.values.len(), indices, data)
     }
 
-    pub fn sort(&mut self) {
-        self.nonzero.sort();
-    }
-
     #[inline]
     pub fn get(&mut self, i: usize) -> &f64 {
         &self.values[i]

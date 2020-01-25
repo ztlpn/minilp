@@ -578,10 +578,6 @@ impl Tableau {
         }
 
         std::mem::swap(&mut self.col_coeffs, &mut self.rhs);
-        // Some problems (fl_100_7) greatly depend on the choice of leaving row in degenerate
-        // case and thus on col_coeffs.order.
-        // TODO: investigate more principled approach to choosing leaving row.
-        self.col_coeffs.sort();
     }
 
     /// Calculate current coeffs row for a single constraint (permuted according to non_basic_vars).
@@ -707,25 +703,41 @@ impl Tableau {
 
     /// returns index into basic_vars
     fn choose_pivot_row(&self) -> Result<usize, Error> {
-        let mut i_row = 0;
-        let mut val = None;
-        for (i, &c) in self.col_coeffs.iter() {
-            if c < 1e-8 {
+        let mut leaving = 0;
+        let mut leaving_val = None;
+        let mut leaving_coeff_abs = 0.0;
+        for (r, &coeff) in self.col_coeffs.iter() {
+            if coeff < 1e-8 {
                 continue;
             }
 
-            let cur_val = self.cur_bounds[i] / c;
-            if val.is_none() || val.unwrap() > cur_val {
-                i_row = i;
-                val = Some(cur_val);
+            let cur_val = self.cur_bounds[r] / coeff;
+            let coeff_abs = f64::abs(coeff);
+
+            let should_choose = leaving_val.is_none()
+                || cur_val < leaving_val.unwrap() - 1e-8
+                || (cur_val < leaving_val.unwrap() + 1e-8
+                    // There is uncertainty in choosing the leaving variable row.
+                    // Choose the one with the biggest absolute coeff for the reasons of
+                    // numerical stability.
+                    && (coeff_abs > leaving_coeff_abs + 1e-8
+                        || coeff_abs > leaving_coeff_abs - 1e-8
+                            // There is still uncertainty, choose based on the column index.
+                            // NOTE: this still doesn't guarantee the absence of cycling.
+                            && r < leaving));
+
+            if should_choose {
+                leaving = r;
+                leaving_val = Some(cur_val);
+                leaving_coeff_abs = coeff_abs;
             }
         }
 
-        if val.is_none() {
+        if leaving_val.is_none() {
             return Err(Error::Unbounded);
         }
 
-        Ok(i_row)
+        Ok(leaving)
     }
 
     fn choose_pivot_row_dual(&self) -> usize {
@@ -745,6 +757,7 @@ impl Tableau {
     fn choose_entering_col_dual(&self) -> Result<usize, Error> {
         let mut entering = 0;
         let mut entering_val = None;
+        let mut entering_coeff_abs = 0.0;
         for (c, &coeff) in self.row_coeffs.iter() {
             let var = self.non_basic_vars[c];
             if coeff > -1e-8 || self.set_vars.contains_key(&var) {
@@ -752,9 +765,20 @@ impl Tableau {
             }
 
             let cur_val = self.cur_obj[c] / coeff; // obj[v] and row[v] are both negative
-            if entering_val.is_none() || entering_val.unwrap() > cur_val {
+            let coeff_abs = f64::abs(coeff);
+
+            // See comments in `choose_pivot_row`
+            let should_choose = entering_val.is_none()
+                || cur_val < entering_val.unwrap() - 1e-8
+                || (cur_val < entering_val.unwrap() + 1e-8
+                && (coeff_abs > entering_coeff_abs + 1e-8
+                    || coeff_abs > entering_coeff_abs - 1e-8
+                        && c < entering));
+
+            if should_choose {
                 entering = c;
                 entering_val = Some(cur_val);
+                entering_coeff_abs = coeff_abs;
             }
         }
 
