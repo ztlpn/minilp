@@ -28,8 +28,8 @@ pub struct Tableau {
     orig_bounds: Vec<f64>,
 
     // LU factors of the basis matrix
-    lu_factors: LUFactors,
-    lu_factors_transp: LUFactors,
+    lu_factors: Option<LUFactors>,
+    lu_factors_transp: Option<LUFactors>,
     scratch: ScratchSpace,
     rhs: ScatteredVec,
 
@@ -195,8 +195,8 @@ impl Tableau {
         };
 
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
-        let lu_factors = lu_factorize(&orig_constraints_csc, &basic_vars, 0.1, &mut scratch);
-        let lu_factors_transp = lu_factors.transpose();
+        let lu_factors = lu_factorize(&orig_constraints_csc, &basic_vars, 0.1, &mut scratch, None);
+        let lu_factors_transp = lu_factors.transpose(None);
 
         let cur_bounds = orig_bounds.clone();
         Tableau {
@@ -207,8 +207,8 @@ impl Tableau {
             orig_constraints,
             orig_constraints_csc,
             orig_bounds,
-            lu_factors,
-            lu_factors_transp,
+            lu_factors: Some(lu_factors),
+            lu_factors_transp: Some(lu_factors_transp),
             eta_matrices: EtaMatrices::new(num_constraints),
             rhs: ScatteredVec::empty(num_constraints),
             col_coeffs: ScatteredVec::empty(num_constraints),
@@ -559,7 +559,7 @@ impl Tableau {
     }
 
     fn nnz(&self) -> usize {
-        self.lu_factors.nnz()
+        self.lu_factors.as_ref().unwrap().nnz()
     }
 
     /// Calculate current coeffs column for a single non-basic variable.
@@ -568,7 +568,10 @@ impl Tableau {
         let orig_coeffs = self.orig_constraints_csc.outer_view(var).unwrap();
         self.rhs.set(orig_coeffs);
 
-        self.lu_factors.solve(&mut self.rhs, &mut self.scratch);
+        self.lu_factors
+            .as_ref()
+            .unwrap()
+            .solve(&mut self.rhs, &mut self.scratch);
 
         // apply eta matrices (Vanderbei p.139)
         for idx in 0..self.eta_matrices.len() {
@@ -604,6 +607,8 @@ impl Tableau {
         }
 
         self.lu_factors_transp
+            .as_ref()
+            .unwrap()
             .solve(&mut self.rhs, &mut self.scratch);
 
         self.row_coeffs.clear();
@@ -634,19 +639,22 @@ impl Tableau {
         let pivot_coeff = *self.col_coeffs.get(r_leaving);
 
         let eta_matrices_nnz = self.eta_matrices.entering_coeff_cols.nnz();
-        if eta_matrices_nnz < self.lu_factors.nnz() / 2 {
+        if eta_matrices_nnz < self.lu_factors.as_ref().unwrap().nnz() / 2 {
             self.eta_matrices
                 .push(r_leaving, pivot_coeff, &self.col_coeffs);
         } else {
-            self.eta_matrices.clear();
+            self.eta_matrices.clear_and_resize(self.num_constraints());
 
-            self.lu_factors = lu_factorize(
+            let lu_factors = lu_factorize(
                 &self.orig_constraints_csc,
                 &self.basic_vars,
                 0.1,
                 &mut self.scratch,
+                self.lu_factors.take(),
             );
-            self.lu_factors_transp = self.lu_factors.transpose();
+            let lu_factors_transp = lu_factors.transpose(self.lu_factors_transp.take());
+            self.lu_factors = Some(lu_factors);
+            self.lu_factors_transp = Some(lu_factors_transp);
         }
 
         let pivot_bound = self.cur_bounds[r_leaving] / pivot_coeff;
@@ -825,14 +833,17 @@ impl Tableau {
 
         self.row_coeffs.clear_and_resize(self.non_basic_vars.len());
 
-        self.eta_matrices.clear();
-        self.lu_factors = lu_factorize(
+        self.eta_matrices.clear_and_resize(self.non_basic_vars.len());
+        let lu_factors = lu_factorize(
             &self.orig_constraints_csc,
             &self.basic_vars,
             0.1,
             &mut self.scratch,
+            self.lu_factors.take(),
         );
-        self.lu_factors_transp = self.lu_factors.transpose();
+        let lu_factors_transp = lu_factors.transpose(self.lu_factors_transp.take());
+        self.lu_factors = Some(lu_factors);
+        self.lu_factors_transp = Some(lu_factors_transp);
 
         let mut cur_bounds = self.orig_bounds.clone();
         for (&var, &val) in self.set_vars.iter() {
@@ -841,6 +852,8 @@ impl Tableau {
             }
         }
         self.lu_factors
+            .as_ref()
+            .unwrap()
             .solve_dense(&mut cur_bounds, &mut self.scratch);
         self.cur_bounds = cur_bounds;
         for b in &mut self.cur_bounds {
@@ -863,6 +876,8 @@ impl Tableau {
                 obj_coeffs[c] = -self.orig_obj[var];
             }
             self.lu_factors_transp
+                .as_ref()
+                .unwrap()
                 .solve_dense(&mut obj_coeffs, &mut self.scratch);
             ArrayVec::from(obj_coeffs)
         };
@@ -1053,10 +1068,10 @@ impl EtaMatrices {
         self.leaving_rows.len()
     }
 
-    fn clear(&mut self) {
+    fn clear_and_resize(&mut self, n_rows: usize) {
         self.leaving_rows.clear();
         self.pivot_coeffs.clear();
-        self.entering_coeff_cols.clear();
+        self.entering_coeff_cols.clear_and_resize(n_rows);
     }
 
     fn push(&mut self, leaving_row: usize, coeff: f64, entering_coeffs: &ScatteredVec) {

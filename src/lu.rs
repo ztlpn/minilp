@@ -42,11 +42,12 @@ impl CscMat {
         self.data.len()
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear_and_resize(&mut self, n_rows: usize) {
         self.data.clear();
         self.indices.clear();
         self.indptr.clear();
         self.indptr.push(0);
+        self.n_rows = n_rows;
     }
 
     fn push(&mut self, row: usize, val: f64) {
@@ -333,9 +334,14 @@ impl LUFactors {
             std::mem::swap(rhs, &mut scratch.rhs);
         }
     }
-    pub fn transpose(&self) -> LUFactors {
-        let lower = self.upper.transpose(None);
-        let upper = self.lower.transpose(None);
+    pub fn transpose(&self, prev: Option<LUFactors>) -> LUFactors {
+        let (prev_lower, prev_upper) = if let Some(prev) = prev {
+            (Some(prev.lower), Some(prev.upper))
+        } else {
+            (None, None)
+        };
+        let lower = self.upper.transpose(prev_lower);
+        let upper = self.lower.transpose(prev_upper);
         LUFactors {
             lower,
             upper,
@@ -350,6 +356,7 @@ pub fn lu_factorize(
     cols: &[usize],
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
+    prev: Option<LUFactors>,
 ) -> LUFactors {
     assert!(mat.is_csc());
     assert_eq!(mat.rows(), cols.len());
@@ -372,8 +379,13 @@ pub fn lu_factorize(
     scratch.rhs.clear_and_resize(cols.len());
     scratch.mark_nonzero.clear_and_resize(cols.len());
 
-    let mut lower = CscMat::new(mat.rows());
-    let mut upper = CscMat::new(mat.rows());
+    let (mut lower, mut upper) = if let Some(mut prev) = prev {
+        prev.lower.clear_and_resize(mat.rows());
+        prev.upper.clear_and_resize(mat.rows());
+        (prev.lower, prev.upper)
+    } else {
+        (CscMat::new(mat.rows()), CscMat::new(mat.rows()))
+    };
 
     let mut new2orig_row = (0..mat.rows()).collect::<Vec<_>>();
     let mut orig2new_row = new2orig_row.clone();
@@ -736,8 +748,8 @@ mod tests {
         }
         let mat = mat.to_csc();
         let mut scratch = ScratchSpace::with_capacity(mat.rows());
-        let lu = lu_factorize(&mat, &[1, 0, 3], 0.9, &mut scratch);
-        let lu_transp = lu.transpose();
+        let lu = lu_factorize(&mat, &[1, 0, 3], 0.9, &mut scratch, None);
+        let lu_transp = lu.transpose(None);
 
         let l_ref = [
             vec![1.0, 0.0, 0.0],
@@ -805,8 +817,8 @@ mod tests {
         // TODO: random permutation?
         let cols: Vec<_> = (0..size).collect();
 
-        let lu = lu_factorize(&mat, &cols, 0.1, &mut scratch);
-        let lu_transp = lu.transpose();
+        let lu = lu_factorize(&mat, &cols, 0.1, &mut scratch, None);
+        let lu_transp = lu.transpose(None);
 
         let multiplied = &lu.lower.to_csmat() * &lu.upper.to_csmat();
         assert!(multiplied.is_csc());
