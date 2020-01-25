@@ -30,11 +30,13 @@ pub struct Tableau {
     // LU factors of the basis matrix
     lu_factors: LUFactors,
     lu_factors_transp: LUFactors,
+    scratch: ScratchSpace,
+    rhs: ScatteredVec,
 
     eta_matrices: Vec<EtaMatrix>,
-    rhs: ScatteredVec,
+
+    col_coeffs: ScatteredVec,
     row_coeffs: ScatteredVec,
-    scratch: ScratchSpace,
 
     basic_vars: Vec<usize>, // for each constraint the corresponding basic var.
     cur_bounds: Vec<f64>,
@@ -209,6 +211,7 @@ impl Tableau {
             lu_factors_transp,
             eta_matrices: vec![],
             rhs: ScatteredVec::empty(num_constraints),
+            col_coeffs: ScatteredVec::empty(num_constraints),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
             scratch,
             basic_vars,
@@ -332,10 +335,10 @@ impl Tableau {
 
             if let Some(c_entering) = self.choose_entering_col() {
                 let entering_var = self.non_basic_vars[c_entering];
-                let entering_coeffs = self.calc_col_coeffs(c_entering);
-                let r_pivot = self.choose_pivot_row(&entering_coeffs)?;
-                let row_coeffs = self.calc_row_coeffs(r_pivot);
-                let leaving_var = self.pivot(c_entering, &entering_coeffs, r_pivot, &row_coeffs);
+                self.calc_col_coeffs(c_entering);
+                let r_pivot = self.choose_pivot_row()?;
+                self.calc_row_coeffs(r_pivot);
+                let leaving_var = self.pivot(c_entering, r_pivot);
 
                 let art_vars_start = self.num_vars + self.num_slack_vars;
                 match (entering_var < art_vars_start, leaving_var < art_vars_start) {
@@ -378,10 +381,10 @@ impl Tableau {
             }
 
             if let Some(c_entering) = self.choose_entering_col() {
-                let entering_coeffs = self.calc_col_coeffs(c_entering);
-                let r_pivot = self.choose_pivot_row(&entering_coeffs)?;
-                let row_coeffs = self.calc_row_coeffs(r_pivot);
-                self.pivot(c_entering, &entering_coeffs, r_pivot, &row_coeffs);
+                self.calc_col_coeffs(c_entering);
+                let r_pivot = self.choose_pivot_row()?;
+                self.calc_row_coeffs(r_pivot);
+                self.pivot(c_entering, r_pivot);
             } else {
                 debug!(
                     "found optimum: {} in {} iterations, nnz: {}",
@@ -421,10 +424,10 @@ impl Tableau {
                 break;
             }
 
-            let row_coeffs = self.calc_row_coeffs(r_pivot);
-            let c_entering = self.choose_entering_col_dual(&row_coeffs)?;
-            let entering_coeffs = self.calc_col_coeffs(c_entering);
-            self.pivot(c_entering, &entering_coeffs, r_pivot, &row_coeffs);
+            self.calc_row_coeffs(r_pivot);
+            let c_entering = self.choose_entering_col_dual()?;
+            self.calc_col_coeffs(c_entering);
+            self.pivot(c_entering, r_pivot);
         }
 
         Ok(())
@@ -452,15 +455,14 @@ impl Tableau {
 
         if let Some(r) = basic_row {
             // if var was basic, remove it.
-            let row_coeffs = self.calc_row_coeffs(r);
-            let c_entering = self.choose_entering_col_dual(&row_coeffs)?;
-            let entering_coeffs = self.calc_col_coeffs(c_entering);
             self.cur_bounds[r] -= val;
-
-            self.pivot(c_entering, &entering_coeffs, r, &row_coeffs);
+            self.calc_row_coeffs(r);
+            let c_entering = self.choose_entering_col_dual()?;
+            self.calc_col_coeffs(c_entering);
+            self.pivot(c_entering, r);
         } else if let Some(c) = non_basic_col {
-            let coeffs = self.calc_col_coeffs(c);
-            for (r, coeff) in coeffs.iter() {
+            self.calc_col_coeffs(c);
+            for (r, coeff) in self.col_coeffs.iter() {
                 self.cur_bounds[r] -= val * coeff;
             }
             self.cur_obj_val -= val * self.cur_obj[c];
@@ -481,8 +483,8 @@ impl Tableau {
     pub fn unset_var(&mut self, var: usize) -> Result<bool, Error> {
         if let Some(val) = self.set_vars.remove(&var) {
             let col = self.non_basic_vars.iter().position(|&v| v == var).unwrap();
-            let coeffs = self.calc_col_coeffs(col);
-            for (r, coeff) in coeffs.iter() {
+            self.calc_col_coeffs(col);
+            for (r, coeff) in self.col_coeffs.iter() {
                 self.cur_bounds[r] += val * coeff;
             }
             self.cur_obj_val += val * self.cur_obj[col];
@@ -560,33 +562,8 @@ impl Tableau {
         self.lu_factors.nnz()
     }
 
-    fn update_solver(&mut self, r_leaving: usize, pivot_coeff: f64, entering_coeffs: &CsVec<f64>) {
-        let eta_matrices_nnz = self
-            .eta_matrices
-            .iter()
-            .map(|m| m.entering_coeffs.nnz())
-            .sum::<usize>();
-        if eta_matrices_nnz < self.lu_factors.nnz() / 2 {
-            self.eta_matrices.push(EtaMatrix {
-                r_leaving,
-                pivot_coeff,
-                entering_coeffs: entering_coeffs.clone(),
-            });
-        } else {
-            self.eta_matrices.clear();
-
-            self.lu_factors = lu_factorize(
-                &self.orig_constraints_csc,
-                &self.basic_vars,
-                0.1,
-                &mut self.scratch,
-            );
-            self.lu_factors_transp = self.lu_factors.transpose();
-        }
-    }
-
     /// Calculate current coeffs column for a single non-basic variable.
-    fn calc_col_coeffs(&mut self, c_var: usize) -> CsVec<f64> {
+    fn calc_col_coeffs(&mut self, c_var: usize) {
         let var = self.non_basic_vars[c_var];
         let orig_coeffs = self.orig_constraints_csc.outer_view(var).unwrap();
         self.rhs.set(orig_coeffs);
@@ -600,13 +577,15 @@ impl Tableau {
             *self.rhs.get_mut(eta.r_leaving) += coeff;
         }
 
-        let res = self.rhs.to_csvec();
-        trace!("VAR {} COEFFS: {:?}", var, to_dense(&res));
-        res
+        std::mem::swap(&mut self.col_coeffs, &mut self.rhs);
+        // Some problems (fl_100_7) greatly depend on the choice of leaving row in degenerate
+        // case and thus on col_coeffs.order.
+        // TODO: investigate more principled approach to choosing leaving row.
+        self.col_coeffs.sort();
     }
 
     /// Calculate current coeffs row for a single constraint (permuted according to non_basic_vars).
-    fn calc_row_coeffs(&mut self, r_constr: usize) -> CsVec<f64> {
+    fn calc_row_coeffs(&mut self, r_constr: usize) {
         self.rhs.clear();
         *self.rhs.get_mut(r_constr) = 1.0;
 
@@ -627,7 +606,7 @@ impl Tableau {
             .solve(&mut self.rhs, &mut self.scratch);
 
         self.row_coeffs.clear();
-        for (r, &coeff) in self.rhs.to_csvec().iter() {
+        for (r, &coeff) in self.rhs.iter() {
             for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
                 let idx = self.non_basic_vars_inv[v];
                 if idx != SENTINEL {
@@ -635,19 +614,9 @@ impl Tableau {
                 }
             }
         }
-
-        let res = self.row_coeffs.to_csvec();
-        trace!("CONSTR {} COEFFS {:?}", r_constr, to_dense(&res));
-        res
     }
 
-    fn pivot(
-        &mut self,
-        c_entering: usize,
-        entering_coeffs: &CsVec<f64>,
-        r_leaving: usize,
-        row_coeffs: &CsVec<f64>,
-    ) -> usize {
+    fn pivot(&mut self, c_entering: usize, r_leaving: usize) -> usize {
         let entering_var = self.non_basic_vars[c_entering];
         let leaving_var = std::mem::replace(&mut self.basic_vars[r_leaving], entering_var);
         std::mem::replace(&mut self.non_basic_vars[c_entering], leaving_var);
@@ -661,12 +630,33 @@ impl Tableau {
             r_leaving,
         );
 
-        // TODO: save NNZ index
-        let pivot_coeff = *entering_coeffs.get(r_leaving).unwrap();
-        self.update_solver(r_leaving, pivot_coeff, &entering_coeffs);
+        let pivot_coeff = *self.col_coeffs.get(r_leaving);
+
+        let eta_matrices_nnz = self
+            .eta_matrices
+            .iter()
+            .map(|m| m.entering_coeffs.nnz())
+            .sum::<usize>();
+        if eta_matrices_nnz < self.lu_factors.nnz() / 2 {
+            self.eta_matrices.push(EtaMatrix {
+                r_leaving,
+                pivot_coeff,
+                entering_coeffs: self.col_coeffs.to_csvec(),
+            });
+        } else {
+            self.eta_matrices.clear();
+
+            self.lu_factors = lu_factorize(
+                &self.orig_constraints_csc,
+                &self.basic_vars,
+                0.1,
+                &mut self.scratch,
+            );
+            self.lu_factors_transp = self.lu_factors.transpose();
+        }
 
         let pivot_bound = self.cur_bounds[r_leaving] / pivot_coeff;
-        for (r, coeff) in entering_coeffs.iter() {
+        for (r, coeff) in self.col_coeffs.iter() {
             if r == r_leaving {
                 self.cur_bounds[r] = pivot_bound;
             } else {
@@ -681,7 +671,7 @@ impl Tableau {
         self.cur_obj_val -= self.cur_obj[c_entering] * pivot_bound;
 
         let pivot_obj = self.cur_obj[c_entering] / pivot_coeff;
-        for (c, coeff) in row_coeffs.iter() {
+        for (c, &coeff) in self.row_coeffs.iter() {
             if c == c_entering {
                 self.cur_obj[c] = -pivot_obj;
             } else {
@@ -715,22 +705,23 @@ impl Tableau {
         entering
     }
 
-    fn choose_pivot_row(&self, coeffs: &CsVec<f64>) -> Result<usize, Error> {
+    /// returns index into basic_vars
+    fn choose_pivot_row(&self) -> Result<usize, Error> {
         let mut i_row = 0;
-        let mut coeff = None;
-        for (i, &c) in coeffs.iter() {
+        let mut val = None;
+        for (i, &c) in self.col_coeffs.iter() {
             if c < 1e-8 {
                 continue;
             }
 
-            let cur_coeff = self.cur_bounds[i] / c;
-            if coeff.is_none() || coeff.unwrap() > cur_coeff {
+            let cur_val = self.cur_bounds[i] / c;
+            if val.is_none() || val.unwrap() > cur_val {
                 i_row = i;
-                coeff = Some(cur_coeff);
+                val = Some(cur_val);
             }
         }
 
-        if coeff.is_none() {
+        if val.is_none() {
             return Err(Error::Unbounded);
         }
 
@@ -750,13 +741,11 @@ impl Tableau {
         i_row
     }
 
-    // index in the non_basic_vars permutation
-    fn choose_entering_col_dual(&self, row_coeffs: &CsVec<f64>) -> Result<usize, Error> {
-        // eprintln!("ROW {} CUR COEFFS {:?}\n", i_row, to_dense(&row));
-
+    /// returns index into non_basic_vars
+    fn choose_entering_col_dual(&self) -> Result<usize, Error> {
         let mut entering = 0;
         let mut entering_val = None;
-        for (c, &coeff) in row_coeffs.iter() {
+        for (c, &coeff) in self.row_coeffs.iter() {
             let var = self.non_basic_vars[c];
             if coeff > -1e-8 || self.set_vars.contains_key(&var) {
                 continue;
@@ -797,6 +786,7 @@ impl Tableau {
         assert_eq!(self.num_artificial_vars, 0);
 
         self.rhs.clear_and_resize(self.basic_vars.len());
+        self.col_coeffs.clear_and_resize(self.basic_vars.len());
 
         self.non_basic_vars_inv.clear();
         self.non_basic_vars_inv.resize(self.num_total_vars(), 0);
@@ -829,7 +819,8 @@ impl Tableau {
                 cur_bounds[r] -= val * coeff;
             }
         }
-        self.lu_factors.solve_dense(&mut cur_bounds, &mut self.scratch);
+        self.lu_factors
+            .solve_dense(&mut cur_bounds, &mut self.scratch);
         self.cur_bounds = cur_bounds;
         for b in &mut self.cur_bounds {
             if f64::abs(*b) < 1e-8 {
@@ -850,7 +841,8 @@ impl Tableau {
             for (c, &var) in self.basic_vars.iter().enumerate() {
                 obj_coeffs[c] = -self.orig_obj[var];
             }
-            self.lu_factors_transp.solve_dense(&mut obj_coeffs, &mut self.scratch);
+            self.lu_factors_transp
+                .solve_dense(&mut obj_coeffs, &mut self.scratch);
             ArrayVec::from(obj_coeffs)
         };
 

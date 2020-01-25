@@ -44,6 +44,10 @@ impl ScatteredVec {
         self.values.len()
     }
 
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item=(usize, &'a f64)> {
+        self.nonzero.iter().map(move |&i| (i, &self.values[i]))
+    }
+
     pub fn clear(&mut self) {
         for &i in &self.nonzero {
             self.values[i] = 0.0;
@@ -89,6 +93,10 @@ impl ScatteredVec {
             }
         }
         CsVec::new(self.values.len(), indices, data)
+    }
+
+    pub fn sort(&mut self) {
+        self.nonzero.sort();
     }
 
     #[inline]
