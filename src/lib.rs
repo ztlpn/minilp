@@ -33,7 +33,7 @@ pub struct Tableau {
     scratch: ScratchSpace,
     rhs: ScatteredVec,
 
-    eta_matrices: Vec<EtaMatrix>,
+    eta_matrices: EtaMatrices,
 
     col_coeffs: ScatteredVec,
     row_coeffs: ScatteredVec,
@@ -209,7 +209,7 @@ impl Tableau {
             orig_bounds,
             lu_factors,
             lu_factors_transp,
-            eta_matrices: vec![],
+            eta_matrices: EtaMatrices::new(num_constraints),
             rhs: ScatteredVec::empty(num_constraints),
             col_coeffs: ScatteredVec::empty(num_constraints),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
@@ -571,10 +571,14 @@ impl Tableau {
         self.lu_factors.solve(&mut self.rhs, &mut self.scratch);
 
         // apply eta matrices (Vanderbei p.139)
-        for eta in &self.eta_matrices {
-            let coeff = self.rhs.get(eta.r_leaving) / eta.pivot_coeff;
-            self.rhs.mul_add(-coeff, eta.entering_coeffs.view());
-            *self.rhs.get_mut(eta.r_leaving) += coeff;
+        for idx in 0..self.eta_matrices.len() {
+            let r_leaving = self.eta_matrices.leaving_rows[idx];
+            let pivot_coeff = self.eta_matrices.pivot_coeffs[idx];
+            let coeff = self.rhs.get(r_leaving) / pivot_coeff;
+            for (r, &val) in self.eta_matrices.entering_coeff_cols.col_iter(idx) {
+                *self.rhs.get_mut(r) -= coeff * val;
+            }
+            *self.rhs.get_mut(r_leaving) += coeff;
         }
 
         std::mem::swap(&mut self.col_coeffs, &mut self.rhs);
@@ -586,16 +590,17 @@ impl Tableau {
         *self.rhs.get_mut(r_constr) = 1.0;
 
         // apply eta matrices in reverse (Vanderbei p.139)
-        for eta in self.eta_matrices.iter().rev() {
+        for idx in (0..self.eta_matrices.len()).rev() {
             let mut coeff = 0.0;
             // eta.2 `dot` rhs_transp
-            for (i, &val) in eta.entering_coeffs.iter() {
+            for (i, &val) in self.eta_matrices.entering_coeff_cols.col_iter(idx) {
                 coeff += val * self.rhs.get(i);
             }
-            coeff -= self.rhs.get(eta.r_leaving);
-            coeff /= eta.pivot_coeff;
+            let r_leaving = self.eta_matrices.leaving_rows[idx];
+            coeff -= self.rhs.get(r_leaving);
+            coeff /= self.eta_matrices.pivot_coeffs[idx];
 
-            *self.rhs.get_mut(eta.r_leaving) -= coeff;
+            *self.rhs.get_mut(r_leaving) -= coeff;
         }
 
         self.lu_factors_transp
@@ -628,17 +633,10 @@ impl Tableau {
 
         let pivot_coeff = *self.col_coeffs.get(r_leaving);
 
-        let eta_matrices_nnz = self
-            .eta_matrices
-            .iter()
-            .map(|m| m.entering_coeffs.nnz())
-            .sum::<usize>();
+        let eta_matrices_nnz = self.eta_matrices.entering_coeff_cols.nnz();
         if eta_matrices_nnz < self.lu_factors.nnz() / 2 {
-            self.eta_matrices.push(EtaMatrix {
-                r_leaving,
-                pivot_coeff,
-                entering_coeffs: self.col_coeffs.to_csvec(),
-            });
+            self.eta_matrices
+                .push(r_leaving, pivot_coeff, &self.col_coeffs);
         } else {
             self.eta_matrices.clear();
 
@@ -771,9 +769,8 @@ impl Tableau {
             let should_choose = entering_val.is_none()
                 || cur_val < entering_val.unwrap() - 1e-8
                 || (cur_val < entering_val.unwrap() + 1e-8
-                && (coeff_abs > entering_coeff_abs + 1e-8
-                    || coeff_abs > entering_coeff_abs - 1e-8
-                        && c < entering));
+                    && (coeff_abs > entering_coeff_abs + 1e-8
+                        || coeff_abs > entering_coeff_abs - 1e-8 && c < entering));
 
             if should_choose {
                 entering = c;
@@ -1037,10 +1034,37 @@ impl Tableau {
 }
 
 #[derive(Clone, Debug)]
-struct EtaMatrix {
-    r_leaving: usize,
-    pivot_coeff: f64,
-    entering_coeffs: CsVec<f64>,
+struct EtaMatrices {
+    leaving_rows: Vec<usize>,
+    pivot_coeffs: Vec<f64>,
+    entering_coeff_cols: lu::CscMat,
+}
+
+impl EtaMatrices {
+    fn new(n_rows: usize) -> EtaMatrices {
+        EtaMatrices {
+            leaving_rows: vec![],
+            pivot_coeffs: vec![],
+            entering_coeff_cols: lu::CscMat::new(n_rows),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.leaving_rows.len()
+    }
+
+    fn clear(&mut self) {
+        self.leaving_rows.clear();
+        self.pivot_coeffs.clear();
+        self.entering_coeff_cols.clear();
+    }
+
+    fn push(&mut self, leaving_row: usize, coeff: f64, entering_coeffs: &ScatteredVec) {
+        self.leaving_rows.push(leaving_row);
+        self.pivot_coeffs.push(coeff);
+        self.entering_coeff_cols
+            .append_scattered_col(entering_coeffs);
+    }
 }
 
 fn into_resized(vec: CsVec<f64>, len: usize) -> CsVec<f64> {

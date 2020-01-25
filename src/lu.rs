@@ -1,4 +1,6 @@
-use sprs::{CsMat, CsVec, CsVecView};
+use sprs::{CsMat, CsVecView};
+#[cfg(test)]
+use sprs::CsVec;
 use crate::helpers::to_dense;
 
 #[derive(Clone)]
@@ -19,7 +21,7 @@ pub struct CscMat {
 }
 
 impl CscMat {
-    fn new(n_rows: usize) -> CscMat {
+    pub fn new(n_rows: usize) -> CscMat {
         CscMat {
             n_rows,
             indptr: vec![0],
@@ -28,16 +30,23 @@ impl CscMat {
         }
     }
 
-    fn rows(&self) -> usize {
+    pub fn rows(&self) -> usize {
         self.n_rows
     }
 
-    fn cols(&self) -> usize {
+    pub fn cols(&self) -> usize {
         self.indptr.len() - 1
     }
 
-    fn nnz(&self) -> usize {
+    pub fn nnz(&self) -> usize {
         self.data.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.indices.clear();
+        self.indptr.clear();
+        self.indptr.push(0);
     }
 
     fn push(&mut self, row: usize, val: f64) {
@@ -49,26 +58,32 @@ impl CscMat {
         self.indptr.push(self.indices.len())
     }
 
-    fn col_rows(&self, i_col: usize) -> &[usize] {
+    pub fn col_rows(&self, i_col: usize) -> &[usize] {
         &self.indices[self.indptr[i_col]..self.indptr[i_col + 1]]
     }
 
-    fn col_rows_mut(&mut self, i_col: usize) -> &mut [usize] {
+    pub fn col_rows_mut(&mut self, i_col: usize) -> &mut [usize] {
         &mut self.indices[self.indptr[i_col]..self.indptr[i_col + 1]]
     }
 
-    fn col_data(&self, i_col: usize) -> &[f64] {
+    pub fn col_data(&self, i_col: usize) -> &[f64] {
         &self.data[self.indptr[i_col]..self.indptr[i_col + 1]]
     }
 
-    fn col_iter(&self, i_col: usize) -> impl Iterator<Item = (usize, &f64)> {
+    pub fn col_iter(&self, i_col: usize) -> impl Iterator<Item = (usize, &f64)> {
         self.col_rows(i_col)
             .iter()
             .copied()
             .zip(self.col_data(i_col))
     }
 
-    fn into_csmat(self) -> CsMat<f64> {
+    pub fn append_scattered_col(&mut self, col: &ScatteredVec) {
+        self.indices.extend_from_slice(&col.nonzero);
+        self.data.extend(col.iter().map(|(_, &val)| val));
+        self.seal_column();
+    }
+
+    pub fn into_csmat(self) -> CsMat<f64> {
         CsMat::new_csc(
             (self.cols(), self.n_rows),
             self.indptr,
@@ -77,12 +92,12 @@ impl CscMat {
         )
     }
 
-    fn to_csmat(&self) -> CsMat<f64> {
+    pub fn to_csmat(&self) -> CsMat<f64> {
         self.clone().into_csmat()
     }
 
     /// Pass any matrix as `prev` to save allocations with repeated use.
-    fn transpose(&self, prev: Option<CscMat>) -> CscMat {
+    pub fn transpose(&self, prev: Option<CscMat>) -> CscMat {
         let mut out = if let Some(prev) = prev {
             prev
         } else {
@@ -191,17 +206,7 @@ impl ScatteredVec {
         }
     }
 
-    pub fn mul_add(&mut self, coeff: f64, rhs: CsVecView<f64>) {
-        for (i, &val) in rhs.iter() {
-            let new_val = self.values[i] + coeff * val;
-            if !self.is_nonzero[i] && new_val != 0.0 {
-                self.is_nonzero[i] = true;
-                self.nonzero.push(i);
-            }
-            self.values[i] = new_val;
-        }
-    }
-
+    #[cfg(test)]
     pub fn to_csvec(&self) -> CsVec<f64> {
         let mut indices = vec![];
         let mut data = vec![];
