@@ -1,12 +1,10 @@
+use sprs::{CsMat, CsVec, CsVecView};
 use crate::helpers::to_dense;
-use sprs::{linalg::trisolve, CsMat, CsMatView, CsVec, CsVecView};
 
 #[derive(Clone)]
 pub struct LUFactors {
-    lower: CsMat<f64>,
-    upper: CsMat<f64>,
-    lower_unord: CscMat,
-    upper_unord: CscMat,
+    lower: CscMat,
+    upper: CscMat,
     row_perm: Option<Perm>,
     col_perm: Option<Perm>,
 }
@@ -71,7 +69,16 @@ impl CscMat {
     }
 
     fn into_csmat(self) -> CsMat<f64> {
-        CsMat::new_csc((self.cols(), self.n_rows), self.indptr, self.indices, self.data)
+        CsMat::new_csc(
+            (self.cols(), self.n_rows),
+            self.indptr,
+            self.indices,
+            self.data,
+        )
+    }
+
+    fn to_csmat(&self) -> CsMat<f64> {
+        self.clone().into_csmat()
     }
 
     /// Pass any matrix as `prev` to save allocations with repeated use.
@@ -243,11 +250,11 @@ impl ScratchSpace {
 impl std::fmt::Debug for LUFactors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "L:\n")?;
-        for row in self.lower.to_csr().outer_iterator() {
+        for row in self.lower.to_csmat().to_csr().outer_iterator() {
             write!(f, "{:?}\n", to_dense(&row))?
         }
         write!(f, "U:\n")?;
-        for row in self.upper.to_csr().outer_iterator() {
+        for row in self.upper.to_csmat().to_csr().outer_iterator() {
             write!(f, "{:?}\n", to_dense(&row))?
         }
         write!(
@@ -281,8 +288,8 @@ impl LUFactors {
             scratch.dense_rhs.copy_from_slice(rhs);
         }
 
-        trisolve::lsolve_csc_dense_rhs(self.lower.view(), &mut scratch.dense_rhs).unwrap();
-        trisolve::usolve_csc_dense_rhs(self.upper.view(), &mut scratch.dense_rhs).unwrap();
+        tri_solve_dense(&self.lower, Triangle::Lower, &mut scratch.dense_rhs);
+        tri_solve_dense(&self.upper, Triangle::Upper, &mut scratch.dense_rhs);
 
         if let Some(col_perm) = &self.col_perm {
             for i in 0..rhs.len() {
@@ -306,8 +313,8 @@ impl LUFactors {
             std::mem::swap(&mut scratch.rhs, rhs);
         }
 
-        solve_sparse_csc(self.lower.view(), Triangle::Lower, scratch);
-        solve_sparse_csc(self.upper.view(), Triangle::Upper, scratch);
+        tri_solve_sparse(&self.lower, scratch);
+        tri_solve_sparse(&self.upper, scratch);
 
         if let Some(col_perm) = &self.col_perm {
             rhs.clear();
@@ -322,13 +329,11 @@ impl LUFactors {
         }
     }
     pub fn transpose(&self) -> LUFactors {
-        let lower_unord = self.upper_unord.transpose(None);
-        let upper_unord = self.lower_unord.transpose(None);
+        let lower = self.upper.transpose(None);
+        let upper = self.lower.transpose(None);
         LUFactors {
-            lower: lower_unord.clone().into_csmat(),
-            lower_unord,
-            upper: upper_unord.clone().into_csmat(),
-            upper_unord,
+            lower,
+            upper,
             row_perm: self.col_perm.as_ref().map(|p| p.clone().inv()),
             col_perm: self.row_perm.as_ref().map(|p| p.clone().inv()),
         }
@@ -514,10 +519,8 @@ pub fn lu_factorize(
     );
 
     LUFactors {
-        lower: lower.clone().into_csmat(),
-        lower_unord: lower,
-        upper: upper.clone().into_csmat(),
-        upper_unord: upper,
+        lower,
+        upper,
         row_perm: Some(Perm {
             orig2new: orig2new_row,
             new2orig: new2orig_row,
@@ -531,6 +534,12 @@ struct MarkNonzero {
     dfs_stack: Vec<DfsStep>,
     is_visited: Vec<bool>,
     visited: Vec<usize>, // in reverse topological order
+}
+
+#[derive(Clone, Debug)]
+struct DfsStep {
+    orig_i: usize,
+    cur_child: usize,
 }
 
 impl MarkNonzero {
@@ -619,47 +628,63 @@ impl MarkNonzero {
     }
 }
 
-#[derive(Clone, Debug)]
-struct DfsStep {
-    orig_i: usize,
-    cur_child: usize,
-}
-
 enum Triangle {
     Lower,
     Upper,
 }
 
+fn tri_solve_dense(tri_mat: &CscMat, triangle: Triangle, rhs: &mut [f64]) {
+    assert_eq!(tri_mat.rows(), rhs.len());
+    match triangle {
+        Triangle::Lower => {
+            for col in 0..tri_mat.cols() {
+                tri_solve_process_col(tri_mat, col, rhs);
+            }
+        }
+
+        Triangle::Upper => {
+            for col in (0..tri_mat.cols()).rev() {
+                tri_solve_process_col(tri_mat, col, rhs);
+            }
+        }
+    };
+}
+
 /// rhs is passed via scratch.visited, scratch.values.
-fn solve_sparse_csc(tri_mat: CsMatView<f64>, triangle: Triangle, scratch: &mut ScratchSpace) {
-    assert!(tri_mat.is_csc());
+fn tri_solve_sparse(tri_mat: &CscMat, scratch: &mut ScratchSpace) {
     assert_eq!(tri_mat.rows(), scratch.rhs.len());
 
     // compute the non-zero elements of the result by dfs traversal
     scratch.mark_nonzero.run(
         &mut scratch.rhs,
-        |col| &tri_mat.indices()[tri_mat.indptr()[col]..tri_mat.indptr()[col + 1]],
+        |col| tri_mat.col_rows(col),
         |_| true,
         |orig_i| orig_i,
     );
 
     // solve for the non-zero values into dense workspace.
     // rev() because DFS returns vertices in reverse topological order.
-    for &ind in scratch.mark_nonzero.visited.iter().rev() {
-        let col = tri_mat.outer_view(ind).unwrap();
-        let diag_coeff = match triangle {
-            Triangle::Lower => *col.data().first().unwrap(),
-            Triangle::Upper => *col.data().last().unwrap(),
-        };
+    for &col in scratch.mark_nonzero.visited.iter().rev() {
+        tri_solve_process_col(tri_mat, col, &mut scratch.rhs.values);
+    }
+}
 
-        // scratch.values[orig_i] is already fully calculated.
-        let x_val = scratch.rhs.values[ind] / diag_coeff;
-        for (r, &coeff) in col.iter() {
-            if r == ind {
-                scratch.rhs.values[r] = x_val;
+fn tri_solve_process_col(tri_mat: &CscMat, col: usize, rhs: &mut [f64]) {
+    // TODO: maybe store diag elements separately so that there is no need to seek for them.
+    let i_diag = tri_mat
+        .col_rows(col)
+        .iter()
+        .position(|&r| r == col)
+        .unwrap();
+    let diag_coeff = tri_mat.col_data(col)[i_diag];
+
+    // rhs[col] is already fully calculated.
+    let x_val = rhs[col] / diag_coeff;
+    for (r, &coeff) in tri_mat.col_iter(col) {
+        if r == col {
+            rhs[r] = x_val;
             } else {
-                scratch.rhs.values[r] -= x_val * coeff;
-            }
+            rhs[r] -= x_val * coeff;
         }
     }
 }
@@ -667,7 +692,7 @@ fn solve_sparse_csc(tri_mat: CsMatView<f64>, triangle: Triangle, scratch: &mut S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::{assert_matrix_eq, to_sparse};
+    use crate::helpers::{to_sparse, assert_matrix_eq};
     use sprs::TriMat;
 
     #[test]
@@ -714,14 +739,14 @@ mod tests {
             vec![0.5, 1.0, 0.0],
             vec![0.0, 0.0, 1.0],
         ];
-        assert_matrix_eq(&lu.lower, &l_ref);
+        assert_matrix_eq(&lu.lower.to_csmat(), &l_ref);
 
         let u_ref = [
             vec![4.0, 3.0, 1.0],
             vec![0.0, 0.5, -0.5],
             vec![0.0, 0.0, 1.0],
         ];
-        assert_matrix_eq(&lu.upper, &u_ref);
+        assert_matrix_eq(&lu.upper.to_csmat(), &u_ref);
 
         assert_eq!(lu.row_perm.as_ref().unwrap().orig2new, &[1, 2, 0]);
         assert_eq!(lu.row_perm.as_ref().unwrap().new2orig, &[2, 0, 1]);
@@ -778,7 +803,7 @@ mod tests {
         let lu = lu_factorize(&mat, &cols, 0.1, &mut scratch);
         let lu_transp = lu.transpose();
 
-        let multiplied = &lu.lower * &lu.upper;
+        let multiplied = &lu.lower.to_csmat() * &lu.upper.to_csmat();
         assert!(multiplied.is_csc());
         for (i, &c) in cols.iter().enumerate() {
             let permuted = {
