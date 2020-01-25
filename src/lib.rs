@@ -686,7 +686,10 @@ impl Tableau {
         let mut entering_coeff = None;
         for c in 0..self.cur_obj.len() {
             let var = self.non_basic_vars[c];
-            if self.cur_obj[c] < 1e-8 || self.set_vars.contains_key(&var) {
+            // set_vars.is_empty() check results in small, but significant perf improvement.
+            if self.cur_obj[c] < 1e-8
+                || (!self.set_vars.is_empty() && self.set_vars.contains_key(&var))
+            {
                 continue;
             }
 
@@ -758,7 +761,8 @@ impl Tableau {
         let mut entering_coeff_abs = 0.0;
         for (c, &coeff) in self.row_coeffs.iter() {
             let var = self.non_basic_vars[c];
-            if coeff > -1e-8 || self.set_vars.contains_key(&var) {
+            // set_vars.is_empty() check results in small, but significant perf improvement.
+            if coeff > -1e-8 || (!self.set_vars.is_empty() && self.set_vars.contains_key(&var)) {
                 continue;
             }
 
