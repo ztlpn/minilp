@@ -1,5 +1,5 @@
 use crate::helpers::to_dense;
-use sprs::{linalg::trisolve, CsMat, CsMatView, CsVec, CsVecView, TriMat};
+use sprs::{linalg::trisolve, CsMat, CsMatView, CsVec, CsVecView};
 
 #[derive(Clone)]
 pub struct LUFactors {
@@ -7,6 +7,63 @@ pub struct LUFactors {
     upper: CsMat<f64>,
     row_perm: Option<Perm>,
     col_perm: Option<Perm>,
+}
+
+/// Unordered sparse matrix with elements stored by columns
+pub struct CscMat {
+    indptr: Vec<usize>,
+    indices: Vec<usize>,
+    data: Vec<f64>,
+}
+
+impl CscMat {
+    fn new() -> CscMat {
+        CscMat {
+            indptr: vec![0],
+            indices: vec![],
+            data: vec![],
+        }
+    }
+
+    fn cols(&self) -> usize {
+        self.indptr.len() - 1
+    }
+
+    fn nnz(&self) -> usize {
+        self.data.len()
+    }
+
+    fn push(&mut self, row: usize, val: f64) {
+        self.indices.push(row);
+        self.data.push(val);
+    }
+
+    fn seal_column(&mut self) {
+        self.indptr.push(self.indices.len())
+    }
+
+    fn col_rows(&self, i_col: usize) -> &[usize] {
+        &self.indices[self.indptr[i_col]..self.indptr[i_col + 1]]
+    }
+
+    fn col_rows_mut(&mut self, i_col: usize) -> &mut [usize] {
+        &mut self.indices[self.indptr[i_col]..self.indptr[i_col + 1]]
+    }
+
+    fn col_data(&self, i_col: usize) -> &[f64] {
+        &self.data[self.indptr[i_col]..self.indptr[i_col + 1]]
+    }
+
+    fn col_iter(&self, i_col: usize) -> impl Iterator<Item = (usize, &f64)> {
+        self.col_rows(i_col)
+            .iter()
+            .copied()
+            .zip(self.col_data(i_col))
+    }
+
+    fn into_csmat(self, n_rows: usize) -> CsMat<f64> {
+        CsMat::new_csc((self.cols(), n_rows), self.indptr, self.indices, self.data)
+    }
 }
 
 #[derive(Clone)]
@@ -44,7 +101,7 @@ impl ScatteredVec {
         self.values.len()
     }
 
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item=(usize, &'a f64)> {
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = (usize, &'a f64)> {
         self.nonzero.iter().map(move |&i| (i, &self.values[i]))
     }
 
@@ -245,8 +302,8 @@ pub fn lu_factorize(
     scratch.rhs.clear_and_resize(cols.len());
     scratch.mark_nonzero.clear_and_resize(cols.len());
 
-    let mut lower_cols: Vec<Col> = Vec::with_capacity(cols.len());
-    let mut upper = TriMat::new((mat.rows(), cols.len()));
+    let mut lower = CscMat::new();
+    let mut upper = CscMat::new();
 
     let mut new2orig_row = (0..mat.rows()).collect::<Vec<_>>();
     let mut orig2new_row = new2orig_row.clone();
@@ -266,7 +323,7 @@ pub fn lu_factorize(
 
         scratch.mark_nonzero.run(
             &mut scratch.rhs,
-            |new_i| &lower_cols[new_i].rows,
+            |new_i| &lower.col_rows(new_i),
             |new_i| new_i < i_col,
             |orig_r| orig2new_row[orig_r],
         );
@@ -276,7 +333,7 @@ pub fn lu_factorize(
             // values[orig_i] is already fully calculated, diag coeff = 1.0.
             let x_val = scratch.rhs.values[orig_i];
             let new_i = orig2new_row[orig_i];
-            for (orig_r, coeff) in lower_cols[new_i].iter() {
+            for (orig_r, coeff) in lower.col_iter(new_i) {
                 let new_r = orig2new_row[orig_r];
                 if new_r < i_col && new_r > new_i {
                     scratch.rhs.values[orig_r] -= x_val * coeff;
@@ -302,9 +359,9 @@ pub fn lu_factorize(
 
             if u_coeff != 0.0 {
                 let new_u_r = orig2new_row[orig_u_r];
-                upper.add_triplet(new_u_r, i_col, u_coeff);
+                upper.push(new_u_r, u_coeff);
 
-                for (orig_r, val) in lower_cols[new_u_r].iter() {
+                for (orig_r, val) in lower.col_iter(new_u_r) {
                     if orig2new_row[orig_r] >= i_col {
                         if !scratch.rhs.is_nonzero[orig_r] {
                             scratch.rhs.is_nonzero[orig_r] = true;
@@ -362,8 +419,11 @@ pub fn lu_factorize(
         }
 
         // 6, 7.
-        let mut l_col = Col::new();
-        upper.add_triplet(i_col, i_col, pivot_val);
+
+        // diagonal elements.
+        upper.push(i_col, pivot_val);
+        upper.seal_column();
+        lower.push(scratch.rhs.nonzero[pivot_i], 1.0);
 
         for i in below_rows_start..scratch.rhs.nonzero.len() {
             let orig_row = scratch.rhs.nonzero[i];
@@ -373,20 +433,17 @@ pub fn lu_factorize(
                 continue;
             }
 
-            if i == pivot_i {
-                l_col.push(orig_row, 1.0);
-            } else {
-                l_col.push(orig_row, val / pivot_val);
+            if i != pivot_i {
+                lower.push(orig_row, val / pivot_val);
             }
         }
-
-        lower_cols.push(l_col);
+        lower.seal_column();
     }
 
-    let mut lower = TriMat::new((mat.rows(), cols.len()));
-    for (c, col) in lower_cols.iter().enumerate() {
-        for (&orig_r, &val) in col.rows.iter().zip(&col.vals) {
-            lower.add_triplet(orig2new_row[orig_r], c, val);
+    // permute rows of lower to "new" indices.
+    for i_col in 0..lower.cols() {
+        for r in lower.col_rows_mut(i_col) {
+            *r = orig2new_row[*r];
         }
     }
 
@@ -397,8 +454,8 @@ pub fn lu_factorize(
     );
 
     LUFactors {
-        lower: lower.to_csc(),
-        upper: upper.to_csc(),
+        lower: lower.into_csmat(mat.rows()),
+        upper: upper.into_csmat(mat.rows()),
         row_perm: Some(Perm {
             orig2new: orig2new_row,
             new2orig: new2orig_row,
@@ -506,30 +563,6 @@ struct DfsStep {
     cur_child: usize,
 }
 
-#[derive(Debug)]
-struct Col {
-    rows: Vec<usize>, // not necessarily sorted. correspond to "old" rows.
-    vals: Vec<f64>,
-}
-
-impl Col {
-    fn new() -> Col {
-        Col {
-            rows: vec![],
-            vals: vec![],
-        }
-    }
-
-    fn push(&mut self, r: usize, val: f64) {
-        self.rows.push(r);
-        self.vals.push(val);
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
-        self.rows.iter().zip(&self.vals).map(|(&r, &v)| (r, v))
-    }
-}
-
 enum Triangle {
     Lower,
     Upper,
@@ -573,6 +606,7 @@ fn solve_sparse_csc(tri_mat: CsMatView<f64>, triangle: Triangle, scratch: &mut S
 mod tests {
     use super::*;
     use crate::helpers::{assert_matrix_eq, to_sparse};
+    use sprs::TriMat;
 
     #[test]
     fn lu_simple() {
