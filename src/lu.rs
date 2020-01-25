@@ -5,24 +5,33 @@ use sprs::{linalg::trisolve, CsMat, CsMatView, CsVec, CsVecView};
 pub struct LUFactors {
     lower: CsMat<f64>,
     upper: CsMat<f64>,
+    lower_unord: CscMat,
+    upper_unord: CscMat,
     row_perm: Option<Perm>,
     col_perm: Option<Perm>,
 }
 
 /// Unordered sparse matrix with elements stored by columns
+#[derive(Clone, Debug)]
 pub struct CscMat {
+    n_rows: usize,
     indptr: Vec<usize>,
     indices: Vec<usize>,
     data: Vec<f64>,
 }
 
 impl CscMat {
-    fn new() -> CscMat {
+    fn new(n_rows: usize) -> CscMat {
         CscMat {
+            n_rows,
             indptr: vec![0],
             indices: vec![],
             data: vec![],
         }
+    }
+
+    fn rows(&self) -> usize {
+        self.n_rows
     }
 
     fn cols(&self) -> usize {
@@ -61,8 +70,55 @@ impl CscMat {
             .zip(self.col_data(i_col))
     }
 
-    fn into_csmat(self, n_rows: usize) -> CsMat<f64> {
-        CsMat::new_csc((self.cols(), n_rows), self.indptr, self.indices, self.data)
+    fn into_csmat(self) -> CsMat<f64> {
+        CsMat::new_csc((self.cols(), self.n_rows), self.indptr, self.indices, self.data)
+    }
+
+    /// Pass any matrix as `prev` to save allocations with repeated use.
+    fn transpose(&self, prev: Option<CscMat>) -> CscMat {
+        let mut out = if let Some(prev) = prev {
+            prev
+        } else {
+            CscMat {
+                n_rows: self.cols(),
+                indptr: vec![],
+                indices: vec![],
+                data: vec![],
+            }
+        };
+        out.n_rows = self.cols();
+
+        // calculate row counts and store them in the indptr array.
+        out.indptr.clear();
+        out.indptr.resize(self.rows() + 1, 0);
+        for c in 0..self.cols() {
+            for &r in self.col_rows(c) {
+                out.indptr[r] += 1;
+            }
+        }
+
+        // calculate cumulative counts so that indptr elements point to
+        // the *ends* of each resulting row.
+        for r in 1..out.indptr.len() {
+            out.indptr[r] += out.indptr[r - 1];
+        }
+
+        // place the elements
+        out.indices.clear();
+        out.indices.resize(self.nnz(), 0);
+        out.data.clear();
+        out.data.resize(self.nnz(), 0.0);
+        for c in 0..self.cols() {
+            for (r, &val) in self.col_iter(c) {
+                out.indptr[r] -= 1;
+                out.indices[out.indptr[r]] = c;
+                out.data[out.indptr[r]] = val;
+            }
+        }
+
+        *out.indptr.last_mut().unwrap() = self.nnz();
+
+        out
     }
 }
 
@@ -266,9 +322,13 @@ impl LUFactors {
         }
     }
     pub fn transpose(&self) -> LUFactors {
+        let lower_unord = self.upper_unord.transpose(None);
+        let upper_unord = self.lower_unord.transpose(None);
         LUFactors {
-            lower: self.upper.transpose_view().to_csc(),
-            upper: self.lower.transpose_view().to_csc(),
+            lower: lower_unord.clone().into_csmat(),
+            lower_unord,
+            upper: upper_unord.clone().into_csmat(),
+            upper_unord,
             row_perm: self.col_perm.as_ref().map(|p| p.clone().inv()),
             col_perm: self.row_perm.as_ref().map(|p| p.clone().inv()),
         }
@@ -302,8 +362,8 @@ pub fn lu_factorize(
     scratch.rhs.clear_and_resize(cols.len());
     scratch.mark_nonzero.clear_and_resize(cols.len());
 
-    let mut lower = CscMat::new();
-    let mut upper = CscMat::new();
+    let mut lower = CscMat::new(mat.rows());
+    let mut upper = CscMat::new(mat.rows());
 
     let mut new2orig_row = (0..mat.rows()).collect::<Vec<_>>();
     let mut orig2new_row = new2orig_row.clone();
@@ -454,8 +514,10 @@ pub fn lu_factorize(
     );
 
     LUFactors {
-        lower: lower.into_csmat(mat.rows()),
-        upper: upper.into_csmat(mat.rows()),
+        lower: lower.clone().into_csmat(),
+        lower_unord: lower,
+        upper: upper.clone().into_csmat(),
+        upper_unord: upper,
         row_perm: Some(Perm {
             orig2new: orig2new_row,
             new2orig: new2orig_row,
@@ -607,6 +669,23 @@ mod tests {
     use super::*;
     use crate::helpers::{assert_matrix_eq, to_sparse};
     use sprs::TriMat;
+
+    #[test]
+    fn mat_transpose() {
+        let mut mat = CscMat::new(2);
+        mat.push(0, 1.1);
+        mat.push(1, 2.2);
+        mat.seal_column();
+        mat.push(1, 3.3);
+        mat.seal_column();
+        mat.push(0, 4.4);
+        mat.seal_column();
+
+        let transp = mat.transpose(None);
+        assert_eq!(&transp.indptr, &[0, 2, 4]);
+        assert_eq!(&transp.indices, &[2, 0, 1, 0]);
+        assert_eq!(&transp.data, &[4.4, 1.1, 3.3, 2.2]);
+    }
 
     #[test]
     fn lu_simple() {
