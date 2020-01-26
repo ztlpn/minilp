@@ -1,6 +1,35 @@
-use sprs::{CsMat, CsVecView};
+use sprs::CsMat;
 #[cfg(test)]
 use sprs::CsVec;
+
+#[derive(Clone, Debug)]
+pub struct SparseVec {
+    indices: Vec<usize>,
+    values: Vec<f64>,
+}
+
+impl SparseVec {
+    pub fn new() -> SparseVec {
+        SparseVec {
+            indices: vec![],
+            values: vec![],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.indices.clear();
+        self.values.clear();
+    }
+
+    pub fn push(&mut self, i: usize, val: f64) {
+        self.indices.push(i);
+        self.values.push(val);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &f64)> {
+        self.indices.iter().copied().zip(&self.values)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ScatteredVec {
@@ -40,12 +69,23 @@ impl ScatteredVec {
         self.is_nonzero.resize(n, false);
     }
 
-    pub fn set(&mut self, rhs: CsVecView<f64>) {
+    pub fn set<'a, T>(&mut self, rhs: T)
+    where
+        T: IntoIterator<Item = (usize, &'a f64)>,
+    {
         self.clear();
-        for (i, &val) in rhs.iter() {
+        for (i, &val) in rhs {
             self.is_nonzero[i] = true;
             self.nonzero.push(i);
             self.values[i] = val;
+        }
+    }
+
+    pub fn to_sparse_vec(&mut self, lhs: &mut SparseVec) {
+        lhs.clear();
+        for &idx in &self.nonzero {
+            lhs.indices.push(idx);
+            lhs.values.push(self.values[idx])
         }
     }
 
@@ -145,9 +185,15 @@ impl SparseMat {
             .zip(self.col_data(i_col))
     }
 
-    pub fn append_scattered_col(&mut self, col: &ScatteredVec) {
-        self.indices.extend_from_slice(&col.nonzero);
-        self.data.extend(col.iter().map(|(_, &val)| val));
+    pub fn append_col<'a, T>(&mut self, col: T)
+    where
+        T: IntoIterator<Item = (usize, &'a f64)>,
+    {
+        assert_eq!(*self.indptr.last().unwrap(), self.indices.len()); // prev column is sealed
+        for (idx, &val) in col {
+            self.indices.push(idx);
+            self.data.push(val);
+        }
         self.seal_column();
     }
 

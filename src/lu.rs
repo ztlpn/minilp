@@ -542,14 +542,14 @@ mod tests {
 
         {
             let mut rhs = ScatteredVec::empty(3);
-            rhs.set(to_sparse(&[0.0, -1.0, 0.0]).view());
+            rhs.set(to_sparse(&[0.0, -1.0, 0.0]).iter());
             lu.solve(&mut rhs, &mut scratch);
             assert_eq!(to_dense(&rhs.to_csvec()), vec![1.0, -1.0, -1.0]);
         }
 
         {
             let mut rhs = ScatteredVec::empty(3);
-            rhs.set(to_sparse(&[0.0, -1.0, 1.0]).view());
+            rhs.set(to_sparse(&[0.0, -1.0, 1.0]).iter());
             lu_transp.solve(&mut rhs, &mut scratch);
             assert_eq!(to_dense(&rhs.to_csvec()), vec![-2.0, 0.0, 1.0]);
         }
@@ -626,7 +626,7 @@ mod tests {
 
         {
             let mut rhs = ScatteredVec::empty(size);
-            rhs.set(sparse_rhs.view());
+            rhs.set(sparse_rhs.iter());
             lu.solve(&mut rhs, &mut scratch);
             let diff = &sparse_rhs - &(&mat * &rhs.to_csvec());
             assert!(diff.norm(1.0) < 1e-5);
@@ -634,7 +634,7 @@ mod tests {
 
         {
             let mut rhs_t = ScatteredVec::empty(size);
-            rhs_t.set(sparse_rhs.view());
+            rhs_t.set(sparse_rhs.iter());
             lu_transp.solve(&mut rhs_t, &mut scratch);
             let diff = &sparse_rhs - &(&mat.transpose_view() * &rhs_t.to_csvec());
             assert!(diff.norm(1.0) < 1e-5);
