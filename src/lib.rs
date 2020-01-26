@@ -6,8 +6,11 @@ pub use sprs::CsVec;
 use sprs::{CompressedStorage, CsMat};
 use std::collections::{BTreeSet, HashMap};
 
+mod sparse;
+use sparse::{SparseMat, ScatteredVec};
+
 mod lu;
-use lu::{lu_factorize, LUFactors, ScatteredVec, ScratchSpace};
+use lu::{lu_factorize, LUFactors, ScratchSpace};
 
 mod helpers;
 use helpers::{resized_view, to_dense};
@@ -1041,7 +1044,7 @@ impl Tableau {
 struct EtaMatrices {
     leaving_rows: Vec<usize>,
     pivot_coeffs: Vec<f64>,
-    entering_coeff_cols: lu::CscMat,
+    entering_coeff_cols: SparseMat,
 }
 
 impl EtaMatrices {
@@ -1049,7 +1052,7 @@ impl EtaMatrices {
         EtaMatrices {
             leaving_rows: vec![],
             pivot_coeffs: vec![],
-            entering_coeff_cols: lu::CscMat::new(n_rows),
+            entering_coeff_cols: SparseMat::new(n_rows),
         }
     }
 
