@@ -95,7 +95,7 @@ pub enum Error {
 }
 
 impl Tableau {
-    pub fn new(mut obj: Vec<f64>, constraints: Vec<Constraint>) -> Tableau {
+    pub fn new(mut obj: Vec<f64>, constraints: Vec<Constraint>) -> Self {
         let enable_steepest_edge = false;
 
         let num_vars = obj.len();
@@ -259,7 +259,7 @@ impl Tableau {
         values
     }
 
-    pub fn move_to_solution(&mut self, solution: &[f64]) -> Result<(), Error> {
+    pub fn move_to_solution(mut self, solution: &[f64]) -> Result<Self, Error> {
         assert_eq!(solution.len(), self.num_vars);
 
         // fill the slack variables.
@@ -320,10 +320,10 @@ impl Tableau {
         // Transition is feasible, we can remove artificial vars.
         self.remove_artificial_vars();
         self.recalc_cur_state();
-        Ok(())
+        Ok(self)
     }
 
-    pub fn canonicalize(&mut self) -> Result<(), Error> {
+    pub fn canonicalize(mut self) -> Result<Self, Error> {
         let mut cur_artificial_vars = self.num_artificial_vars;
         trace!("TAB {:?}", self);
         for iter in 0.. {
@@ -371,12 +371,12 @@ impl Tableau {
         self.remove_artificial_vars();
         self.recalc_cur_state();
         trace!("CANONICAL TAB {:?}", self);
-        Ok(())
+        Ok(self)
     }
 
-    pub fn optimize(&mut self) -> Result<(), Error> {
+    pub fn optimize(mut self) -> Result<Self, Error> {
         if self.num_artificial_vars > 0 {
-            self.canonicalize()?;
+            self = self.canonicalize()?;
         }
 
         for iter in 0.. {
@@ -406,12 +406,12 @@ impl Tableau {
         }
 
         trace!("OPTIMIZED TAB {:?}", self);
-        Ok(())
+        Ok(self)
     }
 
-    pub fn restore_feasibility(&mut self) -> Result<(), Error> {
+    pub fn restore_feasibility(mut self) -> Result<Self, Error> {
         if self.num_artificial_vars > 0 {
-            self.canonicalize()?;
+            self = self.canonicalize()?;
         }
 
         for iter in 0.. {
@@ -440,26 +440,14 @@ impl Tableau {
             self.pivot(c_entering, r_pivot, pivot_coeff);
         }
 
-        Ok(())
+        Ok(self)
     }
 
     /// Precondition: optimality
-    pub fn set_var(&mut self, var: usize, val: f64) -> Result<(), Error> {
+    pub fn set_var(mut self, var: usize, val: f64) -> Result<Self, Error> {
         assert_eq!(self.num_artificial_vars, 0);
         assert!(self.set_vars.insert(var, val).is_none());
-        // If additional constraint renders the problem infeasible, tableau can become garbled.
-        // We protect against it by saving basic variables and returning to them if that happens.
-        let orig_basic_vars = self.basic_vars.clone();
-        if let Err(e) = self.set_var_impl(var, val) {
-            self.set_vars.remove(&var);
-            self.basic_vars = orig_basic_vars;
-            self.recalc_cur_state();
-            return Err(e);
-        }
-        Ok(())
-    }
 
-    fn set_var_impl(&mut self, var: usize, val: f64) -> Result<(), Error> {
         let basic_row = self.basic_vars.iter().position(|&v| v == var);
         let non_basic_col = self.non_basic_vars.iter().position(|&v| v == var);
 
@@ -483,14 +471,14 @@ impl Tableau {
             );
         }
 
-        self.restore_feasibility()?;
-        self.optimize().unwrap();
-        Ok(())
+        self = self.restore_feasibility()?;
+        self = self.optimize().unwrap();
+        Ok(self)
     }
 
     /// Precondition: optimality.
     /// Return true if the var was really unset.
-    pub fn unset_var(&mut self, var: usize) -> Result<bool, Error> {
+    pub fn unset_var(mut self, var: usize) -> Result<(Self, bool), Error> {
         if let Some(val) = self.set_vars.remove(&var) {
             let col = self.non_basic_vars.iter().position(|&v| v == var).unwrap();
             self.calc_col_coeffs(col);
@@ -499,24 +487,22 @@ impl Tableau {
             }
             self.cur_obj_val += val * self.cur_obj[col];
 
-            self.restore_feasibility()?;
-            self.optimize().unwrap();
-            Ok(true)
+            self = self.restore_feasibility()?;
+            self = self.optimize().unwrap();
+            Ok((self, true))
         } else {
-            Ok(false)
+            Ok((self, false))
         }
     }
 
-    pub fn add_constraints(&mut self, constraints: &[Constraint]) -> Result<(), Error> {
+    pub fn add_constraints(mut self, constraints: &[Constraint]) -> Result<Self, Error> {
         assert_eq!(self.num_artificial_vars, 0);
         // TODO: assert optimality.
 
-        let mut tmp = self.clone();
-
         // each constraint adds a slack var
-        let new_num_total_vars = tmp.num_total_vars() + constraints.len();
+        let new_num_total_vars = self.num_total_vars() + constraints.len();
         let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_num_total_vars);
-        for row in tmp.orig_constraints.outer_iterator() {
+        for row in self.orig_constraints.outer_iterator() {
             new_orig_constraints =
                 new_orig_constraints.append_outer_csvec(resized_view(&row, new_num_total_vars));
         }
@@ -531,30 +517,28 @@ impl Tableau {
             assert_eq!(coeffs.dim(), self.num_vars);
             assert!(bound >= 0.0);
 
-            let slack_var = tmp.num_vars + tmp.num_slack_vars;
-            tmp.num_slack_vars += 1;
+            let slack_var = self.num_vars + self.num_slack_vars;
+            self.num_slack_vars += 1;
 
-            tmp.orig_obj.push(0.0);
+            self.orig_obj.push(0.0);
 
             coeffs = into_resized(coeffs, new_num_total_vars);
             coeffs.append(slack_var, 1.0);
             new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
 
-            tmp.orig_bounds.push(bound);
+            self.orig_bounds.push(bound);
 
-            tmp.basic_vars.push(slack_var);
+            self.basic_vars.push(slack_var);
         }
 
-        tmp.orig_constraints = new_orig_constraints;
-        tmp.orig_constraints_csc = tmp.orig_constraints.to_csc();
+        self.orig_constraints = new_orig_constraints;
+        self.orig_constraints_csc = self.orig_constraints.to_csc();
 
-        tmp.recalc_cur_state();
+        self.recalc_cur_state();
 
-        tmp.restore_feasibility()?;
-        tmp.optimize().unwrap();
-
-        *self = tmp;
-        Ok(())
+        self = self.restore_feasibility()?;
+        self = self.optimize().unwrap();
+        Ok(self)
     }
 
     pub fn print_stats(&self) {
@@ -1187,7 +1171,7 @@ mod tests {
 
     #[test]
     fn canonicalize() {
-        let mut tab = Tableau::new(
+        let tab = Tableau::new(
             vec![-3.0, -4.0],
             vec![
                 Constraint::Ge(to_sparse(&[1.0, 0.0]), 10.0),
@@ -1195,9 +1179,9 @@ mod tests {
                 Constraint::Le(to_sparse(&[1.0, 1.0]), 20.0),
                 Constraint::Le(to_sparse(&[-1.0, 4.0]), 20.0),
             ],
-        );
-
-        tab.canonicalize().unwrap();
+        )
+        .canonicalize()
+        .unwrap();
 
         assert_eq!(tab.num_vars, 2);
         assert_eq!(tab.num_slack_vars, 4);
@@ -1223,7 +1207,7 @@ mod tests {
             ],
         );
 
-        tab.optimize().unwrap();
+        tab = tab.optimize().unwrap();
         assert_eq!(tab.cur_solution(), vec![12.0, 8.0]);
         assert_eq!(tab.cur_obj_val(), -68.0);
     }
@@ -1240,52 +1224,50 @@ mod tests {
         );
 
         assert_eq!(
-            tab.move_to_solution(&[0.0, 4.0]).err(),
+            tab.clone().move_to_solution(&[0.0, 4.0]).err(),
             Some(Error::Infeasible)
         );
         assert_eq!(
-            tab.move_to_solution(&[0.5, 3.0]).err(),
+            tab.clone().move_to_solution(&[0.5, 3.0]).err(),
             Some(Error::Infeasible)
         );
 
-        assert!(tab.move_to_solution(&[1.0, 3.0]).is_ok());
+        tab = tab.move_to_solution(&[1.0, 3.0]).unwrap();
         assert_eq!(tab.cur_obj_val(), 5.0);
 
-        tab.optimize().unwrap();
+        tab = tab.optimize().unwrap();
         assert_eq!(tab.cur_solution(), vec![0.0, 3.0]);
         assert_eq!(tab.cur_obj_val(), 3.0);
     }
 
     #[test]
     fn set_unset_var() {
-        let mut orig_tab = Tableau::new(
+        let orig_tab = Tableau::new(
             vec![2.0, 1.0],
             vec![
                 Constraint::Le(to_sparse(&[1.0, 1.0]), 4.0),
                 Constraint::Ge(to_sparse(&[1.0, 1.0]), 2.0),
             ],
-        );
-        orig_tab.canonicalize().unwrap();
-        orig_tab.optimize().unwrap();
+        )
+        .optimize()
+        .unwrap();
 
         {
-            let mut tab = orig_tab.clone();
-            tab.set_var(0, 3.0).unwrap();
+            let mut tab = orig_tab.clone().set_var(0, 3.0).unwrap();
             assert_eq!(tab.cur_solution(), vec![3.0, 0.0]);
             assert_eq!(tab.cur_obj_val(), 6.0);
 
-            tab.unset_var(0).unwrap();
+            tab = tab.unset_var(0).unwrap().0;
             assert_eq!(tab.cur_solution(), vec![0.0, 2.0]);
             assert_eq!(tab.cur_obj_val(), 2.0);
         }
 
         {
-            let mut tab = orig_tab.clone();
-            tab.set_var(1, 3.0).unwrap();
+            let mut tab = orig_tab.clone().set_var(1, 3.0).unwrap();
             assert_eq!(tab.cur_solution(), vec![0.0, 3.0]);
             assert_eq!(tab.cur_obj_val(), 3.0);
 
-            tab.unset_var(1).unwrap();
+            tab = tab.unset_var(1).unwrap().0;
             assert_eq!(tab.cur_solution(), vec![0.0, 2.0]);
             assert_eq!(tab.cur_obj_val(), 2.0);
         }
@@ -1293,28 +1275,31 @@ mod tests {
 
     #[test]
     fn add_constraint() {
-        let mut orig_tab = Tableau::new(
+        let orig_tab = Tableau::new(
             vec![2.0, 1.0],
             vec![
                 Constraint::Le(to_sparse(&[1.0, 1.0]), 4.0),
                 Constraint::Ge(to_sparse(&[1.0, 1.0]), 2.0),
             ],
-        );
-        orig_tab.canonicalize().unwrap();
-        orig_tab.optimize().unwrap();
+        )
+        .optimize()
+        .unwrap();
 
         {
-            let mut tab = orig_tab.clone();
-            tab.add_constraints(&[Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0)])
+            let tab = orig_tab
+                .clone()
+                .add_constraints(&[Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0)])
                 .unwrap();
             assert_eq!(tab.cur_solution(), [1.0, 1.0]);
             assert_eq!(tab.cur_obj_val(), 3.0);
         }
 
         {
-            let mut tab = orig_tab.clone();
-            tab.set_var(1, 1.5).unwrap();
-            tab.add_constraints(&[Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0)])
+            let tab = orig_tab
+                .clone()
+                .set_var(1, 1.5)
+                .unwrap()
+                .add_constraints(&[Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0)])
                 .unwrap();
             assert_eq!(tab.cur_solution(), [1.5, 1.5]);
             assert_eq!(tab.cur_obj_val(), 4.5);
