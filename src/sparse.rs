@@ -29,6 +29,10 @@ impl SparseVec {
     pub fn iter(&self) -> impl Iterator<Item = (usize, &f64)> {
         self.indices.iter().copied().zip(&self.values)
     }
+
+    pub fn sq_norm(&self) -> f64 {
+        self.values.iter().map(|&v| v * v).sum()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +57,10 @@ impl ScatteredVec {
 
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = (usize, &'a f64)> {
         self.nonzero.iter().map(move |&i| (i, &self.values[i]))
+    }
+
+    pub fn sq_norm(&self) -> f64 {
+        self.nonzero.iter().map(|&i| self.values[i] * self.values[i]).sum()
     }
 
     pub fn clear(&mut self) {

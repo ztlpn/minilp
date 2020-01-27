@@ -30,28 +30,33 @@ pub struct Tableau {
     orig_constraints_csc: CsMat<f64>,
     orig_bounds: Vec<f64>,
 
-    // LU factors of the basis matrix
+    set_vars: HashMap<usize, f64>,
+
+    enable_steepest_edge: bool,
+
+    // Related to inversion of the basis matrix
     lu_factors: LUFactors,
     lu_factors_transp: LUFactors,
     scratch: ScratchSpace,
+    eta_matrices: EtaMatrices,
     rhs: ScatteredVec,
 
-    eta_matrices: EtaMatrices,
-
+    // Recomputed on each pivot
     col_coeffs: SparseVec,
     eta_matrix_coeffs: SparseVec,
+    sq_norms_update_helper: ScatteredVec,
     row_coeffs: ScatteredVec,
 
+    // Updated on each pivot
     basic_vars: Vec<usize>, // for each constraint the corresponding basic var.
     cur_bounds: Vec<f64>,
 
     non_basic_vars: Vec<usize>,     // remaining variables. (idx -> var)
     non_basic_vars_inv: Vec<usize>, // (var -> idx)
     cur_obj: Vec<f64>,
+    non_basic_col_sq_norms: Vec<f64>,
 
     cur_obj_val: f64,
-
-    set_vars: HashMap<usize, f64>,
 }
 
 impl std::fmt::Debug for Tableau {
@@ -66,11 +71,9 @@ impl std::fmt::Debug for Tableau {
             write!(f, "{:?}\n", to_dense(&row))?;
         }
         write!(f, "orig_bounds:\n{:?}\n", self.orig_bounds)?;
-        write!(f, "lu_factors:\n{:?}", self.lu_factors)?;
         write!(f, "basic_vars:\n{:?}\n", self.basic_vars)?;
         write!(f, "cur_bounds:\n{:?}\n", self.cur_bounds)?;
         write!(f, "non_basic_vars:\n{:?}\n", self.non_basic_vars)?;
-        write!(f, "non_basic_vars_inv:\n{:?}\n", self.non_basic_vars_inv)?;
         write!(f, "cur_obj:\n{:?}\n", self.cur_obj)?;
         write!(f, "cur_obj_val: {:?}\n", self.cur_obj_val)?;
         write!(f, "set_vars:\n{:?}\n", self.set_vars)?;
@@ -93,6 +96,8 @@ pub enum Error {
 
 impl Tableau {
     pub fn new(mut obj: Vec<f64>, constraints: Vec<Constraint>) -> Tableau {
+        let enable_steepest_edge = false;
+
         let num_vars = obj.len();
         let (num_slack_vars, num_artificial_vars) = {
             let mut s = 0;
@@ -174,29 +179,25 @@ impl Tableau {
             orig_bounds.push(bound);
         }
 
-        let (non_basic_vars, non_basic_vars_inv) = {
-            let mut forward = vec![];
-            let mut inv = vec![SENTINEL; num_total_vars];
-
-            for v in 0..num_total_vars {
-                if !is_basic_var[v] {
-                    inv[v] = forward.len();
-                    forward.push(v);
-                }
-            }
-            (forward, inv)
-        };
-
         let orig_constraints_csc = orig_constraints.to_csc();
 
-        let cur_obj = {
-            let mut res = vec![];
-            for &var in &non_basic_vars {
-                let col = orig_constraints_csc.outer_view(var).unwrap();
-                res.push(artificial_multipliers.dot(&col));
+        let mut non_basic_vars = vec![];
+        let mut non_basic_vars_inv = vec![SENTINEL; num_total_vars];
+        let mut cur_obj = vec![];
+        let mut non_basic_col_sq_norms = vec![];
+        for v in 0..num_total_vars {
+            if !is_basic_var[v] {
+                non_basic_vars_inv[v] = non_basic_vars.len();
+                non_basic_vars.push(v);
+
+                let col = orig_constraints_csc.outer_view(v).unwrap();
+                cur_obj.push(artificial_multipliers.dot(&col));
+
+                if enable_steepest_edge {
+                    non_basic_col_sq_norms.push(col.squared_l2_norm());
+                }
             }
-            res
-        };
+        }
 
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
         let lu_factors = lu_factorize(&orig_constraints_csc, &basic_vars, 0.1, &mut scratch);
@@ -211,21 +212,24 @@ impl Tableau {
             orig_constraints,
             orig_constraints_csc,
             orig_bounds,
+            set_vars: HashMap::new(),
+            enable_steepest_edge,
             lu_factors,
             lu_factors_transp,
+            scratch,
             eta_matrices: EtaMatrices::new(num_constraints),
             rhs: ScatteredVec::empty(num_constraints),
             col_coeffs: SparseVec::new(),
             eta_matrix_coeffs: SparseVec::new(),
+            sq_norms_update_helper: ScatteredVec::empty(num_total_vars - num_constraints),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
-            scratch,
             basic_vars,
             cur_bounds,
             non_basic_vars,
             non_basic_vars_inv,
             cur_obj,
+            non_basic_col_sq_norms,
             cur_obj_val: artificial_obj_val,
-            set_vars: HashMap::new(),
         }
     }
 
@@ -401,6 +405,7 @@ impl Tableau {
             }
         }
 
+        trace!("OPTIMIZED TAB {:?}", self);
         Ok(())
     }
 
@@ -599,11 +604,7 @@ impl Tableau {
         }
     }
 
-    /// Calculate current coeffs row for a single constraint (permuted according to non_basic_vars).
-    fn calc_row_coeffs(&mut self, r_constr: usize) {
-        self.rhs.clear();
-        *self.rhs.get_mut(r_constr) = 1.0;
-
+    fn solve_basis_transp(&mut self) {
         // apply eta matrices in reverse (Vanderbei p.139)
         for idx in (0..self.eta_matrices.len()).rev() {
             let mut coeff = 0.0;
@@ -617,6 +618,13 @@ impl Tableau {
 
         self.lu_factors_transp
             .solve(&mut self.rhs, &mut self.scratch);
+    }
+
+    /// Calculate current coeffs row for a single constraint (permuted according to non_basic_vars).
+    fn calc_row_coeffs(&mut self, r_constr: usize) {
+        self.rhs.clear();
+        *self.rhs.get_mut(r_constr) = 1.0;
+        self.solve_basis_transp();
 
         self.row_coeffs.clear();
         for (r, &coeff) in self.rhs.iter() {
@@ -630,35 +638,6 @@ impl Tableau {
     }
 
     fn pivot(&mut self, c_entering: usize, r_leaving: usize, pivot_coeff: f64) -> usize {
-        let entering_var = self.non_basic_vars[c_entering];
-        let leaving_var = std::mem::replace(&mut self.basic_vars[r_leaving], entering_var);
-        std::mem::replace(&mut self.non_basic_vars[c_entering], leaving_var);
-        self.non_basic_vars_inv[entering_var] = SENTINEL;
-        self.non_basic_vars_inv[leaving_var] = c_entering;
-        trace!(
-            "PIVOT entering {} (col #{}) leaving {} (row #{})",
-            entering_var,
-            c_entering,
-            leaving_var,
-            r_leaving,
-        );
-
-        let eta_matrices_nnz = self.eta_matrices.coeff_cols.nnz();
-        if eta_matrices_nnz < self.lu_factors.nnz() / 2 {
-            self.calc_eta_matrix_coeffs(r_leaving, pivot_coeff);
-            self.eta_matrices.push(r_leaving, &self.eta_matrix_coeffs);
-        } else {
-            self.eta_matrices.clear_and_resize(self.num_constraints());
-
-            self.lu_factors = lu_factorize(
-                &self.orig_constraints_csc,
-                &self.basic_vars,
-                0.1,
-                &mut self.scratch,
-            );
-            self.lu_factors_transp = self.lu_factors.transpose();
-        }
-
         let pivot_bound = self.cur_bounds[r_leaving] / pivot_coeff;
         for (r, coeff) in self.col_coeffs.iter() {
             if r == r_leaving {
@@ -687,13 +666,73 @@ impl Tableau {
             }
         }
 
+        self.calc_eta_matrix_coeffs(r_leaving, pivot_coeff);
+
+        if self.enable_steepest_edge {
+            // Vanderbei p. 149.
+            self.rhs.set(self.eta_matrix_coeffs.iter());
+            self.solve_basis_transp();
+            // now self.rhs contains the (w - v)/x_i vector.
+
+            // Calculate transp(N) * (w - v) / x_1
+            self.sq_norms_update_helper.clear();
+            for (r, &coeff) in self.rhs.iter() {
+                for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
+                    let idx = self.non_basic_vars_inv[v];
+                    if idx != SENTINEL {
+                        *self.sq_norms_update_helper.get_mut(idx) += val * coeff;
+                    }
+                }
+            }
+
+            let eta_sq_norm = self.eta_matrix_coeffs.sq_norm();
+            for (c, &r_coeff) in self.row_coeffs.iter() {
+                if c == c_entering {
+                    self.non_basic_col_sq_norms[c] = eta_sq_norm - 1.0 + 2.0 / pivot_coeff;
+                } else {
+                    self.non_basic_col_sq_norms[c] +=
+                        -2.0 * r_coeff * self.sq_norms_update_helper.get(c)
+                            + eta_sq_norm * r_coeff * r_coeff;
+                }
+            }
+        }
+
+        let entering_var = self.non_basic_vars[c_entering];
+        let leaving_var = std::mem::replace(&mut self.basic_vars[r_leaving], entering_var);
+        std::mem::replace(&mut self.non_basic_vars[c_entering], leaving_var);
+        self.non_basic_vars_inv[entering_var] = SENTINEL;
+        self.non_basic_vars_inv[leaving_var] = c_entering;
+
+        let eta_matrices_nnz = self.eta_matrices.coeff_cols.nnz();
+        if eta_matrices_nnz < self.lu_factors.nnz() / 2 {
+            self.eta_matrices.push(r_leaving, &self.eta_matrix_coeffs);
+        } else {
+            self.eta_matrices.clear_and_resize(self.num_constraints());
+
+            self.lu_factors = lu_factorize(
+                &self.orig_constraints_csc,
+                &self.basic_vars,
+                0.1,
+                &mut self.scratch,
+            );
+            self.lu_factors_transp = self.lu_factors.transpose();
+        }
+
+        trace!(
+            "PIVOT entering {} (col #{}) leaving {} (row #{})",
+            entering_var,
+            c_entering,
+            leaving_var,
+            r_leaving,
+        );
+
         leaving_var
     }
 
     // index in the non_basic_vars permutation.
     fn choose_entering_col(&self) -> Option<usize> {
         let mut entering = None;
-        let mut entering_coeff = None;
+        let mut entering_val = None;
         for c in 0..self.cur_obj.len() {
             let var = self.non_basic_vars[c];
             // set_vars.is_empty() check results in a small, but significant perf improvement.
@@ -703,9 +742,15 @@ impl Tableau {
                 continue;
             }
 
-            if entering_coeff.is_none() || self.cur_obj[c] > entering_coeff.unwrap() {
+            let val = if self.num_artificial_vars == 0 && self.enable_steepest_edge {
+                self.cur_obj[c] * self.cur_obj[c] / (self.non_basic_col_sq_norms[c] + 1.0)
+            } else {
+                self.cur_obj[c]
+            };
+            // let val = self.cur_obj[c];
+            if entering_val.is_none() || val > entering_val.unwrap() {
                 entering = Some(c);
-                entering_coeff = Some(self.cur_obj[c]);
+                entering_val = Some(val);
             }
         }
 
@@ -887,6 +932,16 @@ impl Tableau {
                 val = 0.0;
             }
             self.cur_obj.push(val);
+        }
+
+        if self.enable_steepest_edge {
+            self.non_basic_col_sq_norms.clear();
+            for &var in &self.non_basic_vars {
+                let col = self.orig_constraints_csc.outer_view(var).unwrap();
+                self.rhs.set(col.iter());
+                self.lu_factors.solve(&mut self.rhs, &mut self.scratch);
+                self.non_basic_col_sq_norms.push(self.rhs.sq_norm());
+            }
         }
     }
 
