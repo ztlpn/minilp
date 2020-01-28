@@ -1,7 +1,7 @@
 use crate::helpers::to_dense;
 use sprs::CsMat;
 
-use crate::sparse::{SparseMat, ScatteredVec};
+use crate::sparse::{ScatteredVec, SparseMat};
 
 #[derive(Clone)]
 pub struct LUFactors {
@@ -40,6 +40,11 @@ impl ScratchSpace {
             dense_rhs: vec![0.0; n],
             mark_nonzero: MarkNonzero::with_capacity(n),
         }
+    }
+
+    pub fn clear_sparse(&mut self, size: usize) {
+        self.rhs.clear_and_resize(size);
+        self.mark_nonzero.clear_and_resize(size);
     }
 }
 
@@ -158,8 +163,7 @@ pub fn lu_factorize(
         }
     }
 
-    scratch.rhs.clear_and_resize(cols.len());
-    scratch.mark_nonzero.clear_and_resize(cols.len());
+    scratch.clear_sparse(cols.len());
 
     let mut lower = SparseMat::new(mat.rows());
     let mut upper = SparseMat::new(mat.rows());
@@ -487,7 +491,7 @@ fn tri_solve_process_col(tri_mat: &SparseMat, col: usize, rhs: &mut [f64]) {
 mod tests {
     use super::*;
     use crate::helpers::{assert_matrix_eq, to_sparse};
-    use sprs::{TriMat, CsVec};
+    use sprs::{CsVec, TriMat};
 
     #[test]
     fn lu_simple() {

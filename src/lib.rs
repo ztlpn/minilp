@@ -34,12 +34,7 @@ pub struct Tableau {
 
     enable_steepest_edge: bool,
 
-    // Related to inversion of the basis matrix
-    lu_factors: LUFactors,
-    lu_factors_transp: LUFactors,
-    scratch: ScratchSpace,
-    eta_matrices: EtaMatrices,
-    rhs: ScatteredVec,
+    basis_solver: BasisSolver,
 
     // Recomputed on each pivot
     col_coeffs: SparseVec,
@@ -214,11 +209,13 @@ impl Tableau {
             orig_bounds,
             set_vars: HashMap::new(),
             enable_steepest_edge,
-            lu_factors,
-            lu_factors_transp,
-            scratch,
-            eta_matrices: EtaMatrices::new(num_constraints),
-            rhs: ScatteredVec::empty(num_constraints),
+            basis_solver: BasisSolver {
+                lu_factors,
+                lu_factors_transp,
+                scratch,
+                eta_matrices: EtaMatrices::new(num_constraints),
+                rhs: ScatteredVec::empty(num_constraints),
+            },
             col_coeffs: SparseVec::new(),
             eta_matrix_coeffs: SparseVec::new(),
             sq_norms_update_helper: ScatteredVec::empty(num_total_vars - num_constraints),
@@ -369,7 +366,29 @@ impl Tableau {
         }
 
         self.remove_artificial_vars();
-        self.recalc_cur_state();
+
+        self.non_basic_vars_inv.truncate(self.num_total_vars());
+
+        let mut new_non_basic_vars = vec![];
+        let mut new_sq_norms = vec![];
+        for (i, &var) in self.non_basic_vars.iter().enumerate() {
+            if var < self.num_total_vars() {
+                self.non_basic_vars_inv[var] = new_non_basic_vars.len();
+                new_non_basic_vars.push(var);
+                if self.enable_steepest_edge {
+                    new_sq_norms.push(self.non_basic_col_sq_norms[i]);
+                }
+            }
+        }
+        self.non_basic_vars = new_non_basic_vars;
+        self.non_basic_col_sq_norms = new_sq_norms;
+
+        self.row_coeffs.clear_and_resize(self.non_basic_vars.len());
+        self.sq_norms_update_helper.clear_and_resize(self.non_basic_vars.len());
+        self.non_basic_col_sq_norms.truncate(self.non_basic_vars.len());
+
+        self.recalc_cur_obj();
+
         trace!("CANONICAL TAB {:?}", self);
         Ok(self)
     }
@@ -553,27 +572,16 @@ impl Tableau {
     }
 
     fn nnz(&self) -> usize {
-        self.lu_factors.nnz()
+        self.basis_solver.lu_factors.nnz()
     }
 
     /// Calculate current coeffs column for a single non-basic variable.
     fn calc_col_coeffs(&mut self, c_var: usize) {
         let var = self.non_basic_vars[c_var];
-        let orig_coeffs = self.orig_constraints_csc.outer_view(var).unwrap();
-        self.rhs.set(orig_coeffs.iter());
-
-        self.lu_factors.solve(&mut self.rhs, &mut self.scratch);
-
-        // apply eta matrices (Vanderbei p.139)
-        for idx in 0..self.eta_matrices.len() {
-            let r_leaving = self.eta_matrices.leaving_rows[idx];
-            let coeff = *self.rhs.get(r_leaving);
-            for (r, &val) in self.eta_matrices.coeff_cols.col_iter(idx) {
-                *self.rhs.get_mut(r) -= coeff * val;
-            }
-        }
-
-        self.rhs.to_sparse_vec(&mut self.col_coeffs);
+        let orig_col = self.orig_constraints_csc.outer_view(var).unwrap();
+        self.basis_solver
+            .solve(orig_col.iter())
+            .to_sparse_vec(&mut self.col_coeffs);
     }
 
     fn calc_eta_matrix_coeffs(&mut self, r_leaving: usize, pivot_coeff: f64) {
@@ -588,30 +596,13 @@ impl Tableau {
         }
     }
 
-    fn solve_basis_transp(&mut self) {
-        // apply eta matrices in reverse (Vanderbei p.139)
-        for idx in (0..self.eta_matrices.len()).rev() {
-            let mut coeff = 0.0;
-            // eta col `dot` rhs_transp
-            for (i, &val) in self.eta_matrices.coeff_cols.col_iter(idx) {
-                coeff += val * self.rhs.get(i);
-            }
-            let r_leaving = self.eta_matrices.leaving_rows[idx];
-            *self.rhs.get_mut(r_leaving) -= coeff;
-        }
-
-        self.lu_factors_transp
-            .solve(&mut self.rhs, &mut self.scratch);
-    }
-
     /// Calculate current coeffs row for a single constraint (permuted according to non_basic_vars).
     fn calc_row_coeffs(&mut self, r_constr: usize) {
-        self.rhs.clear();
-        *self.rhs.get_mut(r_constr) = 1.0;
-        self.solve_basis_transp();
-
-        self.row_coeffs.clear();
-        for (r, &coeff) in self.rhs.iter() {
+        let tmp = self
+            .basis_solver
+            .solve_transp(std::iter::once((r_constr, &1.0)));
+        self.row_coeffs.clear_and_resize(self.non_basic_vars.len());
+        for (r, &coeff) in tmp.iter() {
             for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
                 let idx = self.non_basic_vars_inv[v];
                 if idx != SENTINEL {
@@ -654,13 +645,14 @@ impl Tableau {
 
         if self.enable_steepest_edge {
             // Vanderbei p. 149.
-            self.rhs.set(self.eta_matrix_coeffs.iter());
-            self.solve_basis_transp();
-            // now self.rhs contains the (w - v)/x_i vector.
+            let tmp = self
+                .basis_solver
+                .solve_transp(self.eta_matrix_coeffs.iter());
+            // now tmp contains the (w - v)/x_i vector.
 
             // Calculate transp(N) * (w - v) / x_1
             self.sq_norms_update_helper.clear();
-            for (r, &coeff) in self.rhs.iter() {
+            for (r, &coeff) in tmp.iter() {
                 for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
                     let idx = self.non_basic_vars_inv[v];
                     if idx != SENTINEL {
@@ -687,19 +679,13 @@ impl Tableau {
         self.non_basic_vars_inv[entering_var] = SENTINEL;
         self.non_basic_vars_inv[leaving_var] = c_entering;
 
-        let eta_matrices_nnz = self.eta_matrices.coeff_cols.nnz();
-        if eta_matrices_nnz < self.lu_factors.nnz() / 2 {
-            self.eta_matrices.push(r_leaving, &self.eta_matrix_coeffs);
+        let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
+        if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() / 2 {
+            self.basis_solver
+                .push_eta_matrix(r_leaving, &self.eta_matrix_coeffs);
         } else {
-            self.eta_matrices.clear_and_resize(self.num_constraints());
-
-            self.lu_factors = lu_factorize(
-                &self.orig_constraints_csc,
-                &self.basic_vars,
-                0.1,
-                &mut self.scratch,
-            );
-            self.lu_factors_transp = self.lu_factors.transpose();
+            self.basis_solver
+                .reset(&self.orig_constraints_csc, &self.basic_vars);
         }
 
         trace!(
@@ -847,9 +833,6 @@ impl Tableau {
     fn recalc_cur_state(&mut self) {
         assert_eq!(self.num_artificial_vars, 0);
 
-        self.rhs.clear_and_resize(self.basic_vars.len());
-        self.col_coeffs.clear();
-
         self.non_basic_vars_inv.clear();
         self.non_basic_vars_inv.resize(self.num_total_vars(), 0);
         for &v in &self.basic_vars {
@@ -864,16 +847,8 @@ impl Tableau {
             }
         }
 
-        self.row_coeffs.clear_and_resize(self.non_basic_vars.len());
-
-        self.eta_matrices.clear_and_resize(self.num_constraints());
-        self.lu_factors = lu_factorize(
-            &self.orig_constraints_csc,
-            &self.basic_vars,
-            0.1,
-            &mut self.scratch,
-        );
-        self.lu_factors_transp = self.lu_factors.transpose();
+        self.basis_solver
+            .reset(&self.orig_constraints_csc, &self.basic_vars);
 
         let mut cur_bounds = self.orig_bounds.clone();
         for (&var, &val) in self.set_vars.iter() {
@@ -881,8 +856,9 @@ impl Tableau {
                 cur_bounds[r] -= val * coeff;
             }
         }
-        self.lu_factors
-            .solve_dense(&mut cur_bounds, &mut self.scratch);
+        self.basis_solver
+            .lu_factors
+            .solve_dense(&mut cur_bounds, &mut self.basis_solver.scratch);
         self.cur_bounds = cur_bounds;
         for b in &mut self.cur_bounds {
             if f64::abs(*b) < 1e-8 {
@@ -890,12 +866,22 @@ impl Tableau {
             }
         }
 
-        self.cur_obj_val = 0.0;
-        for (c, &var) in self.basic_vars.iter().enumerate() {
-            self.cur_obj_val += -self.orig_obj[var] * self.cur_bounds[c];
+        self.recalc_cur_obj();
+
+        if self.enable_steepest_edge {
+            self.non_basic_col_sq_norms.clear();
+            for &var in &self.non_basic_vars {
+                let col = self.orig_constraints_csc.outer_view(var).unwrap();
+                let sq_norm = self.basis_solver.solve(col.iter()).sq_norm();
+                self.non_basic_col_sq_norms.push(sq_norm);
+            }
         }
-        for (&var, &val) in self.set_vars.iter() {
-            self.cur_obj_val += -self.orig_obj[var] * val;
+    }
+
+    fn recalc_cur_obj(&mut self) {
+        if self.basis_solver.eta_matrices.len() > 0 {
+            self.basis_solver
+                .reset(&self.orig_constraints_csc, &self.basic_vars);
         }
 
         let multipliers = {
@@ -903,8 +889,9 @@ impl Tableau {
             for (c, &var) in self.basic_vars.iter().enumerate() {
                 obj_coeffs[c] = -self.orig_obj[var];
             }
-            self.lu_factors_transp
-                .solve_dense(&mut obj_coeffs, &mut self.scratch);
+            self.basis_solver
+                .lu_factors_transp
+                .solve_dense(&mut obj_coeffs, &mut self.basis_solver.scratch);
             ArrayVec::from(obj_coeffs)
         };
 
@@ -918,14 +905,12 @@ impl Tableau {
             self.cur_obj.push(val);
         }
 
-        if self.enable_steepest_edge {
-            self.non_basic_col_sq_norms.clear();
-            for &var in &self.non_basic_vars {
-                let col = self.orig_constraints_csc.outer_view(var).unwrap();
-                self.rhs.set(col.iter());
-                self.lu_factors.solve(&mut self.rhs, &mut self.scratch);
-                self.non_basic_col_sq_norms.push(self.rhs.sq_norm());
-            }
+        self.cur_obj_val = 0.0;
+        for (c, &var) in self.basic_vars.iter().enumerate() {
+            self.cur_obj_val += -self.orig_obj[var] * self.cur_bounds[c];
+        }
+        for (&var, &val) in self.set_vars.iter() {
+            self.cur_obj_val += -self.orig_obj[var] * val;
         }
     }
 
@@ -1081,6 +1066,68 @@ impl Tableau {
         }
 
         Ok(basic_vars)
+    }
+}
+
+/// Stuff related to inversion of the basis matrix
+#[derive(Clone)]
+struct BasisSolver {
+    lu_factors: LUFactors,
+    lu_factors_transp: LUFactors,
+    scratch: ScratchSpace,
+    eta_matrices: EtaMatrices,
+    rhs: ScatteredVec,
+}
+
+impl BasisSolver {
+    fn push_eta_matrix(&mut self, r_leaving: usize, coeffs: &SparseVec) {
+        self.eta_matrices.push(r_leaving, coeffs);
+    }
+
+    fn reset(&mut self, orig_constraints_csc: &CsMat<f64>, basic_vars: &[usize]) {
+        self.scratch.clear_sparse(basic_vars.len());
+        self.eta_matrices.clear_and_resize(basic_vars.len());
+        self.rhs.clear_and_resize(basic_vars.len());
+        self.lu_factors = lu_factorize(orig_constraints_csc, basic_vars, 0.1, &mut self.scratch);
+        self.lu_factors_transp = self.lu_factors.transpose();
+    }
+
+    fn solve<'a>(&mut self, rhs: impl Iterator<Item = (usize, &'a f64)>) -> &mut ScatteredVec {
+        self.rhs.set(rhs);
+        self.lu_factors.solve(&mut self.rhs, &mut self.scratch);
+
+        // apply eta matrices (Vanderbei p.139)
+        for idx in 0..self.eta_matrices.len() {
+            let r_leaving = self.eta_matrices.leaving_rows[idx];
+            let coeff = *self.rhs.get(r_leaving);
+            for (r, &val) in self.eta_matrices.coeff_cols.col_iter(idx) {
+                *self.rhs.get_mut(r) -= coeff * val;
+            }
+        }
+
+        &mut self.rhs
+    }
+
+    /// Pass right-hand side via self.rhs
+    fn solve_transp<'a>(
+        &mut self,
+        rhs: impl Iterator<Item = (usize, &'a f64)>,
+    ) -> &mut ScatteredVec {
+        self.rhs.set(rhs);
+        // apply eta matrices in reverse (Vanderbei p.139)
+        for idx in (0..self.eta_matrices.len()).rev() {
+            let mut coeff = 0.0;
+            // eta col `dot` rhs_transp
+            for (i, &val) in self.eta_matrices.coeff_cols.col_iter(idx) {
+                coeff += val * self.rhs.get(i);
+            }
+            let r_leaving = self.eta_matrices.leaving_rows[idx];
+            *self.rhs.get_mut(r_leaving) -= coeff;
+        }
+
+        self.lu_factors_transp
+            .solve(&mut self.rhs, &mut self.scratch);
+        &mut self.rhs
     }
 }
 

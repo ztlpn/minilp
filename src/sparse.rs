@@ -55,12 +55,15 @@ impl ScatteredVec {
         self.values.len()
     }
 
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item = (usize, &'a f64)> {
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &f64)> {
         self.nonzero.iter().map(move |&i| (i, &self.values[i]))
     }
 
     pub fn sq_norm(&self) -> f64 {
-        self.nonzero.iter().map(|&i| self.values[i] * self.values[i]).sum()
+        self.nonzero
+            .iter()
+            .map(|&i| self.values[i] * self.values[i])
+            .sum()
     }
 
     pub fn clear(&mut self) {
