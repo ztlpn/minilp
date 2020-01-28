@@ -92,7 +92,7 @@ impl ScatteredVec {
         }
     }
 
-    pub fn to_sparse_vec(&mut self, lhs: &mut SparseVec) {
+    pub fn to_sparse_vec(&self, lhs: &mut SparseVec) {
         lhs.clear();
         for &idx in &self.nonzero {
             lhs.indices.push(idx);

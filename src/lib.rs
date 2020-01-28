@@ -311,12 +311,10 @@ impl Tableau {
 
         let basic_vars = self.assign_basic_vars(&values)?;
 
-        self.basic_vars = basic_vars;
-        self.set_vars.clear();
-
         // Transition is feasible, we can remove artificial vars.
         self.remove_artificial_vars();
-        self.recalc_cur_state();
+        self.set_vars.clear();
+        self.reset_basis(basic_vars);
         Ok(self)
     }
 
@@ -384,8 +382,10 @@ impl Tableau {
         self.non_basic_col_sq_norms = new_sq_norms;
 
         self.row_coeffs.clear_and_resize(self.non_basic_vars.len());
-        self.sq_norms_update_helper.clear_and_resize(self.non_basic_vars.len());
-        self.non_basic_col_sq_norms.truncate(self.non_basic_vars.len());
+        self.sq_norms_update_helper
+            .clear_and_resize(self.non_basic_vars.len());
+        self.non_basic_col_sq_norms
+            .truncate(self.non_basic_vars.len());
 
         self.recalc_cur_obj();
 
@@ -514,46 +514,105 @@ impl Tableau {
         }
     }
 
-    pub fn add_constraints(mut self, constraints: &[Constraint]) -> Result<Self, Error> {
+    pub fn add_constraint(mut self, constraint: Constraint) -> Result<Self, Error> {
         assert_eq!(self.num_artificial_vars, 0);
         // TODO: assert optimality.
 
         // each constraint adds a slack var
-        let new_num_total_vars = self.num_total_vars() + constraints.len();
+        let new_num_total_vars = self.num_total_vars() + 1;
         let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_num_total_vars);
         for row in self.orig_constraints.outer_iterator() {
             new_orig_constraints =
                 new_orig_constraints.append_outer_csvec(resized_view(&row, new_num_total_vars));
         }
 
-        for constr in constraints {
-            let (mut coeffs, bound) = if let Constraint::Le(coeffs, bound) = constr {
-                (coeffs.clone(), *bound)
-            } else {
-                unimplemented!();
-            };
+        let (mut coeffs, orig_bound) = if let Constraint::Le(c, b) = constraint {
+            (c, b)
+        } else {
+            unimplemented!();
+        };
 
-            assert_eq!(coeffs.dim(), self.num_vars);
-            assert!(bound >= 0.0);
+        assert_eq!(coeffs.dim(), self.num_vars);
+        assert!(orig_bound >= 0.0);
 
-            let slack_var = self.num_vars + self.num_slack_vars;
-            self.num_slack_vars += 1;
+        let slack_var = self.num_vars + self.num_slack_vars;
+        self.num_slack_vars += 1;
 
-            self.orig_obj.push(0.0);
+        self.orig_obj.push(0.0);
 
-            coeffs = into_resized(coeffs, new_num_total_vars);
-            coeffs.append(slack_var, 1.0);
-            new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
+        {
+            // calculate gaussian elimination coefficients for the new tableau row
+            let mut permuted = SparseVec::new();
+            for (var, &coeff) in coeffs.iter() {
+                if self.non_basic_vars_inv[var] == SENTINEL {
+                    permuted.push(
+                        self.basic_vars.iter().position(|&bv| bv == var).unwrap(),
+                        coeff,
+                    );
+                }
+            }
+            let gaussian_coeffs = self.basis_solver.solve_transp(permuted.iter());
 
-            self.orig_bounds.push(bound);
+            // calculate cur bound for the new constraint taking set_vars into account
+            let mut orig_bounds = self.orig_bounds.clone();
+            for (&var, &val) in self.set_vars.iter() {
+                for (r, &coeff) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
+                    orig_bounds[r] -= val * coeff;
+                }
+            }
 
-            self.basic_vars.push(slack_var);
+            let mut cur_bound = orig_bound;
+            for (r, &coeff) in gaussian_coeffs.iter() {
+                cur_bound -= orig_bounds[r] * coeff;
+            }
+
+            if !self.set_vars.is_empty() {
+                for (var, &coeff) in coeffs.iter() {
+                    if let Some(&val) = self.set_vars.get(&var) {
+                        cur_bound -= val * coeff;
+                    }
+                }
+            }
+
+            self.cur_bounds.push(cur_bound);
+
+            if self.enable_steepest_edge {
+                // calculate non-basic coeffs and update sq. norms
+                self.sq_norms_update_helper.clear();
+                for (var, &coeff) in coeffs.iter() {
+                    let idx = self.non_basic_vars_inv[var];
+                    if idx != SENTINEL {
+                        *self.sq_norms_update_helper.get_mut(idx) = coeff;
+                    }
+                }
+                for (r, &coeff) in gaussian_coeffs.iter() {
+                    for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
+                        let idx = self.non_basic_vars_inv[v];
+                        if idx != SENTINEL {
+                            *self.sq_norms_update_helper.get_mut(idx) -= val * coeff;
+                        }
+                    }
+                }
+                for (c, &coeff) in self.sq_norms_update_helper.iter() {
+                    self.non_basic_col_sq_norms[c] += coeff * coeff;
+                }
+            }
         }
+
+        coeffs = into_resized(coeffs, new_num_total_vars);
+        coeffs.append(slack_var, 1.0);
+        new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
+
+        self.orig_bounds.push(orig_bound);
+
+        self.basic_vars.push(slack_var);
+        self.non_basic_vars_inv.push(SENTINEL);
 
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
 
-        self.recalc_cur_state();
+        self.basis_solver
+            .reset(&self.orig_constraints_csc, &self.basic_vars);
 
         self = self.restore_feasibility()?;
         self = self.optimize().unwrap();
@@ -830,26 +889,7 @@ impl Tableau {
         self.orig_constraints_csc = self.orig_constraints.to_csc();
     }
 
-    fn recalc_cur_state(&mut self) {
-        assert_eq!(self.num_artificial_vars, 0);
-
-        self.non_basic_vars_inv.clear();
-        self.non_basic_vars_inv.resize(self.num_total_vars(), 0);
-        for &v in &self.basic_vars {
-            self.non_basic_vars_inv[v] = SENTINEL;
-        }
-
-        self.non_basic_vars.clear();
-        for v in 0..self.num_total_vars() {
-            if self.non_basic_vars_inv[v] != SENTINEL {
-                self.non_basic_vars_inv[v] = self.non_basic_vars.len();
-                self.non_basic_vars.push(v);
-            }
-        }
-
-        self.basis_solver
-            .reset(&self.orig_constraints_csc, &self.basic_vars);
-
+    fn recalc_cur_bounds(&mut self) {
         let mut cur_bounds = self.orig_bounds.clone();
         for (&var, &val) in self.set_vars.iter() {
             for (r, &coeff) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
@@ -863,17 +903,6 @@ impl Tableau {
         for b in &mut self.cur_bounds {
             if f64::abs(*b) < 1e-8 {
                 *b = 0.0;
-            }
-        }
-
-        self.recalc_cur_obj();
-
-        if self.enable_steepest_edge {
-            self.non_basic_col_sq_norms.clear();
-            for &var in &self.non_basic_vars {
-                let col = self.orig_constraints_csc.outer_view(var).unwrap();
-                let sq_norm = self.basis_solver.solve(col.iter()).sq_norm();
-                self.non_basic_col_sq_norms.push(sq_norm);
             }
         }
     }
@@ -911,6 +940,45 @@ impl Tableau {
         }
         for (&var, &val) in self.set_vars.iter() {
             self.cur_obj_val += -self.orig_obj[var] * val;
+        }
+    }
+
+    fn recalc_cur_sq_norms(&mut self) {
+        self.non_basic_col_sq_norms.clear();
+        for &var in &self.non_basic_vars {
+            let col = self.orig_constraints_csc.outer_view(var).unwrap();
+            let sq_norm = self.basis_solver.solve(col.iter()).sq_norm();
+            self.non_basic_col_sq_norms.push(sq_norm);
+        }
+    }
+
+    fn reset_basis(&mut self, basic_vars: Vec<usize>) {
+        assert_eq!(self.num_artificial_vars, 0);
+        assert_eq!(basic_vars.len(), self.num_constraints());
+
+        self.basic_vars = basic_vars;
+
+        self.non_basic_vars_inv.clear();
+        self.non_basic_vars_inv.resize(self.num_total_vars(), 0);
+        for &v in &self.basic_vars {
+            self.non_basic_vars_inv[v] = SENTINEL;
+        }
+
+        self.non_basic_vars.clear();
+        for v in 0..self.num_total_vars() {
+            if self.non_basic_vars_inv[v] != SENTINEL {
+                self.non_basic_vars_inv[v] = self.non_basic_vars.len();
+                self.non_basic_vars.push(v);
+            }
+        }
+
+        self.basis_solver
+            .reset(&self.orig_constraints_csc, &self.basic_vars);
+
+        self.recalc_cur_bounds();
+        self.recalc_cur_obj();
+        if self.enable_steepest_edge {
+            self.recalc_cur_sq_norms();
         }
     }
 
@@ -1092,7 +1160,7 @@ impl BasisSolver {
         self.lu_factors_transp = self.lu_factors.transpose();
     }
 
-    fn solve<'a>(&mut self, rhs: impl Iterator<Item = (usize, &'a f64)>) -> &mut ScatteredVec {
+    fn solve<'a>(&mut self, rhs: impl Iterator<Item = (usize, &'a f64)>) -> &ScatteredVec {
         self.rhs.set(rhs);
         self.lu_factors.solve(&mut self.rhs, &mut self.scratch);
 
@@ -1109,10 +1177,7 @@ impl BasisSolver {
     }
 
     /// Pass right-hand side via self.rhs
-    fn solve_transp<'a>(
-        &mut self,
-        rhs: impl Iterator<Item = (usize, &'a f64)>,
-    ) -> &mut ScatteredVec {
+    fn solve_transp<'a>(&mut self, rhs: impl Iterator<Item = (usize, &'a f64)>) -> &ScatteredVec {
         self.rhs.set(rhs);
         // apply eta matrices in reverse (Vanderbei p.139)
         for idx in (0..self.eta_matrices.len()).rev() {
@@ -1335,7 +1400,7 @@ mod tests {
         {
             let tab = orig_tab
                 .clone()
-                .add_constraints(&[Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0)])
+                .add_constraint(Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0))
                 .unwrap();
             assert_eq!(tab.cur_solution(), [1.0, 1.0]);
             assert_eq!(tab.cur_obj_val(), 3.0);
@@ -1346,7 +1411,7 @@ mod tests {
                 .clone()
                 .set_var(1, 1.5)
                 .unwrap()
-                .add_constraints(&[Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0)])
+                .add_constraint(Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0))
                 .unwrap();
             assert_eq!(tab.cur_solution(), [1.5, 1.5]);
             assert_eq!(tab.cur_obj_val(), 4.5);
