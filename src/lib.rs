@@ -44,10 +44,11 @@ pub struct Tableau {
 
     // Updated on each pivot
     basic_vars: Vec<usize>, // for each constraint the corresponding basic var.
+    basic_vars_inv: Vec<usize>, // (var -> idx if basic or sentinel) for all vars
     cur_bounds: Vec<f64>,
 
     non_basic_vars: Vec<usize>,     // remaining variables. (idx -> var)
-    non_basic_vars_inv: Vec<usize>, // (var -> idx)
+    non_basic_vars_inv: Vec<usize>, // (var -> idx if non-basic or sentinel) for all vars
     cur_obj: Vec<f64>,
     non_basic_col_sq_norms: Vec<f64>,
 
@@ -126,7 +127,7 @@ impl Tableau {
         let mut orig_constraints = CsMat::empty(CompressedStorage::CSR, num_total_vars);
         let mut orig_bounds = Vec::with_capacity(num_constraints);
         let mut basic_vars = vec![];
-        let mut is_basic_var = vec![false; num_total_vars];
+        let mut basic_vars_inv = vec![SENTINEL; num_total_vars];
 
         for constr in constraints.into_iter() {
             let (mut coeffs, bound, basic_idx) = match constr {
@@ -166,8 +167,8 @@ impl Tableau {
                 }
             };
 
+            basic_vars_inv[num_vars + basic_idx] = basic_vars.len();
             basic_vars.push(num_vars + basic_idx);
-            is_basic_var[num_vars + basic_idx] = true;
             coeffs = into_resized(coeffs, num_total_vars);
             coeffs.append(num_vars + basic_idx, 1.0);
             orig_constraints = orig_constraints.append_outer_csvec(coeffs.view());
@@ -181,7 +182,7 @@ impl Tableau {
         let mut cur_obj = vec![];
         let mut non_basic_col_sq_norms = vec![];
         for v in 0..num_total_vars {
-            if !is_basic_var[v] {
+            if basic_vars_inv[v] == SENTINEL {
                 non_basic_vars_inv[v] = non_basic_vars.len();
                 non_basic_vars.push(v);
 
@@ -221,6 +222,7 @@ impl Tableau {
             sq_norms_update_helper: ScatteredVec::empty(num_total_vars - num_constraints),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
             basic_vars,
+            basic_vars_inv,
             cur_bounds,
             non_basic_vars,
             non_basic_vars_inv,
@@ -365,6 +367,7 @@ impl Tableau {
 
         self.remove_artificial_vars();
 
+        self.basic_vars_inv.truncate(self.num_total_vars());
         self.non_basic_vars_inv.truncate(self.num_total_vars());
 
         let mut new_non_basic_vars = vec![];
@@ -544,11 +547,9 @@ impl Tableau {
             // calculate gaussian elimination coefficients for the new tableau row
             let mut permuted = SparseVec::new();
             for (var, &coeff) in coeffs.iter() {
-                if self.non_basic_vars_inv[var] == SENTINEL {
-                    permuted.push(
-                        self.basic_vars.iter().position(|&bv| bv == var).unwrap(),
-                        coeff,
-                    );
+                let pos = self.basic_vars_inv[var];
+                if pos != SENTINEL {
+                    permuted.push(pos, coeff);
                 }
             }
             let gaussian_coeffs = self.basis_solver.solve_transp(permuted.iter());
@@ -605,6 +606,7 @@ impl Tableau {
 
         self.orig_bounds.push(orig_bound);
 
+        self.basic_vars_inv.push(self.basic_vars.len());
         self.basic_vars.push(slack_var);
         self.non_basic_vars_inv.push(SENTINEL);
 
@@ -735,6 +737,8 @@ impl Tableau {
         let entering_var = self.non_basic_vars[c_entering];
         let leaving_var = std::mem::replace(&mut self.basic_vars[r_leaving], entering_var);
         std::mem::replace(&mut self.non_basic_vars[c_entering], leaving_var);
+        self.basic_vars_inv[entering_var] = r_leaving;
+        self.basic_vars_inv[leaving_var] = SENTINEL;
         self.non_basic_vars_inv[entering_var] = SENTINEL;
         self.non_basic_vars_inv[leaving_var] = c_entering;
 
@@ -957,16 +961,18 @@ impl Tableau {
         assert_eq!(basic_vars.len(), self.num_constraints());
 
         self.basic_vars = basic_vars;
-
-        self.non_basic_vars_inv.clear();
-        self.non_basic_vars_inv.resize(self.num_total_vars(), 0);
-        for &v in &self.basic_vars {
-            self.non_basic_vars_inv[v] = SENTINEL;
+        self.basic_vars_inv.clear();
+        self.basic_vars_inv.resize(self.num_total_vars(), SENTINEL);
+        for (i, &v) in self.basic_vars.iter().enumerate() {
+            self.basic_vars_inv[v] = i;
         }
 
+        self.non_basic_vars_inv.clear();
+        self.non_basic_vars_inv
+            .resize(self.num_total_vars(), SENTINEL);
         self.non_basic_vars.clear();
         for v in 0..self.num_total_vars() {
-            if self.non_basic_vars_inv[v] != SENTINEL {
+            if self.basic_vars_inv[v] == SENTINEL {
                 self.non_basic_vars_inv[v] = self.non_basic_vars.len();
                 self.non_basic_vars.push(v);
             }
