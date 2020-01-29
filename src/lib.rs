@@ -538,10 +538,10 @@ impl Tableau {
         assert_eq!(coeffs.dim(), self.num_vars);
         assert!(bound >= 0.0);
 
-        self.add_constraint_impl(coeffs, bound)
+        self.add_le_constraint_impl(coeffs, bound)
     }
 
-    fn add_constraint_impl(
+    fn add_le_constraint_impl(
         mut self,
         mut coeffs: CsVec<f64>,
         orig_bound: f64,
@@ -562,62 +562,6 @@ impl Tableau {
 
         self.orig_obj.push(0.0);
 
-        {
-            // calculate gaussian elimination coefficients for the new tableau row
-            let mut permuted = SparseVec::new();
-            for (var, &coeff) in coeffs.iter() {
-                let pos = self.basic_vars_inv[var];
-                if pos != SENTINEL {
-                    permuted.push(pos, coeff);
-                }
-            }
-            let gaussian_coeffs = self.basis_solver.solve_transp(permuted.iter());
-
-            // calculate cur bound for the new constraint taking set_vars into account
-            let mut orig_bounds = self.orig_bounds.clone();
-            for (&var, &val) in self.set_vars.iter() {
-                for (r, &coeff) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
-                    orig_bounds[r] -= val * coeff;
-                }
-            }
-
-            let mut cur_bound = orig_bound;
-            for (r, &coeff) in gaussian_coeffs.iter() {
-                cur_bound -= orig_bounds[r] * coeff;
-            }
-
-            if !self.set_vars.is_empty() {
-                for (var, &coeff) in coeffs.iter() {
-                    if let Some(&val) = self.set_vars.get(&var) {
-                        cur_bound -= val * coeff;
-                    }
-                }
-            }
-
-            self.cur_bounds.push(cur_bound);
-
-            if self.enable_steepest_edge {
-                // calculate non-basic coeffs and update sq. norms
-                self.sq_norms_update_helper.clear();
-                for (var, &coeff) in coeffs.iter() {
-                    let idx = self.non_basic_vars_inv[var];
-                    if idx != SENTINEL {
-                        *self.sq_norms_update_helper.get_mut(idx) = coeff;
-                    }
-                }
-                for (r, &coeff) in gaussian_coeffs.iter() {
-                    for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
-                        let idx = self.non_basic_vars_inv[v];
-                        if idx != SENTINEL {
-                            *self.sq_norms_update_helper.get_mut(idx) -= val * coeff;
-                        }
-                    }
-                }
-                for (c, &coeff) in self.sq_norms_update_helper.iter() {
-                    self.non_basic_col_sq_norms[c] += coeff * coeff;
-                }
-            }
-        }
 
         coeffs = into_resized(coeffs, new_num_total_vars);
         coeffs.append(slack_var, 1.0);
@@ -634,6 +578,17 @@ impl Tableau {
 
         self.basis_solver
             .reset(&self.orig_constraints_csc, &self.basic_vars);
+
+        self.recalc_cur_bounds();
+
+        if self.enable_steepest_edge {
+            // existing tableau rows didn't change, so we calc the last row
+            // and add its contribution to sq. norms.
+            self.calc_row_coeffs(self.num_constraints() - 1);
+            for (c, &coeff) in self.row_coeffs.iter() {
+                self.non_basic_col_sq_norms[c] += coeff * coeff;
+            }
+        }
 
         self = self.restore_feasibility()?;
         self = self.optimize().unwrap();
@@ -661,7 +616,7 @@ impl Tableau {
 
         let cut_bound = self.cur_bounds[basic_row].floor();
         let num_total_vars = self.num_total_vars();
-        self.add_constraint_impl(cut_coeffs.into_csvec(num_total_vars), cut_bound)
+        self.add_le_constraint_impl(cut_coeffs.into_csvec(num_total_vars), cut_bound)
     }
 
     pub fn print_stats(&self) {
