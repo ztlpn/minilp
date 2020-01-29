@@ -181,19 +181,30 @@ impl Tableau {
         let mut non_basic_vars_inv = vec![SENTINEL; num_total_vars];
         let mut cur_obj = vec![];
         let mut non_basic_col_sq_norms = vec![];
-        for v in 0..num_total_vars {
-            if basic_vars_inv[v] == SENTINEL {
-                non_basic_vars_inv[v] = non_basic_vars.len();
-                non_basic_vars.push(v);
+        for var in 0..num_total_vars {
+            if basic_vars_inv[var] == SENTINEL {
+                non_basic_vars_inv[var] = non_basic_vars.len();
+                non_basic_vars.push(var);
 
-                let col = orig_constraints_csc.outer_view(v).unwrap();
-                cur_obj.push(artificial_multipliers.dot(&col));
+                let col = orig_constraints_csc.outer_view(var).unwrap();
+
+                if num_artificial_vars > 0 {
+                    cur_obj.push(artificial_multipliers.dot(&col));
+                } else {
+                    cur_obj.push(obj[var]);
+                }
 
                 if enable_steepest_edge {
                     non_basic_col_sq_norms.push(col.squared_l2_norm());
                 }
             }
         }
+
+        let cur_obj_val = if num_artificial_vars > 0 {
+            artificial_obj_val
+        } else {
+            0.0
+        };
 
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
         let lu_factors = lu_factorize(&orig_constraints_csc, &basic_vars, 0.1, &mut scratch);
@@ -228,7 +239,7 @@ impl Tableau {
             non_basic_vars_inv,
             cur_obj,
             non_basic_col_sq_norms,
-            cur_obj_val: artificial_obj_val,
+            cur_obj_val,
         }
     }
 
