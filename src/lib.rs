@@ -529,15 +529,12 @@ impl Tableau {
     }
 
     pub fn add_constraint(self, constraint: Constraint) -> Result<Self, Error> {
-        let (coeffs, bound) = if let Constraint::Le(c, b) = constraint {
-            (c, b)
-        } else {
-            unimplemented!();
+        let (coeffs, bound) = match constraint {
+            Constraint::Le(c, b) => (c, b),
+            Constraint::Ge(c, b) => (c.map(|coeff| -coeff), -b),
+            Constraint::Eq(..) => unimplemented!(),
         };
-
         assert_eq!(coeffs.dim(), self.num_vars);
-        assert!(bound >= 0.0);
-
         self.add_le_constraint_impl(coeffs, bound)
     }
 
@@ -549,7 +546,7 @@ impl Tableau {
         assert_eq!(self.num_artificial_vars, 0);
         // TODO: assert optimality.
 
-        // each constraint adds a slack var
+        // each <= constraint adds a slack var
         let new_num_total_vars = self.num_total_vars() + 1;
         let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_num_total_vars);
         for row in self.orig_constraints.outer_iterator() {
@@ -561,7 +558,6 @@ impl Tableau {
         self.num_slack_vars += 1;
 
         self.orig_obj.push(0.0);
-
 
         coeffs = into_resized(coeffs, new_num_total_vars);
         coeffs.append(slack_var, 1.0);
@@ -583,7 +579,7 @@ impl Tableau {
 
         if self.enable_steepest_edge {
             // existing tableau rows didn't change, so we calc the last row
-            // and add its contribution to sq. norms.
+            // and add its contribution to the sq. norms.
             self.calc_row_coeffs(self.num_constraints() - 1);
             for (c, &coeff) in self.row_coeffs.iter() {
                 self.non_basic_col_sq_norms[c] += coeff * coeff;
@@ -605,16 +601,13 @@ impl Tableau {
 
         self.calc_row_coeffs(basic_row);
 
-        // TODO: reformulate with fractional parts coeffs + Ge constraint
-        // when it becomes available.
         let mut cut_coeffs = SparseVec::new();
-        cut_coeffs.push(var, 1.0);
         for (col, &coeff) in self.row_coeffs.iter() {
             let var = self.non_basic_vars[col];
-            cut_coeffs.push(var, coeff.floor());
+            cut_coeffs.push(var, coeff.floor() - coeff);
         }
 
-        let cut_bound = self.cur_bounds[basic_row].floor();
+        let cut_bound = self.cur_bounds[basic_row].floor() - self.cur_bounds[basic_row];
         let num_total_vars = self.num_total_vars();
         self.add_le_constraint_impl(cut_coeffs.into_csvec(num_total_vars), cut_bound)
     }
@@ -1419,6 +1412,15 @@ mod tests {
                 .unwrap();
             assert_eq!(tab.cur_solution(), [1.5, 1.5]);
             assert_eq!(tab.cur_obj_val(), 4.5);
+        }
+
+        {
+            let tab = orig_tab
+                .clone()
+                .add_constraint(Constraint::Ge(to_sparse(&[-1.0, 1.0]), 3.0))
+                .unwrap();
+            assert_eq!(tab.cur_solution(), [0.0, 3.0]);
+            assert_eq!(tab.cur_obj_val(), 3.0);
         }
     }
 
