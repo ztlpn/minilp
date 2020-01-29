@@ -92,7 +92,7 @@ pub enum Error {
 
 impl Tableau {
     pub fn new(mut obj: Vec<f64>, constraints: Vec<Constraint>) -> Self {
-        let enable_steepest_edge = false;
+        let enable_steepest_edge = true;
 
         let num_vars = obj.len();
         let (num_slack_vars, num_artificial_vars) = {
