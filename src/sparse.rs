@@ -1,6 +1,4 @@
-use sprs::CsMat;
-#[cfg(test)]
-use sprs::CsVec;
+use sprs::{CsMat, CsVec};
 
 #[derive(Clone, Debug)]
 pub struct SparseVec {
@@ -32,6 +30,10 @@ impl SparseVec {
 
     pub fn sq_norm(&self) -> f64 {
         self.values.iter().map(|&v| v * v).sum()
+    }
+
+    pub fn into_csvec(self, len: usize) -> CsVec<f64> {
+        CsVec::new(len, self.indices, self.values)
     }
 }
 

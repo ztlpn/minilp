@@ -528,7 +528,24 @@ impl Tableau {
         }
     }
 
-    pub fn add_constraint(mut self, constraint: Constraint) -> Result<Self, Error> {
+    pub fn add_constraint(self, constraint: Constraint) -> Result<Self, Error> {
+        let (coeffs, bound) = if let Constraint::Le(c, b) = constraint {
+            (c, b)
+        } else {
+            unimplemented!();
+        };
+
+        assert_eq!(coeffs.dim(), self.num_vars);
+        assert!(bound >= 0.0);
+
+        self.add_constraint_impl(coeffs, bound)
+    }
+
+    fn add_constraint_impl(
+        mut self,
+        mut coeffs: CsVec<f64>,
+        orig_bound: f64,
+    ) -> Result<Self, Error> {
         assert_eq!(self.num_artificial_vars, 0);
         // TODO: assert optimality.
 
@@ -539,15 +556,6 @@ impl Tableau {
             new_orig_constraints =
                 new_orig_constraints.append_outer_csvec(resized_view(&row, new_num_total_vars));
         }
-
-        let (mut coeffs, orig_bound) = if let Constraint::Le(c, b) = constraint {
-            (c, b)
-        } else {
-            unimplemented!();
-        };
-
-        assert_eq!(coeffs.dim(), self.num_vars);
-        assert!(orig_bound >= 0.0);
 
         let slack_var = self.num_vars + self.num_slack_vars;
         self.num_slack_vars += 1;
@@ -630,6 +638,30 @@ impl Tableau {
         self = self.restore_feasibility()?;
         self = self.optimize().unwrap();
         Ok(self)
+    }
+
+    pub fn add_gomory_cut(mut self, var: usize) -> Result<Self, Error> {
+        // TODO: assert optimality
+
+        let basic_row = self.basic_vars_inv[var];
+        if basic_row == SENTINEL {
+            panic!("var {} is not basic!", var);
+        }
+
+        self.calc_row_coeffs(basic_row);
+
+        // TODO: reformulate with fractional parts coeffs + Ge constraint
+        // when it becomes available.
+        let mut cut_coeffs = SparseVec::new();
+        cut_coeffs.push(var, 1.0);
+        for (col, &coeff) in self.row_coeffs.iter() {
+            let var = self.non_basic_vars[col];
+            cut_coeffs.push(var, coeff.floor());
+        }
+
+        let cut_bound = self.cur_bounds[basic_row].floor();
+        let num_total_vars = self.num_total_vars();
+        self.add_constraint_impl(cut_coeffs.into_csvec(num_total_vars), cut_bound)
     }
 
     pub fn print_stats(&self) {
@@ -1433,5 +1465,33 @@ mod tests {
             assert_eq!(tab.cur_solution(), [1.5, 1.5]);
             assert_eq!(tab.cur_obj_val(), 4.5);
         }
+    }
+
+    #[test]
+    fn gomory_cut() {
+        let mut tab = Tableau::new(
+            vec![0.0, -1.0],
+            vec![
+                Constraint::Le(to_sparse(&[3.0, 2.0]), 6.0),
+                Constraint::Le(to_sparse(&[-3.0, 2.0]), 0.0),
+            ],
+        )
+        .optimize()
+        .unwrap();
+
+        assert_eq!(tab.cur_solution(), [1.0, 1.5]);
+        assert_eq!(tab.cur_obj_val(), -1.5);
+
+        tab = tab.add_gomory_cut(1).unwrap();
+        let solution = tab.cur_solution();
+        assert!(f64::abs(solution[0] - 2.0 / 3.0) < 1e-8);
+        assert_eq!(solution[1], 1.0);
+        assert_eq!(tab.cur_obj_val(), -1.0);
+
+        tab = tab.add_gomory_cut(0).unwrap();
+        let solution = tab.cur_solution();
+        assert!(f64::abs(solution[0] - 1.0) < 1e-8);
+        assert_eq!(solution[1], 1.0);
+        assert_eq!(tab.cur_obj_val(), -1.0);
     }
 }
