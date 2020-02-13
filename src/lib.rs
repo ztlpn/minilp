@@ -15,6 +15,8 @@ use lu::{lu_factorize, LUFactors, ScratchSpace};
 mod helpers;
 use helpers::{resized_view, to_dense};
 
+pub mod ordering;
+
 type ArrayVec = ndarray::Array1<f64>;
 
 const SENTINEL: usize = 0usize.wrapping_sub(1);
