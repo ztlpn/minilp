@@ -1,3 +1,4 @@
+use super::sparse::Perm;
 use sprs::CsMat;
 use std::collections::BTreeSet;
 
@@ -11,7 +12,7 @@ struct Col {
     rows: Vec<usize>,
 }
 
-pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Vec<usize> {
+pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
     assert!(mat.is_csc());
     assert_eq!(mat.rows(), mat_cols.len());
 
@@ -49,7 +50,7 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Vec<usize> {
     //     cols, rows, col_scores
     // );
 
-    let mut ordered_cols = Vec::with_capacity(mat_cols.len());
+    let mut new2orig = Vec::with_capacity(mat_cols.len());
 
     // cleared every iteration
     let mut is_in_pivot_row = vec![false; mat_cols.len()];
@@ -60,14 +61,14 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Vec<usize> {
     let mut rows_with_diffs = vec![];
     let mut is_in_diffs = vec![false; mat.rows()];
 
-    while ordered_cols.len() < mat_cols.len() {
+    while new2orig.len() < mat_cols.len() {
         let pivot_c = {
             let first = score_to_col.iter().next().unwrap().clone();
             score_to_col.take(&first).unwrap().1
         };
 
-        ordered_cols.push(mat_cols[pivot_c]);
-        // eprintln!("ORDERED {}", ordered_cols.last().unwrap());
+        new2orig.push(pivot_c);
+        // eprintln!("ORDERED {}", new2orig.last().unwrap());
 
         for &r in &cols[pivot_c].rows {
             is_absorbed_row[r] = true;
@@ -152,8 +153,8 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Vec<usize> {
                 if diff == 0 {
                     // mass elimination: we can order column c now as it will not result
                     // in any additional fill-in.
-                    ordered_cols.push(mat_cols[c]);
-                    // eprintln!("ME: ORDERED {}", ordered_cols.last().unwrap());
+                    new2orig.push(c);
+                    // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
                     pivot_row.swap_remove(i);
                     cols[c].rows.clear();
                 } else {
@@ -188,11 +189,16 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Vec<usize> {
 
         // eprintln!(
         //     "AFTER ORDERING {} COLS:\nCOLS: {:?}\nROWS: {:?}\nSCORES: {:?}",
-        //     ordered_cols.len(), cols, rows, col_scores
+        //     new2orig.len(), cols, rows, col_scores
         // );
     }
 
-    ordered_cols
+    let mut orig2new = vec![0; mat_cols.len()];
+    for (new, &orig) in new2orig.iter().enumerate() {
+        orig2new[orig] = new;
+    }
+
+    Perm { orig2new, new2orig }
 }
 
 #[cfg(test)]
@@ -207,20 +213,21 @@ mod tests {
             (0, 2, 1.0),
             (1, 0, 1.0),
             (1, 2, 1.0),
-            (1, 3, 1.0),
+            (1, 4, 1.0),
             (2, 0, 1.0),
             (2, 1, 1.0),
-            (2, 3, 1.0),
+            (2, 4, 1.0),
             (3, 0, 1.0),
-            (3, 3, 1.0),
+            (3, 4, 1.0),
         ];
-        let mut mat = TriMat::with_capacity((4, 4), triplets.len());
+        let mut mat = TriMat::with_capacity((4, 5), triplets.len());
         for (r, c, val) in &triplets {
             mat.add_triplet(*r, *c, *val);
         }
         let mat = mat.to_csc();
 
-        let ordered = order_colamd(&mat, &[0, 1, 2, 3]);
-        assert_eq!(&ordered, &[1, 3, 0, 2])
+        let perm = order_colamd(&mat, &[0, 1, 2, 4]);
+        assert_eq!(&perm.new2orig, &[1, 3, 0, 2]);
+        assert_eq!(&perm.orig2new, &[2, 0, 3, 1]);
     }
 }

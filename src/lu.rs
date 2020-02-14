@@ -1,7 +1,7 @@
 use crate::helpers::to_dense;
 use sprs::CsMat;
 
-use crate::sparse::{ScatteredVec, SparseMat};
+use crate::sparse::{Perm, ScatteredVec, SparseMat};
 
 #[derive(Clone)]
 pub struct LUFactors {
@@ -9,21 +9,6 @@ pub struct LUFactors {
     upper: SparseMat,
     row_perm: Option<Perm>,
     col_perm: Option<Perm>,
-}
-
-#[derive(Clone)]
-pub struct Perm {
-    orig2new: Vec<usize>,
-    new2orig: Vec<usize>,
-}
-
-impl Perm {
-    fn inv(self) -> Perm {
-        Perm {
-            orig2new: self.new2orig,
-            new2orig: self.orig2new,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -94,7 +79,7 @@ impl LUFactors {
 
         if let Some(col_perm) = &self.col_perm {
             for i in 0..rhs.len() {
-                rhs[col_perm.orig2new[i]] = scratch.dense_rhs[i];
+                rhs[col_perm.new2orig[i]] = scratch.dense_rhs[i];
             }
         } else {
             rhs.copy_from_slice(&mut scratch.dense_rhs);
@@ -120,7 +105,7 @@ impl LUFactors {
         if let Some(col_perm) = &self.col_perm {
             rhs.clear();
             for &i in &scratch.rhs.nonzero {
-                let new_i = col_perm.orig2new[i];
+                let new_i = col_perm.new2orig[i];
                 rhs.nonzero.push(new_i);
                 rhs.is_nonzero[new_i] = true;
                 rhs.values[new_i] = scratch.rhs.values[i];
@@ -133,37 +118,40 @@ impl LUFactors {
         LUFactors {
             lower: self.upper.transpose(),
             upper: self.lower.transpose(),
-            row_perm: self.col_perm.as_ref().map(|p| p.clone().inv()),
-            col_perm: self.row_perm.as_ref().map(|p| p.clone().inv()),
+            row_perm: self.col_perm.clone(),
+            col_perm: self.row_perm.clone(),
         }
     }
 }
 
 pub fn lu_factorize(
     mat: &CsMat<f64>,
-    cols: &[usize],
+    mat_cols: &[usize],
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
 ) -> LUFactors {
     assert!(mat.is_csc());
-    assert_eq!(mat.rows(), cols.len());
+    assert_eq!(mat.rows(), mat_cols.len());
 
     trace!(
         "lu_factorize: starting, matrix nnz: {}",
-        cols.iter()
+        mat_cols
+            .iter()
             .map(|&c| mat.outer_view(c).unwrap().nnz())
             .sum::<usize>()
     );
 
+    let col_perm = super::ordering::order_colamd(mat, mat_cols);
+
     let mut orig_row2elt_count = vec![0; mat.rows()];
-    for &c in cols {
+    for &c in mat_cols {
         let col = mat.outer_view(c).unwrap();
         for (orig_r, _) in col.iter() {
             orig_row2elt_count[orig_r] += 1;
         }
     }
 
-    scratch.clear_sparse(cols.len());
+    scratch.clear_sparse(mat_cols.len());
 
     let mut lower = SparseMat::new(mat.rows());
     let mut upper = SparseMat::new(mat.rows());
@@ -171,9 +159,9 @@ pub fn lu_factorize(
     let mut new2orig_row = (0..mat.rows()).collect::<Vec<_>>();
     let mut orig2new_row = new2orig_row.clone();
 
-    for i_col in 0..cols.len() {
+    for i_col in 0..mat_cols.len() {
         scratch.rhs.clear();
-        let mat_col = mat.outer_view(cols[i_col]).unwrap();
+        let mat_col = mat.outer_view(mat_cols[col_perm.new2orig[i_col]]).unwrap();
 
         // 3. calculate i-th column of U
         for (orig_r, &val) in mat_col.iter() {
@@ -323,7 +311,7 @@ pub fn lu_factorize(
             orig2new: orig2new_row,
             new2orig: new2orig_row,
         }),
-        col_perm: None,
+        col_perm: Some(col_perm),
     }
 }
 
@@ -517,20 +505,23 @@ mod tests {
 
         let l_ref = [
             vec![1.0, 0.0, 0.0],
-            vec![0.5, 1.0, 0.0],
-            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0],
+            vec![0.0, 0.5, 1.0],
         ];
         assert_matrix_eq(&lu.lower.to_csmat(), &l_ref);
 
         let u_ref = [
-            vec![4.0, 3.0, 1.0],
-            vec![0.0, 0.5, -0.5],
-            vec![0.0, 0.0, 1.0],
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 4.0, 3.0],
+            vec![0.0, 0.0, 0.5],
         ];
         assert_matrix_eq(&lu.upper.to_csmat(), &u_ref);
 
-        assert_eq!(lu.row_perm.as_ref().unwrap().orig2new, &[1, 2, 0]);
-        assert_eq!(lu.row_perm.as_ref().unwrap().new2orig, &[2, 0, 1]);
+        assert_eq!(lu.row_perm.as_ref().unwrap().orig2new, &[2, 0, 1]);
+        assert_eq!(lu.row_perm.as_ref().unwrap().new2orig, &[1, 2, 0]);
+
+        assert_eq!(lu.col_perm.as_ref().unwrap().orig2new, &[1, 2, 0]);
+        assert_eq!(lu.col_perm.as_ref().unwrap().new2orig, &[2, 0, 1]);
 
         {
             let mut rhs_dense = [6.0, 3.0, 13.0];
@@ -596,7 +587,10 @@ mod tests {
                 }
                 CsVec::new(size, is, vs)
             };
-            let diff = &multiplied.outer_view(i).unwrap() - &permuted;
+            let diff = &multiplied
+                .outer_view(lu.col_perm.as_ref().unwrap().orig2new[i])
+                .unwrap()
+                - &permuted;
             assert!(diff.norm(1.0) < 1e-5);
         }
 

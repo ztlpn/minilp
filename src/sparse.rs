@@ -265,6 +265,21 @@ impl SparseMat {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Perm {
+    pub(crate) orig2new: Vec<usize>,
+    pub(crate) new2orig: Vec<usize>,
+}
+
+impl Perm {
+    pub fn inv(self) -> Perm {
+        Perm {
+            orig2new: self.new2orig,
+            new2orig: self.orig2new,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
