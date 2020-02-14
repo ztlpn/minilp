@@ -540,6 +540,8 @@ impl Tableau {
         self.add_le_constraint_impl(coeffs, bound)
     }
 
+    // TODO: remove_constraint
+
     fn add_le_constraint_impl(
         mut self,
         mut coeffs: CsVec<f64>,
@@ -667,6 +669,9 @@ impl Tableau {
     }
 
     fn pivot(&mut self, c_entering: usize, r_leaving: usize, pivot_coeff: f64) -> usize {
+        // TODO: periodically (say, every 1000 pivots) recalc cur_bounds and cur_obj
+        // from scratch for numerical stability.
+
         let pivot_bound = self.cur_bounds[r_leaving] / pivot_coeff;
         for (r, coeff) in self.col_coeffs.iter() {
             if r == r_leaving {
@@ -771,6 +776,9 @@ impl Tableau {
             let val = if self.num_artificial_vars == 0 && self.enable_steepest_edge {
                 self.cur_obj[c] * self.cur_obj[c] / (self.non_basic_col_sq_norms[c] + 1.0)
             } else {
+                // TODO: simple "biggest coeff" rule seems to perform much better than
+                // the steepest edge rule for minimizing artificial objective (phase 1).
+                // Why is that?
                 self.cur_obj[c]
             };
             // let val = self.cur_obj[c];
