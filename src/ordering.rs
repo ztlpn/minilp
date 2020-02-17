@@ -28,6 +28,7 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
     }
 
     // TODO:
+    // * better priority queue structure
     // * allocate all storage at once
     // * remove dense rows
     // * immediately order dense columns

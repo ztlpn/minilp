@@ -163,13 +163,16 @@ pub fn lu_factorize(
         scratch.rhs.clear();
         let mat_col = mat.outer_view(mat_cols[col_perm.new2orig[i_col]]).unwrap();
 
-        // 3. calculate i-th column of U
+        // Solve the equation L'_j * x = a_j (x will be in scratch.rhs).
+        // L'_j is a sq. matrix with the first j columns of L
+        // and columns of identity matrix after j.
+        // Part of x above the diagonal (in the new row indices) is the column of U
+        // and part of x below the diagonal divided by the pivot value is the column of L
+
         for (orig_r, &val) in mat_col.iter() {
-            if orig2new_row[orig_r] < i_col {
-                scratch.rhs.values[orig_r] = val;
-                scratch.rhs.is_nonzero[orig_r] = true;
-                scratch.rhs.nonzero.push(orig_r);
-            }
+            scratch.rhs.values[orig_r] = val;
+            scratch.rhs.is_nonzero[orig_r] = true;
+            scratch.rhs.nonzero.push(orig_r);
         }
 
         scratch.mark_nonzero.run(
@@ -179,58 +182,33 @@ pub fn lu_factorize(
             |orig_r| orig2new_row[orig_r],
         );
 
+        // At this point all future nonzero positions of scratch.rhs are marked
+        // and the order in which values depend on each other is determined.
         // rev() because DFS returns vertices in reverse topological order.
         for &orig_i in scratch.mark_nonzero.visited.iter().rev() {
             // values[orig_i] is already fully calculated, diag coeff = 1.0.
-            let x_val = scratch.rhs.values[orig_i];
             let new_i = orig2new_row[orig_i];
-            for (orig_r, coeff) in lower.col_iter(new_i) {
-                let new_r = orig2new_row[orig_r];
-                if new_r < i_col && new_r > new_i {
-                    scratch.rhs.values[orig_r] -= x_val * coeff;
-                }
-            }
-        }
-
-        // 4.
-        // Now calculate b vector in scratch.rhs.
-        // It will occupy different indices than the new U col.
-        let below_rows_start = scratch.rhs.nonzero.len();
-        for (orig_r, &val) in mat_col.iter() {
-            if orig2new_row[orig_r] >= i_col {
-                scratch.rhs.values[orig_r] = val;
-                scratch.rhs.is_nonzero[orig_r] = true;
-                scratch.rhs.nonzero.push(orig_r);
-            }
-        }
-
-        for i_upper in 0..below_rows_start {
-            let orig_u_r = scratch.rhs.nonzero[i_upper];
-            let u_coeff = scratch.rhs.values[orig_u_r];
-
-            if u_coeff != 0.0 {
-                let new_u_r = orig2new_row[orig_u_r];
-                upper.push(new_u_r, u_coeff);
-
-                for (orig_r, val) in lower.col_iter(new_u_r) {
-                    if orig2new_row[orig_r] >= i_col {
-                        if !scratch.rhs.is_nonzero[orig_r] {
-                            scratch.rhs.is_nonzero[orig_r] = true;
-                            scratch.rhs.nonzero.push(orig_r);
-                        }
-                        scratch.rhs.values[orig_r] -= val * u_coeff;
+            if new_i < i_col {
+                let x_val = scratch.rhs.values[orig_i];
+                for (orig_r, coeff) in lower.col_iter(new_i) {
+                    if orig_r != orig_i {
+                        scratch.rhs.values[orig_r] -= x_val * coeff;
                     }
                 }
             }
         }
 
-        // Index of the pivot element in tmp_below_rows array.
+        // Next we choose a pivot among values of x below the diagonal.
         // Pivoting by choosing the max element is good for stability,
         // but bad for sparseness, so we do threshold pivoting instead.
 
-        let pivot_i = {
+        let pivot_orig_r = {
             let mut max_abs = 0.0;
-            for &orig_r in &scratch.rhs.nonzero[below_rows_start..] {
+            for &orig_r in &scratch.rhs.nonzero {
+                if orig2new_row[orig_r] < i_col {
+                    continue;
+                }
+
                 let abs = f64::abs(scratch.rhs.values[orig_r]);
                 if abs > max_abs {
                     max_abs = abs;
@@ -242,52 +220,56 @@ pub fn lu_factorize(
             // Gilbert-Peierls suggest to choose row with least elements *to the right*,
             // but it yielded poor results. Our heuristic is not a huge improvement either,
             // but at least we are less dependent on initial row ordering.
-            let mut best_i = None;
+            let mut best_orig_r = None;
             let mut best_elt_count = None;
-            for i in below_rows_start..scratch.rhs.nonzero.len() {
-                let orig_r = scratch.rhs.nonzero[i];
+            for &orig_r in &scratch.rhs.nonzero {
+                if orig2new_row[orig_r] < i_col {
+                    continue;
+                }
+
                 if f64::abs(scratch.rhs.values[orig_r]) >= stability_coeff * max_abs {
                     let elt_count = orig_row2elt_count[orig_r];
                     if best_elt_count.is_none() || best_elt_count.unwrap() > elt_count {
-                        best_i = Some(i);
+                        best_orig_r = Some(orig_r);
                         best_elt_count = Some(elt_count);
                     }
                 }
             }
-            best_i.unwrap()
+            best_orig_r.unwrap()
         };
 
-        let pivot_val = scratch.rhs.values[scratch.rhs.nonzero[pivot_i]];
+        let pivot_val = scratch.rhs.values[pivot_orig_r];
 
-        // 5.
         {
+            // Keep track of row permutations.
             let row = i_col;
             let orig_row = new2orig_row[row];
-            let orig_pivot_row = scratch.rhs.nonzero[pivot_i];
-            let pivot_row = orig2new_row[orig_pivot_row];
+            let pivot_row = orig2new_row[pivot_orig_r];
             new2orig_row.swap(row, pivot_row);
-            orig2new_row.swap(orig_row, orig_pivot_row);
+            orig2new_row.swap(orig_row, pivot_orig_r);
         }
 
-        // 6, 7.
+        // Gather the values of x into lower and upper matrices.
 
-        // diagonal elements.
-        upper.push(i_col, pivot_val);
-        upper.seal_column();
-        lower.push(scratch.rhs.nonzero[pivot_i], 1.0);
-
-        for i in below_rows_start..scratch.rhs.nonzero.len() {
-            let orig_row = scratch.rhs.nonzero[i];
-            let val = scratch.rhs.values[orig_row];
+        lower.push(pivot_orig_r, 1.0);
+        for &orig_r in &scratch.rhs.nonzero {
+            let val = scratch.rhs.values[orig_r];
 
             if val == 0.0 {
                 continue;
             }
 
-            if i != pivot_i {
-                lower.push(orig_row, val / pivot_val);
+            let new_r = orig2new_row[orig_r];
+            if new_r < i_col {
+                upper.push(new_r, val);
+            } else if orig_r != pivot_orig_r {
+                lower.push(orig_r, val / pivot_val);
             }
         }
+
+        upper.push(i_col, pivot_val);
+
+        upper.seal_column();
         lower.seal_column();
     }
 
@@ -376,7 +358,12 @@ impl MarkNonzero {
             });
             while !self.dfs_stack.is_empty() {
                 let cur_step = self.dfs_stack.last_mut().unwrap();
-                let children = get_children(orig2new_row(cur_step.orig_i));
+                let new_i = orig2new_row(cur_step.orig_i);
+                let children = if filter(new_i) {
+                    get_children(new_i)
+                } else {
+                    &[]
+                };
                 if !self.is_visited[cur_step.orig_i] {
                     self.is_visited[cur_step.orig_i] = true;
                 } else {
@@ -385,8 +372,7 @@ impl MarkNonzero {
 
                 while cur_step.cur_child < children.len() {
                     let child_orig_r = children[cur_step.cur_child];
-                    let child_new_r = orig2new_row(child_orig_r);
-                    if !self.is_visited[child_orig_r] && filter(child_new_r) {
+                    if !self.is_visited[child_orig_r] {
                         break;
                     }
                     cur_step.cur_child += 1;
@@ -456,7 +442,7 @@ fn tri_solve_sparse(tri_mat: &SparseMat, scratch: &mut ScratchSpace) {
 }
 
 fn tri_solve_process_col(tri_mat: &SparseMat, col: usize, rhs: &mut [f64]) {
-    // TODO: maybe store diag elements separately so that there is no need to seek for them.
+    // TODO: store diag elements separately so that there is no need to seek for them.
     let i_diag = tri_mat
         .col_rows(col)
         .iter()
