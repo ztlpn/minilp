@@ -24,7 +24,7 @@ impl ScratchSpace {
         }
     }
 
-    pub fn clear_sparse(&mut self, size: usize) {
+    pub(crate) fn clear_sparse(&mut self, size: usize) {
         self.rhs.clear_and_resize(size);
         self.mark_nonzero.clear_and_resize(size);
     }
@@ -104,6 +104,7 @@ impl LUFactors {
             std::mem::swap(rhs, &mut scratch.rhs);
         }
     }
+
     pub fn transpose(&self) -> LUFactors {
         LUFactors {
             lower: self.upper.transpose(),

@@ -2,38 +2,38 @@ use crate::helpers::to_dense;
 use sprs::{CsMat, CsVec};
 
 #[derive(Clone, Debug)]
-pub struct SparseVec {
+pub(crate) struct SparseVec {
     indices: Vec<usize>,
     values: Vec<f64>,
 }
 
 impl SparseVec {
-    pub fn new() -> SparseVec {
+    pub(crate) fn new() -> SparseVec {
         SparseVec {
             indices: vec![],
             values: vec![],
         }
     }
 
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.indices.clear();
         self.values.clear();
     }
 
-    pub fn push(&mut self, i: usize, val: f64) {
+    pub(crate) fn push(&mut self, i: usize, val: f64) {
         self.indices.push(i);
         self.values.push(val);
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &f64)> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &f64)> {
         self.indices.iter().copied().zip(&self.values)
     }
 
-    pub fn sq_norm(&self) -> f64 {
+    pub(crate) fn sq_norm(&self) -> f64 {
         self.values.iter().map(|&v| v * v).sum()
     }
 
-    pub fn into_csvec(self, len: usize) -> CsVec<f64> {
+    pub(crate) fn into_csvec(self, len: usize) -> CsVec<f64> {
         CsVec::new(len, self.indices, self.values)
     }
 }
@@ -60,6 +60,20 @@ impl ScatteredVec {
 
     pub fn iter(&self) -> impl Iterator<Item = (usize, &f64)> {
         self.nonzero.iter().map(move |&i| (i, &self.values[i]))
+    }
+
+    #[inline]
+    pub fn get(&mut self, i: usize) -> &f64 {
+        &self.values[i]
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, i: usize) -> &mut f64 {
+        if !self.is_nonzero[i] {
+            self.is_nonzero[i] = true;
+            self.nonzero.push(i);
+        }
+        &mut self.values[i]
     }
 
     pub fn sq_norm(&self) -> f64 {
@@ -95,7 +109,7 @@ impl ScatteredVec {
         }
     }
 
-    pub fn to_sparse_vec(&self, lhs: &mut SparseVec) {
+    pub(crate) fn to_sparse_vec(&self, lhs: &mut SparseVec) {
         lhs.clear();
         for &idx in &self.nonzero {
             lhs.indices.push(idx);
@@ -104,7 +118,7 @@ impl ScatteredVec {
     }
 
     #[cfg(test)]
-    pub fn to_csvec(&self) -> CsVec<f64> {
+    pub(crate) fn to_csvec(&self) -> CsVec<f64> {
         let mut indices = vec![];
         let mut data = vec![];
         for &i in &self.nonzero {
@@ -116,25 +130,11 @@ impl ScatteredVec {
         }
         CsVec::new(self.values.len(), indices, data)
     }
-
-    #[inline]
-    pub fn get(&mut self, i: usize) -> &f64 {
-        &self.values[i]
-    }
-
-    #[inline]
-    pub fn get_mut(&mut self, i: usize) -> &mut f64 {
-        if !self.is_nonzero[i] {
-            self.is_nonzero[i] = true;
-            self.nonzero.push(i);
-        }
-        &mut self.values[i]
-    }
 }
 
 /// Unordered sparse matrix with elements stored by columns
 #[derive(Clone, Debug)]
-pub struct SparseMat {
+pub(crate) struct SparseMat {
     n_rows: usize,
     indptr: Vec<usize>,
     indices: Vec<usize>,
@@ -142,7 +142,7 @@ pub struct SparseMat {
 }
 
 impl SparseMat {
-    pub fn new(n_rows: usize) -> SparseMat {
+    pub(crate) fn new(n_rows: usize) -> SparseMat {
         SparseMat {
             n_rows,
             indptr: vec![0],
@@ -151,19 +151,19 @@ impl SparseMat {
         }
     }
 
-    pub fn rows(&self) -> usize {
+    pub(crate) fn rows(&self) -> usize {
         self.n_rows
     }
 
-    pub fn cols(&self) -> usize {
+    pub(crate) fn cols(&self) -> usize {
         self.indptr.len() - 1
     }
 
-    pub fn nnz(&self) -> usize {
+    pub(crate) fn nnz(&self) -> usize {
         self.data.len()
     }
 
-    pub fn clear_and_resize(&mut self, n_rows: usize) {
+    pub(crate) fn clear_and_resize(&mut self, n_rows: usize) {
         self.data.clear();
         self.indices.clear();
         self.indptr.clear();
@@ -171,35 +171,35 @@ impl SparseMat {
         self.n_rows = n_rows;
     }
 
-    pub fn push(&mut self, row: usize, val: f64) {
+    pub(crate) fn push(&mut self, row: usize, val: f64) {
         self.indices.push(row);
         self.data.push(val);
     }
 
-    pub fn seal_column(&mut self) {
+    pub(crate) fn seal_column(&mut self) {
         self.indptr.push(self.indices.len())
     }
 
-    pub fn col_rows(&self, i_col: usize) -> &[usize] {
+    pub(crate) fn col_rows(&self, i_col: usize) -> &[usize] {
         &self.indices[self.indptr[i_col]..self.indptr[i_col + 1]]
     }
 
-    pub fn col_rows_mut(&mut self, i_col: usize) -> &mut [usize] {
+    pub(crate) fn col_rows_mut(&mut self, i_col: usize) -> &mut [usize] {
         &mut self.indices[self.indptr[i_col]..self.indptr[i_col + 1]]
     }
 
-    pub fn col_data(&self, i_col: usize) -> &[f64] {
+    pub(crate) fn col_data(&self, i_col: usize) -> &[f64] {
         &self.data[self.indptr[i_col]..self.indptr[i_col + 1]]
     }
 
-    pub fn col_iter(&self, i_col: usize) -> impl Iterator<Item = (usize, &f64)> {
+    pub(crate) fn col_iter(&self, i_col: usize) -> impl Iterator<Item = (usize, &f64)> {
         self.col_rows(i_col)
             .iter()
             .copied()
             .zip(self.col_data(i_col))
     }
 
-    pub fn append_col<'a, T>(&mut self, col: T)
+    pub(crate) fn append_col<'a, T>(&mut self, col: T)
     where
         T: IntoIterator<Item = (usize, &'a f64)>,
     {
@@ -211,7 +211,7 @@ impl SparseMat {
         self.seal_column();
     }
 
-    pub fn into_csmat(self) -> CsMat<f64> {
+    pub(crate) fn into_csmat(self) -> CsMat<f64> {
         CsMat::new_csc(
             (self.cols(), self.n_rows),
             self.indptr,
@@ -220,11 +220,11 @@ impl SparseMat {
         )
     }
 
-    pub fn to_csmat(&self) -> CsMat<f64> {
+    pub(crate) fn to_csmat(&self) -> CsMat<f64> {
         self.clone().into_csmat()
     }
 
-    pub fn transpose(&self) -> SparseMat {
+    pub(crate) fn transpose(&self) -> SparseMat {
         let mut out = SparseMat {
             n_rows: self.cols(),
             indptr: vec![],
@@ -267,26 +267,26 @@ impl SparseMat {
 }
 
 #[derive(Clone)]
-pub struct TriangleMat {
+pub(crate) struct TriangleMat {
     pub(crate) nondiag: SparseMat,
     /// Diag elements, None means all 1's
     pub(crate) diag: Option<Vec<f64>>,
 }
 
 impl TriangleMat {
-    pub fn rows(&self) -> usize {
+    pub(crate) fn rows(&self) -> usize {
         self.nondiag.rows()
     }
 
-    pub fn cols(&self) -> usize {
+    pub(crate) fn cols(&self) -> usize {
         self.nondiag.cols()
     }
 
-    pub fn nnz(&self) -> usize {
+    pub(crate) fn nnz(&self) -> usize {
         self.nondiag.nnz() + self.nondiag.rows()
     }
 
-    pub fn transpose(&self) -> TriangleMat {
+    pub(crate) fn transpose(&self) -> TriangleMat {
         TriangleMat {
             nondiag: self.nondiag.transpose(),
             diag: self.diag.clone(),
@@ -294,7 +294,7 @@ impl TriangleMat {
     }
 
     #[cfg(test)]
-    pub fn to_csmat(&self) -> CsMat<f64> {
+    pub(crate) fn to_csmat(&self) -> CsMat<f64> {
         let mut tri_mat = sprs::TriMat::new((self.rows(), self.cols()));
         if let Some(diag) = self.diag.as_ref() {
             for (i, &val) in diag.iter().enumerate() {
@@ -331,15 +331,6 @@ impl std::fmt::Debug for TriangleMat {
 pub struct Perm {
     pub(crate) orig2new: Vec<usize>,
     pub(crate) new2orig: Vec<usize>,
-}
-
-impl Perm {
-    pub fn inv(self) -> Perm {
-        Perm {
-            orig2new: self.new2orig,
-            new2orig: self.orig2new,
-        }
-    }
 }
 
 #[cfg(test)]

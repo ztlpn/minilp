@@ -1,23 +1,23 @@
 #[macro_use]
 extern crate log;
 
-pub use sprs::CsVec;
+pub mod lu;
+use lu::{lu_factorize, LUFactors, ScratchSpace};
 
-use sprs::{CompressedStorage, CsMat};
+pub mod ordering;
+
+pub type CsVec = sprs::CsVecI<f64, usize>;
+type CsMat = sprs::CsMatI<f64, usize>;
+type ArrayVec = ndarray::Array1<f64>;
+
+use sprs::CompressedStorage;
 use std::collections::{BTreeSet, HashMap};
 
 mod sparse;
 use sparse::{ScatteredVec, SparseMat, SparseVec};
 
-mod lu;
-use lu::{lu_factorize, LUFactors, ScratchSpace};
-
 mod helpers;
 use helpers::{resized_view, to_dense};
-
-pub mod ordering;
-
-type ArrayVec = ndarray::Array1<f64>;
 
 const SENTINEL: usize = 0usize.wrapping_sub(1);
 
@@ -28,8 +28,8 @@ pub struct Tableau {
     num_artificial_vars: usize,
 
     orig_obj: Vec<f64>,           // with negated coeffs
-    orig_constraints: CsMat<f64>, // excluding bounds
-    orig_constraints_csc: CsMat<f64>,
+    orig_constraints: CsMat, // excluding bounds
+    orig_constraints_csc: CsMat,
     orig_bounds: Vec<f64>,
 
     set_vars: HashMap<usize, f64>,
@@ -81,9 +81,9 @@ impl std::fmt::Debug for Tableau {
 
 #[derive(Clone, Debug)]
 pub enum Constraint {
-    Eq(CsVec<f64>, f64),
-    Le(CsVec<f64>, f64),
-    Ge(CsVec<f64>, f64),
+    Eq(CsVec, f64),
+    Le(CsVec, f64),
+    Ge(CsVec, f64),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -554,7 +554,7 @@ impl Tableau {
 
     fn add_le_constraint_impl(
         mut self,
-        mut coeffs: CsVec<f64>,
+        mut coeffs: CsVec,
         orig_bound: f64,
     ) -> Result<Self, Error> {
         assert_eq!(self.num_artificial_vars, 0);
@@ -1169,7 +1169,7 @@ impl BasisSolver {
         self.eta_matrices.push(r_leaving, coeffs);
     }
 
-    fn reset(&mut self, orig_constraints_csc: &CsMat<f64>, basic_vars: &[usize]) {
+    fn reset(&mut self, orig_constraints_csc: &CsMat, basic_vars: &[usize]) {
         self.scratch.clear_sparse(basic_vars.len());
         self.eta_matrices.clear_and_resize(basic_vars.len());
         self.rhs.clear_and_resize(basic_vars.len());
@@ -1252,7 +1252,7 @@ impl EtaMatrices {
     }
 }
 
-fn into_resized(vec: CsVec<f64>, len: usize) -> CsVec<f64> {
+fn into_resized(vec: CsVec, len: usize) -> CsVec {
     let (mut indices, mut data) = vec.into_raw_storage();
 
     while let Some(&i) = indices.last() {

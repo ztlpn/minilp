@@ -5,73 +5,6 @@ struct Row {
     cols: Vec<usize>,
 }
 
-#[derive(Clone, Debug)]
-struct Col {
-    rows: Vec<usize>,
-    score: usize,
-}
-
-#[derive(Debug)]
-struct ColsQueue {
-    score2head: Vec<Option<usize>>,
-    prev: Vec<usize>,
-    next: Vec<usize>,
-    min_score: usize,
-}
-
-impl ColsQueue {
-    fn new(num_cols: usize, max_score: usize) -> ColsQueue {
-        ColsQueue {
-            score2head: vec![None; max_score + 1],
-            prev: vec![0; num_cols],
-            next: vec![0; num_cols],
-            min_score: max_score + 1,
-        }
-    }
-
-    fn pop_min(&mut self) -> Option<usize> {
-        let col = loop {
-            if self.min_score >= self.score2head.len() {
-                return None;
-            }
-            if let Some(col) = self.score2head[self.min_score] {
-                break col;
-            }
-            self.min_score += 1;
-        };
-
-        self.remove(col, self.min_score);
-        Some(col)
-    }
-
-    fn add(&mut self, col: usize, score: usize) {
-        self.min_score = std::cmp::min(self.min_score, score);
-
-        if let Some(head) = self.score2head[score] {
-            self.prev[col] = self.prev[head];
-            self.next[col] = head;
-            self.next[self.prev[head]] = col;
-            self.prev[head] = col;
-        } else {
-            self.prev[col] = col;
-            self.next[col] = col;
-            self.score2head[score] = Some(col);
-        }
-    }
-
-    fn remove(&mut self, col: usize, score: usize) {
-        if self.next[col] == col {
-            self.score2head[score] = None;
-        } else {
-            self.next[self.prev[col]] = self.next[col];
-            self.prev[self.next[col]] = self.prev[col];
-            if self.score2head[score].unwrap() == col {
-                self.score2head[score] = Some(self.next[col]);
-            }
-        }
-    }
-}
-
 pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [usize]>) -> Perm {
     // TODO:
     // * allocate all storage at once
@@ -265,6 +198,73 @@ pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [
     }
 
     Perm { orig2new, new2orig }
+}
+
+#[derive(Clone, Debug)]
+struct Col {
+    rows: Vec<usize>,
+    score: usize,
+}
+
+#[derive(Debug)]
+struct ColsQueue {
+    score2head: Vec<Option<usize>>,
+    prev: Vec<usize>,
+    next: Vec<usize>,
+    min_score: usize,
+}
+
+impl ColsQueue {
+    fn new(num_cols: usize, max_score: usize) -> ColsQueue {
+        ColsQueue {
+            score2head: vec![None; max_score + 1],
+            prev: vec![0; num_cols],
+            next: vec![0; num_cols],
+            min_score: max_score + 1,
+        }
+    }
+
+    fn pop_min(&mut self) -> Option<usize> {
+        let col = loop {
+            if self.min_score >= self.score2head.len() {
+                return None;
+            }
+            if let Some(col) = self.score2head[self.min_score] {
+                break col;
+            }
+            self.min_score += 1;
+        };
+
+        self.remove(col, self.min_score);
+        Some(col)
+    }
+
+    fn add(&mut self, col: usize, score: usize) {
+        self.min_score = std::cmp::min(self.min_score, score);
+
+        if let Some(head) = self.score2head[score] {
+            self.prev[col] = self.prev[head];
+            self.next[col] = head;
+            self.next[self.prev[head]] = col;
+            self.prev[head] = col;
+        } else {
+            self.prev[col] = col;
+            self.next[col] = col;
+            self.score2head[score] = Some(col);
+        }
+    }
+
+    fn remove(&mut self, col: usize, score: usize) {
+        if self.next[col] == col {
+            self.score2head[score] = None;
+        } else {
+            self.next[self.prev[col]] = self.next[col];
+            self.prev[self.next[col]] = self.prev[col];
+            if self.score2head[score].unwrap() == col {
+                self.score2head[score] = Some(self.next[col]);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
