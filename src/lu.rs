@@ -491,23 +491,20 @@ mod tests {
 
         let l_ref = [
             vec![1.0, 0.0, 0.0],
-            vec![1.0, 1.0, 0.0],
-            vec![0.0, 0.5, 1.0],
+            vec![0.5, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
         ];
         assert_matrix_eq(&lu.lower.to_csmat(), &l_ref);
 
         let u_ref = [
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 4.0, 3.0],
-            vec![0.0, 0.0, 0.5],
+            vec![4.0, 3.0, 1.0],
+            vec![0.0, 0.5, -0.5],
+            vec![0.0, 0.0, 1.0],
         ];
         assert_matrix_eq(&lu.upper.to_csmat(), &u_ref);
 
-        assert_eq!(lu.row_perm.as_ref().unwrap().orig2new, &[2, 0, 1]);
-        assert_eq!(lu.row_perm.as_ref().unwrap().new2orig, &[1, 2, 0]);
-
-        assert_eq!(lu.col_perm.as_ref().unwrap().orig2new, &[1, 2, 0]);
-        assert_eq!(lu.col_perm.as_ref().unwrap().new2orig, &[2, 0, 1]);
+        assert_eq!(lu.row_perm.as_ref().unwrap().new2orig, &[2, 0, 1]);
+        assert_eq!(lu.col_perm.as_ref().unwrap().new2orig, &[0, 1, 2]);
 
         {
             let mut rhs_dense = [6.0, 3.0, 13.0];

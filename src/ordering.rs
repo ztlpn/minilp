@@ -1,6 +1,5 @@
 use super::sparse::Perm;
 use sprs::CsMat;
-use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
 struct Row {
@@ -10,14 +9,93 @@ struct Row {
 #[derive(Clone, Debug)]
 struct Col {
     rows: Vec<usize>,
+    score: usize,
+}
+
+#[derive(Debug)]
+struct ColsQueue {
+    score2head: Vec<Option<usize>>,
+    prev: Vec<usize>,
+    next: Vec<usize>,
+    min_score: usize,
+}
+
+impl ColsQueue {
+    fn new(num_cols: usize, max_score: usize) -> ColsQueue {
+        ColsQueue {
+            score2head: vec![None; max_score],
+            prev: vec![0; num_cols],
+            next: vec![0; num_cols],
+            min_score: max_score,
+        }
+    }
+
+    fn pop_min(&mut self) -> Option<usize> {
+        let col = loop {
+            if self.min_score >= self.score2head.len() {
+                return None;
+            }
+
+            if let Some(col) = self.score2head[self.min_score] {
+                break col;
+            }
+
+            self.min_score += 1;
+        };
+
+        self.remove(col, self.min_score);
+        Some(col)
+    }
+
+    fn add(&mut self, col: usize, score: usize) {
+        self.min_score = std::cmp::min(self.min_score, score);
+
+        if let Some(head) = self.score2head[score] {
+            self.prev[col] = self.prev[head];
+            self.next[col] = head;
+            self.next[self.prev[head]] = col;
+            self.prev[head] = col;
+        } else {
+            self.prev[col] = col;
+            self.next[col] = col;
+            self.score2head[score] = Some(col);
+        }
+    }
+
+    fn remove(&mut self, col: usize, score: usize) {
+        if self.next[col] == col {
+            self.score2head[score] = None;
+        } else {
+            self.next[self.prev[col]] = self.next[col];
+            self.prev[self.next[col]] = self.prev[col];
+            if self.score2head[score].unwrap() == col {
+                self.score2head[score] = Some(self.next[col]);
+            }
+        }
+    }
 }
 
 pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
     assert!(mat.is_csc());
     assert_eq!(mat.rows(), mat_cols.len());
 
+    // TODO:
+    // * allocate all storage at once
+    // * remove dense rows
+    // * immediately order dense columns
+    // * deal with empty columns/rows
+    // * supercolumns
+
     let mut rows = vec![Row { cols: vec![] }; mat.rows()];
-    let mut cols = vec![Col { rows: vec![] }; mat_cols.len()];
+    let mut cols = vec![
+        Col {
+            rows: vec![],
+            score: 0,
+        };
+        mat_cols.len()
+    ];
+
+    let mut cols_queue = ColsQueue::new(mat_cols.len(), mat_cols.len());
 
     for c in 0..cols.len() {
         let col = mat.outer_view(mat_cols[c]).unwrap();
@@ -27,23 +105,17 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
         }
     }
 
-    // TODO:
-    // * better priority queue structure
-    // * allocate all storage at once
-    // * remove dense rows
-    // * immediately order dense columns
-    // * deal with empty columns/rows
-    // * supercolumns
+    for c in 0..cols.len() {
+        let col = &mut cols[c];
 
-    let mut col_scores = vec![];
-    let mut score_to_col = BTreeSet::<(usize, usize)>::new();
-    for (c, col) in cols.iter().enumerate() {
         let mut score = 0;
         for &r in &col.rows {
             score += rows[r].cols.len() - 1;
         }
-        col_scores.push(score);
-        score_to_col.insert((score, c));
+        score = std::cmp::min(score, mat_cols.len() - 1);
+
+        col.score = score;
+        cols_queue.add(c, score);
     }
 
     // eprintln!(
@@ -63,10 +135,7 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
     let mut is_in_diffs = vec![false; mat.rows()];
 
     while new2orig.len() < mat_cols.len() {
-        let pivot_c = {
-            let first = score_to_col.iter().next().unwrap().clone();
-            score_to_col.take(&first).unwrap().1
-        };
+        let pivot_c = cols_queue.pop_min().unwrap();
 
         new2orig.push(pivot_c);
         // eprintln!("ORDERED {}", new2orig.last().unwrap());
@@ -144,13 +213,13 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
             let mut i = 0;
             while i < pivot_row.len() {
                 let c = pivot_row[i];
+                cols_queue.remove(c, cols[c].score);
 
                 let mut diff = 0;
                 for &r in &cols[c].rows {
                     diff += row_set_diffs[r];
                 }
 
-                score_to_col.take(&(col_scores[c], c)).unwrap();
                 if diff == 0 {
                     // mass elimination: we can order column c now as it will not result
                     // in any additional fill-in.
@@ -159,7 +228,7 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
                     pivot_row.swap_remove(i);
                     cols[c].rows.clear();
                 } else {
-                    col_scores[c] = diff; // NOTE: not the final score, will be updated later.
+                    cols[c].score = diff; // NOTE: not the final score, will be updated later.
                     i += 1;
                 }
             }
@@ -183,8 +252,10 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
             rows[pivot_r].cols = pivot_row;
             for &c in &rows[pivot_r].cols {
                 cols[c].rows.push(pivot_r);
-                col_scores[c] += pivot_row_len - 1; // TODO: supercolumns
-                score_to_col.insert((col_scores[c], c));
+
+                cols[c].score += pivot_row_len - 1; // TODO: supercolumns
+                cols[c].score = std::cmp::min(cols[c].score, mat_cols.len() - 1);
+                cols_queue.add(c, cols[c].score);
             }
         }
 
