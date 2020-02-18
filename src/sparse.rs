@@ -1,3 +1,4 @@
+use crate::helpers::to_dense;
 use sprs::{CsMat, CsVec};
 
 #[derive(Clone, Debug)]
@@ -262,6 +263,67 @@ impl SparseMat {
         *out.indptr.last_mut().unwrap() = self.nnz();
 
         out
+    }
+}
+
+#[derive(Clone)]
+pub struct TriangleMat {
+    pub(crate) nondiag: SparseMat,
+    /// Diag elements, None means all 1's
+    pub(crate) diag: Option<Vec<f64>>,
+}
+
+impl TriangleMat {
+    pub fn rows(&self) -> usize {
+        self.nondiag.rows()
+    }
+
+    pub fn cols(&self) -> usize {
+        self.nondiag.cols()
+    }
+
+    pub fn nnz(&self) -> usize {
+        self.nondiag.nnz() + self.nondiag.rows()
+    }
+
+    pub fn transpose(&self) -> TriangleMat {
+        TriangleMat {
+            nondiag: self.nondiag.transpose(),
+            diag: self.diag.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn to_csmat(&self) -> CsMat<f64> {
+        let mut tri_mat = sprs::TriMat::new((self.rows(), self.cols()));
+        if let Some(diag) = self.diag.as_ref() {
+            for (i, &val) in diag.iter().enumerate() {
+                tri_mat.add_triplet(i, i, val);
+            }
+        } else {
+            for i in 0..self.rows() {
+                tri_mat.add_triplet(i, i, 1.0);
+            }
+        }
+
+        for c in 0..self.nondiag.cols() {
+            for (r, &val) in self.nondiag.col_iter(c) {
+                tri_mat.add_triplet(r, c, val);
+            }
+        }
+
+        tri_mat.to_csc()
+    }
+}
+
+impl std::fmt::Debug for TriangleMat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "nondiag:\n")?;
+        for row in self.nondiag.to_csmat().to_csr().outer_iterator() {
+            write!(f, "{:?}\n", to_dense(&row))?
+        }
+        write!(f, "diag: {:?}\n", self.diag)?;
+        Ok(())
     }
 }
 

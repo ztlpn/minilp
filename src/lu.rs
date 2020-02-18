@@ -1,12 +1,11 @@
-use crate::helpers::to_dense;
 use sprs::CsMat;
 
-use crate::sparse::{Perm, ScatteredVec, SparseMat};
+use crate::sparse::{Perm, ScatteredVec, SparseMat, TriangleMat};
 
 #[derive(Clone)]
 pub struct LUFactors {
-    lower: SparseMat,
-    upper: SparseMat,
+    lower: TriangleMat,
+    upper: TriangleMat,
     row_perm: Option<Perm>,
     col_perm: Option<Perm>,
 }
@@ -35,25 +34,18 @@ impl ScratchSpace {
 
 impl std::fmt::Debug for LUFactors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "L:\n")?;
-        for row in self.lower.to_csmat().to_csr().outer_iterator() {
-            write!(f, "{:?}\n", to_dense(&row))?
-        }
-        write!(f, "U:\n")?;
-        for row in self.upper.to_csmat().to_csr().outer_iterator() {
-            write!(f, "{:?}\n", to_dense(&row))?
-        }
-        write!(
+        writeln!(f, "L:\n{:?}", self.lower)?;
+        writeln!(f, "U:\n{:?}", self.upper)?;
+        writeln!(
             f,
-            "row_perm.new2orig: {:?}\n",
+            "row_perm.new2orig: {:?}",
             self.row_perm.as_ref().map(|p| &p.new2orig)
         )?;
-        write!(
+        writeln!(
             f,
-            "col_perm.new2orig: {:?}\n",
+            "col_perm.new2orig: {:?}",
             self.col_perm.as_ref().map(|p| &p.new2orig)
         )?;
-
         Ok(())
     }
 }
@@ -155,6 +147,7 @@ pub fn lu_factorize(
 
     let mut lower = SparseMat::new(mat.rows());
     let mut upper = SparseMat::new(mat.rows());
+    let mut upper_diag = Vec::with_capacity(mat.rows());
 
     let mut new2orig_row = (0..mat.rows()).collect::<Vec<_>>();
     let mut orig2new_row = new2orig_row.clone();
@@ -183,7 +176,7 @@ pub fn lu_factorize(
         );
 
         // At this point all future nonzero positions of scratch.rhs are marked
-        // and the order in which values depend on each other is determined.
+        // and the order in which variables depend on each other is determined.
         // rev() because DFS returns vertices in reverse topological order.
         for &orig_i in scratch.mark_nonzero.visited.iter().rev() {
             // values[orig_i] is already fully calculated, diag coeff = 1.0.
@@ -191,9 +184,7 @@ pub fn lu_factorize(
             if new_i < i_col {
                 let x_val = scratch.rhs.values[orig_i];
                 for (orig_r, coeff) in lower.col_iter(new_i) {
-                    if orig_r != orig_i {
-                        scratch.rhs.values[orig_r] -= x_val * coeff;
-                    }
+                    scratch.rhs.values[orig_r] -= x_val * coeff;
                 }
             }
         }
@@ -251,7 +242,6 @@ pub fn lu_factorize(
 
         // Gather the values of x into lower and upper matrices.
 
-        lower.push(pivot_orig_r, 1.0);
         for &orig_r in &scratch.rhs.nonzero {
             let val = scratch.rhs.values[orig_r];
 
@@ -262,12 +252,12 @@ pub fn lu_factorize(
             let new_r = orig2new_row[orig_r];
             if new_r < i_col {
                 upper.push(new_r, val);
-            } else if orig_r != pivot_orig_r {
+            } else if new_r == i_col {
+                upper_diag.push(pivot_val);
+            } else {
                 lower.push(orig_r, val / pivot_val);
             }
         }
-
-        upper.push(i_col, pivot_val);
 
         upper.seal_column();
         lower.seal_column();
@@ -287,8 +277,14 @@ pub fn lu_factorize(
     );
 
     LUFactors {
-        lower,
-        upper,
+        lower: TriangleMat {
+            nondiag: lower,
+            diag: None,
+        },
+        upper: TriangleMat {
+            nondiag: upper,
+            diag: Some(upper_diag),
+        },
         row_perm: Some(Perm {
             orig2new: orig2new_row,
             new2orig: new2orig_row,
@@ -405,7 +401,7 @@ enum Triangle {
     Upper,
 }
 
-fn tri_solve_dense(tri_mat: &SparseMat, triangle: Triangle, rhs: &mut [f64]) {
+fn tri_solve_dense(tri_mat: &TriangleMat, triangle: Triangle, rhs: &mut [f64]) {
     assert_eq!(tri_mat.rows(), rhs.len());
     match triangle {
         Triangle::Lower => {
@@ -423,13 +419,13 @@ fn tri_solve_dense(tri_mat: &SparseMat, triangle: Triangle, rhs: &mut [f64]) {
 }
 
 /// rhs is passed via scratch.visited, scratch.values.
-fn tri_solve_sparse(tri_mat: &SparseMat, scratch: &mut ScratchSpace) {
+fn tri_solve_sparse(tri_mat: &TriangleMat, scratch: &mut ScratchSpace) {
     assert_eq!(tri_mat.rows(), scratch.rhs.len());
 
     // compute the non-zero elements of the result by dfs traversal
     scratch.mark_nonzero.run(
         &mut scratch.rhs,
-        |col| tri_mat.col_rows(col),
+        |col| tri_mat.nondiag.col_rows(col),
         |_| true,
         |orig_i| orig_i,
     );
@@ -441,30 +437,25 @@ fn tri_solve_sparse(tri_mat: &SparseMat, scratch: &mut ScratchSpace) {
     }
 }
 
-fn tri_solve_process_col(tri_mat: &SparseMat, col: usize, rhs: &mut [f64]) {
-    // TODO: store diag elements separately so that there is no need to seek for them.
-    let i_diag = tri_mat
-        .col_rows(col)
-        .iter()
-        .position(|&r| r == col)
-        .unwrap();
-    let diag_coeff = tri_mat.col_data(col)[i_diag];
+fn tri_solve_process_col(tri_mat: &TriangleMat, col: usize, rhs: &mut [f64]) {
+    // all other variables in this row (multiplied by their coeffs)
+    // are already subtracted from rhs[col].
+    let x_val = if let Some(diag) = tri_mat.diag.as_ref() {
+        rhs[col] / diag[col]
+    } else {
+        rhs[col]
+    };
 
-    // rhs[col] is already fully calculated.
-    let x_val = rhs[col] / diag_coeff;
-    for (r, &coeff) in tri_mat.col_iter(col) {
-        if r == col {
-            rhs[r] = x_val;
-        } else {
-            rhs[r] -= x_val * coeff;
-        }
+    rhs[col] = x_val;
+    for (r, &coeff) in tri_mat.nondiag.col_iter(col) {
+        rhs[r] -= x_val * coeff;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::{assert_matrix_eq, to_sparse};
+    use crate::helpers::{assert_matrix_eq, to_dense, to_sparse};
     use sprs::{CsVec, TriMat};
 
     #[test]
@@ -489,19 +480,22 @@ mod tests {
         let lu = lu_factorize(&mat, &[1, 0, 3], 0.9, &mut scratch);
         let lu_transp = lu.transpose();
 
-        let l_ref = [
-            vec![1.0, 0.0, 0.0],
-            vec![0.5, 1.0, 0.0],
-            vec![0.0, 0.0, 1.0],
+        let l_nondiag_ref = [
+            vec![0.0, 0.0, 0.0],
+            vec![0.5, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0],
         ];
-        assert_matrix_eq(&lu.lower.to_csmat(), &l_ref);
+        assert_matrix_eq(&lu.lower.nondiag.to_csmat(), &l_nondiag_ref);
+        assert_eq!(lu.lower.diag, None);
 
-        let u_ref = [
-            vec![4.0, 3.0, 1.0],
-            vec![0.0, 0.5, -0.5],
-            vec![0.0, 0.0, 1.0],
+        let u_nondiag_ref = [
+            vec![0.0, 3.0, 1.0],
+            vec![0.0, 0.0, -0.5],
+            vec![0.0, 0.0, 0.0],
         ];
-        assert_matrix_eq(&lu.upper.to_csmat(), &u_ref);
+        let u_diag_ref = [4.0, 0.5, 1.0];
+        assert_matrix_eq(&lu.upper.nondiag.to_csmat(), &u_nondiag_ref);
+        assert_eq!(lu.upper.diag.as_ref().unwrap(), &u_diag_ref);
 
         assert_eq!(lu.row_perm.as_ref().unwrap().new2orig, &[2, 0, 1]);
         assert_eq!(lu.col_perm.as_ref().unwrap().new2orig, &[0, 1, 2]);
