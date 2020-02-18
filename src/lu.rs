@@ -133,7 +133,12 @@ pub fn lu_factorize(
             .sum::<usize>()
     );
 
-    let col_perm = super::ordering::order_colamd(mat, mat_cols);
+    let col_perm = super::ordering::order_colamd(
+        mat_cols
+            .iter()
+            .map(|&c| mat.outer_view(c).unwrap().into_raw_storage().0),
+        mat.rows(),
+    );
 
     let mut orig_row2elt_count = vec![0; mat.rows()];
     for &c in mat_cols {

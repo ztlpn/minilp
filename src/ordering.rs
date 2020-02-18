@@ -1,5 +1,4 @@
 use super::sparse::Perm;
-use sprs::CsMat;
 
 #[derive(Clone, Debug)]
 struct Row {
@@ -23,10 +22,10 @@ struct ColsQueue {
 impl ColsQueue {
     fn new(num_cols: usize, max_score: usize) -> ColsQueue {
         ColsQueue {
-            score2head: vec![None; max_score],
+            score2head: vec![None; max_score + 1],
             prev: vec![0; num_cols],
             next: vec![0; num_cols],
-            min_score: max_score,
+            min_score: max_score + 1,
         }
     }
 
@@ -35,11 +34,9 @@ impl ColsQueue {
             if self.min_score >= self.score2head.len() {
                 return None;
             }
-
             if let Some(col) = self.score2head[self.min_score] {
                 break col;
             }
-
             self.min_score += 1;
         };
 
@@ -75,10 +72,7 @@ impl ColsQueue {
     }
 }
 
-pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
-    assert!(mat.is_csc());
-    assert_eq!(mat.rows(), mat_cols.len());
-
+pub fn order_colamd<'a>(cols_iter: impl IntoIterator<Item = &'a [usize]>, n_rows: usize) -> Perm {
     // TODO:
     // * allocate all storage at once
     // * remove dense rows
@@ -86,24 +80,24 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
     // * deal with empty columns/rows
     // * supercolumns
 
-    let mut rows = vec![Row { cols: vec![] }; mat.rows()];
-    let mut cols = vec![
-        Col {
-            rows: vec![],
-            score: 0,
-        };
-        mat_cols.len()
-    ];
+    let mut rows = vec![Row { cols: vec![] }; n_rows];
+    let mut cols = vec![];
 
-    let mut cols_queue = ColsQueue::new(mat_cols.len(), mat_cols.len());
-
-    for c in 0..cols.len() {
-        let col = mat.outer_view(mat_cols[c]).unwrap();
-        cols[c].rows.extend_from_slice(col.indices());
-        for &r in col.indices() {
+    for (c, col_rows) in cols_iter.into_iter().enumerate() {
+        for &r in col_rows {
             rows[r].cols.push(c);
         }
+
+        cols.push(Col {
+            rows: col_rows.to_vec(),
+            score: 0,
+        });
     }
+
+    assert_eq!(rows.len(), cols.len());
+
+    let max_score = cols.len() - 1;
+    let mut cols_queue = ColsQueue::new(cols.len(), max_score);
 
     for c in 0..cols.len() {
         let col = &mut cols[c];
@@ -112,7 +106,7 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
         for &r in &col.rows {
             score += rows[r].cols.len() - 1;
         }
-        score = std::cmp::min(score, mat_cols.len() - 1);
+        score = std::cmp::min(score, max_score);
 
         col.score = score;
         cols_queue.add(c, score);
@@ -123,18 +117,18 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
     //     cols, rows, col_scores
     // );
 
-    let mut new2orig = Vec::with_capacity(mat_cols.len());
+    let mut new2orig = Vec::with_capacity(cols.len());
 
     // cleared every iteration
-    let mut is_in_pivot_row = vec![false; mat_cols.len()];
+    let mut is_in_pivot_row = vec![false; cols.len()];
 
-    let mut is_absorbed_row = vec![false; mat.rows()];
+    let mut is_absorbed_row = vec![false; n_rows];
 
-    let mut row_set_diffs = vec![0; mat.rows()];
+    let mut row_set_diffs = vec![0; n_rows];
     let mut rows_with_diffs = vec![];
-    let mut is_in_diffs = vec![false; mat.rows()];
+    let mut is_in_diffs = vec![false; n_rows];
 
-    while new2orig.len() < mat_cols.len() {
+    while new2orig.len() < cols.len() {
         let pivot_c = cols_queue.pop_min().unwrap();
 
         new2orig.push(pivot_c);
@@ -254,7 +248,7 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
                 cols[c].rows.push(pivot_r);
 
                 cols[c].score += pivot_row_len - 1; // TODO: supercolumns
-                cols[c].score = std::cmp::min(cols[c].score, mat_cols.len() - 1);
+                cols[c].score = std::cmp::min(cols[c].score, max_score);
                 cols_queue.add(c, cols[c].score);
             }
         }
@@ -265,7 +259,7 @@ pub fn order_colamd(mat: &CsMat<f64>, mat_cols: &[usize]) -> Perm {
         // );
     }
 
-    let mut orig2new = vec![0; mat_cols.len()];
+    let mut orig2new = vec![0; cols.len()];
     for (new, &orig) in new2orig.iter().enumerate() {
         orig2new[orig] = new;
     }
@@ -298,7 +292,12 @@ mod tests {
         }
         let mat = mat.to_csc();
 
-        let perm = order_colamd(&mat, &[0, 1, 2, 4]);
+        let perm = order_colamd(
+            [0, 1, 2, 4]
+                .iter()
+                .map(|&c| mat.outer_view(c).unwrap().into_raw_storage().0),
+            4,
+        );
         assert_eq!(&perm.new2orig, &[1, 3, 0, 2]);
         assert_eq!(&perm.orig2new, &[2, 0, 3, 1]);
     }
