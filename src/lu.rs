@@ -1,5 +1,3 @@
-use sprs::CsMat;
-
 use crate::sparse::{Perm, ScatteredVec, SparseMat, TriangleMat};
 
 #[derive(Clone)]
@@ -116,50 +114,37 @@ impl LUFactors {
     }
 }
 
-pub fn lu_factorize(
-    mat: &CsMat<f64>,
-    mat_cols: &[usize],
+pub fn lu_factorize<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
 ) -> LUFactors {
-    assert!(mat.is_csc());
-    assert_eq!(mat.rows(), mat_cols.len());
-
     trace!(
         "lu_factorize: starting, matrix nnz: {}",
-        mat_cols
-            .iter()
-            .map(|&c| mat.outer_view(c).unwrap().nnz())
-            .sum::<usize>()
+        (0..size).map(|c| get_col(c).0.len()).sum::<usize>()
     );
 
-    let col_perm = super::ordering::order_colamd(
-        mat_cols
-            .iter()
-            .map(|&c| mat.outer_view(c).unwrap().into_raw_storage().0),
-        mat.rows(),
-    );
+    let col_perm = super::ordering::order_colamd(size, (0..size).map(|c| get_col(c).0));
 
-    let mut orig_row2elt_count = vec![0; mat.rows()];
-    for &c in mat_cols {
-        let col = mat.outer_view(c).unwrap();
-        for (orig_r, _) in col.iter() {
+    let mut orig_row2elt_count = vec![0; size];
+    for col_rows in (0..size).map(|c| get_col(c).0) {
+        for &orig_r in col_rows {
             orig_row2elt_count[orig_r] += 1;
         }
     }
 
-    scratch.clear_sparse(mat_cols.len());
+    scratch.clear_sparse(size);
 
-    let mut lower = SparseMat::new(mat.rows());
-    let mut upper = SparseMat::new(mat.rows());
-    let mut upper_diag = Vec::with_capacity(mat.rows());
+    let mut lower = SparseMat::new(size);
+    let mut upper = SparseMat::new(size);
+    let mut upper_diag = Vec::with_capacity(size);
 
-    let mut new2orig_row = (0..mat.rows()).collect::<Vec<_>>();
+    let mut new2orig_row = (0..size).collect::<Vec<_>>();
     let mut orig2new_row = new2orig_row.clone();
 
-    for i_col in 0..mat_cols.len() {
-        scratch.rhs.clear();
-        let mat_col = mat.outer_view(mat_cols[col_perm.new2orig[i_col]]).unwrap();
+    for i_col in 0..size {
+        let mat_col = get_col(col_perm.new2orig[i_col]);
 
         // Solve the equation L'_j * x = a_j (x will be in scratch.rhs).
         // L'_j is a sq. matrix with the first j columns of L
@@ -167,11 +152,7 @@ pub fn lu_factorize(
         // Part of x above the diagonal (in the new row indices) is the column of U
         // and part of x below the diagonal divided by the pivot value is the column of L
 
-        for (orig_r, &val) in mat_col.iter() {
-            scratch.rhs.values[orig_r] = val;
-            scratch.rhs.is_nonzero[orig_r] = true;
-            scratch.rhs.nonzero.push(orig_r);
-        }
+        scratch.rhs.set(mat_col.0.iter().copied().zip(mat_col.1));
 
         scratch.mark_nonzero.run(
             &mut scratch.rhs,
@@ -482,7 +463,12 @@ mod tests {
         }
         let mat = mat.to_csc();
         let mut scratch = ScratchSpace::with_capacity(mat.rows());
-        let lu = lu_factorize(&mat, &[1, 0, 3], 0.9, &mut scratch);
+        let lu = lu_factorize(
+            mat.rows(),
+            |c| mat.outer_view([1, 0, 3][c]).unwrap().into_raw_storage(),
+            0.9,
+            &mut scratch,
+        );
         let lu_transp = lu.transpose();
 
         let l_nondiag_ref = [
@@ -554,7 +540,12 @@ mod tests {
         // TODO: random permutation?
         let cols: Vec<_> = (0..size).collect();
 
-        let lu = lu_factorize(&mat, &cols, 0.1, &mut scratch);
+        let lu = lu_factorize(
+            size,
+            |c| mat.outer_view(cols[c]).unwrap().into_raw_storage(),
+            0.1,
+            &mut scratch,
+        );
         let lu_transp = lu.transpose();
 
         let multiplied = &lu.lower.to_csmat() * &lu.upper.to_csmat();

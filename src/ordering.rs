@@ -72,7 +72,7 @@ impl ColsQueue {
     }
 }
 
-pub fn order_colamd<'a>(cols_iter: impl IntoIterator<Item = &'a [usize]>, n_rows: usize) -> Perm {
+pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [usize]>) -> Perm {
     // TODO:
     // * allocate all storage at once
     // * remove dense rows
@@ -293,10 +293,10 @@ mod tests {
         let mat = mat.to_csc();
 
         let perm = order_colamd(
+            4,
             [0, 1, 2, 4]
                 .iter()
                 .map(|&c| mat.outer_view(c).unwrap().into_raw_storage().0),
-            4,
         );
         assert_eq!(&perm.new2orig, &[1, 3, 0, 2]);
         assert_eq!(&perm.orig2new, &[2, 0, 3, 1]);

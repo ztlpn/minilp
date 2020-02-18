@@ -209,7 +209,17 @@ impl Tableau {
         };
 
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
-        let lu_factors = lu_factorize(&orig_constraints_csc, &basic_vars, 0.1, &mut scratch);
+        let lu_factors = lu_factorize(
+            basic_vars.len(),
+            |c| {
+                orig_constraints_csc
+                    .outer_view(basic_vars[c])
+                    .unwrap()
+                    .into_raw_storage()
+            },
+            0.1,
+            &mut scratch,
+        );
         let lu_factors_transp = lu_factors.transpose();
 
         let cur_bounds = orig_bounds.clone();
@@ -1163,7 +1173,17 @@ impl BasisSolver {
         self.scratch.clear_sparse(basic_vars.len());
         self.eta_matrices.clear_and_resize(basic_vars.len());
         self.rhs.clear_and_resize(basic_vars.len());
-        self.lu_factors = lu_factorize(orig_constraints_csc, basic_vars, 0.1, &mut self.scratch);
+        self.lu_factors = lu_factorize(
+            basic_vars.len(),
+            |c| {
+                orig_constraints_csc
+                    .outer_view(basic_vars[c])
+                    .unwrap()
+                    .into_raw_storage()
+            },
+            0.1,
+            &mut self.scratch,
+        );
         self.lu_factors_transp = self.lu_factors.transpose();
     }
 
