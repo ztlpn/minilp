@@ -5,7 +5,7 @@ struct Row {
     cols: Vec<usize>,
 }
 
-pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [usize]>) -> Perm {
+pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
     // Implementation of (a part of) the COLAMD algorithm:
     //
     // "An approximate minimum degree column ordering algorithm",
@@ -22,10 +22,11 @@ pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [
     // * deal with empty columns/rows
     // * supercolumns
 
-    let mut rows = vec![Row { cols: vec![] }; n_rows];
-    let mut cols = vec![];
+    let mut rows = vec![Row { cols: vec![] }; size];
+    let mut cols = Vec::with_capacity(size);
 
-    for (c, col_rows) in cols_iter.into_iter().enumerate() {
+    for c in 0..size {
+        let col_rows = get_col(c);
         for &r in col_rows {
             rows[r].cols.push(c);
         }
@@ -61,14 +62,14 @@ pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [
 
     let mut new2orig = Vec::with_capacity(cols.len());
 
-    let mut is_absorbed_row = vec![false; n_rows];
+    let mut is_absorbed_row = vec![false; size];
 
     // cleared every iteration
     let mut is_in_pivot_row = vec![false; cols.len()];
 
-    let mut row_set_diffs = vec![0; n_rows];
+    let mut row_set_diffs = vec![0; size];
     let mut rows_with_diffs = vec![];
-    let mut is_in_diffs = vec![false; n_rows];
+    let mut is_in_diffs = vec![false; size];
 
     while new2orig.len() < cols.len() {
         let pivot_c = cols_queue.pop_min().unwrap();
@@ -183,7 +184,6 @@ pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [
             is_absorbed_row[pivot_r] = false;
             for &c in &rows[pivot_r].cols {
                 cols[c].rows.push(pivot_r);
-
                 cols[c].score += pivot_row_len - 1; // TODO: supercolumns
                 cols[c].score = std::cmp::min(cols[c].score, max_score);
                 cols_queue.add(c, cols[c].score);
@@ -296,12 +296,12 @@ mod tests {
         }
         let mat = mat.to_csc();
 
-        let perm = order_colamd(
-            4,
-            [0, 1, 2, 4]
-                .iter()
-                .map(|&c| mat.outer_view(c).unwrap().into_raw_storage().0),
-        );
+        let perm = order_colamd(4, |c| {
+            mat.outer_view([0, 1, 2, 4][c])
+                .unwrap()
+                .into_raw_storage()
+                .0
+        });
         assert_eq!(&perm.new2orig, &[1, 3, 0, 2]);
         assert_eq!(&perm.orig2new, &[2, 0, 3, 1]);
     }
