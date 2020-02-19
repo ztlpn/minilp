@@ -6,6 +6,15 @@ struct Row {
 }
 
 pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [usize]>) -> Perm {
+    // Implementation of (a part of) the COLAMD algorithm:
+    //
+    // "An approximate minimum degree column ordering algorithm",
+    // S. I. Larimore, MS Thesis, Dept. of Computer and Information
+    // Science and Engineering, University of Florida, Gainesville, FL,
+    // 1998.  CISE Tech Report TR-98-016.
+    //
+    // https://www.researchgate.net/profile/Tim_Davis2/publication/220492488_A_column_approximate_minimum_degree_ordering_algorithm/links/551b1e100cf251c35b507fe5.pdf
+
     // TODO:
     // * allocate all storage at once
     // * remove dense rows

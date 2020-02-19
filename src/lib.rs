@@ -713,7 +713,10 @@ impl Tableau {
         self.calc_eta_matrix_coeffs(r_leaving, pivot_coeff);
 
         if self.enable_steepest_edge {
-            // Vanderbei p. 149.
+            // Computations for the steepest edge pivoting rule. See
+            // Vanderbei, Robert J. "Linear Programming: Foundations and Extensions." (2001).
+            // p. 149.
+
             let tmp = self
                 .basis_solver
                 .solve_transp(self.eta_matrix_coeffs.iter());

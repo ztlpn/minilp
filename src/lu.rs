@@ -121,6 +121,14 @@ pub fn lu_factorize<'a>(
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
 ) -> LUFactors {
+    // Implementation of the Gilbert-Peierls algorithm:
+    //
+    // Gilbert, John R., and Tim Peierls. "Sparse partial pivoting in time
+    // proportional to arithmetic operations." SIAM Journal on Scientific and
+    // Statistical Computing 9.5 (1988): 862-874.
+    //
+    // https://ecommons.cornell.edu/bitstream/handle/1813/6623/86-783.pdf
+
     trace!(
         "lu_factorize: starting, matrix nnz: {}",
         (0..size).map(|c| get_col(c).0.len()).sum::<usize>()
