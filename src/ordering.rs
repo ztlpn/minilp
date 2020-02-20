@@ -61,10 +61,10 @@ pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [
 
     let mut new2orig = Vec::with_capacity(cols.len());
 
+    let mut is_absorbed_row = vec![false; n_rows];
+
     // cleared every iteration
     let mut is_in_pivot_row = vec![false; cols.len()];
-
-    let mut is_absorbed_row = vec![false; n_rows];
 
     let mut row_set_diffs = vec![0; n_rows];
     let mut rows_with_diffs = vec![];
@@ -101,7 +101,8 @@ pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [
             res
         };
 
-        let mut absorbed_rows = std::mem::take(&mut cols[pivot_c].rows);
+        // choose any absorbed row index to represent pivot row.
+        let pivot_r = *cols[pivot_c].rows.first().unwrap();
 
         // find row set differences
         for &c in &pivot_row {
@@ -120,7 +121,6 @@ pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [
 
                 if row_set_diffs[r] == 0 {
                     // aggressive absorption
-                    absorbed_rows.push(r);
                     is_absorbed_row[r] = true;
                     rows[r].cols.clear();
                 }
@@ -137,11 +137,6 @@ pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [
                     i += 1;
                 }
             }
-        }
-
-        // clear is_absorbed_row for next iteration
-        for &r in &absorbed_rows {
-            is_absorbed_row[r] = false;
         }
 
         // calculate row set differences with the pivot row
@@ -183,9 +178,9 @@ pub fn order_colamd<'a>(n_rows: usize, cols_iter: impl IntoIterator<Item = &'a [
 
         // calculate final column scores
         {
-            let pivot_r = *absorbed_rows.first().unwrap(); // choose any absorbed row index to represent pivot row.
             let pivot_row_len = pivot_row.len();
             rows[pivot_r].cols = pivot_row;
+            is_absorbed_row[pivot_r] = false;
             for &c in &rows[pivot_r].cols {
                 cols[c].rows.push(pivot_r);
 
