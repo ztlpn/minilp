@@ -1,10 +1,5 @@
 use super::sparse::Perm;
 
-#[derive(Clone, Debug)]
-struct Row {
-    cols: Vec<usize>,
-}
-
 pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
     // Implementation of (a part of) the COLAMD algorithm:
     //
@@ -39,8 +34,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
     assert_eq!(rows.len(), cols.len());
 
-    let max_score = cols.len() - 1;
-    let mut cols_queue = ColsQueue::new(cols.len(), max_score);
+    let mut cols_queue = ColsQueue::new(cols.len());
 
     for c in 0..cols.len() {
         let col = &mut cols[c];
@@ -49,7 +43,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         for &r in &col.rows {
             score += rows[r].cols.len() - 1;
         }
-        score = std::cmp::min(score, max_score);
+        score = std::cmp::min(score, size - 1);
 
         col.score = score;
         cols_queue.add(c, score);
@@ -62,9 +56,11 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
     let mut new2orig = Vec::with_capacity(cols.len());
 
+    let mut is_ordered_col = vec![false; size];
     let mut is_absorbed_row = vec![false; size];
 
     // cleared every iteration
+    let mut pivot_row = vec![];
     let mut is_in_pivot_row = vec![false; cols.len()];
 
     let mut row_set_diffs = vec![0; size];
@@ -75,35 +71,29 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         let pivot_c = cols_queue.pop_min().unwrap();
 
         new2orig.push(pivot_c);
+        is_ordered_col[pivot_c] = true;
         // eprintln!("ORDERED {}", new2orig.last().unwrap());
 
+        pivot_row.clear();
+        let mut pivot_r = None;
         for &r in &cols[pivot_c].rows {
-            is_absorbed_row[r] = true;
-        }
-
-        let mut pivot_row = {
-            let mut res = vec![];
-            for &r in &cols[pivot_c].rows {
+            if !std::mem::replace(&mut is_absorbed_row[r], true) {
+                pivot_r = Some(r);  // choose any absorbed row index to represent pivot row.
                 for &c in &rows[r].cols {
-                    if c != pivot_c && !is_in_pivot_row[c] {
-                        is_in_pivot_row[c] = true;
-                        res.push(c);
+                    if !is_ordered_col[c] && !std::mem::replace(&mut is_in_pivot_row[c], true) {
+                        pivot_row.push(c);
                     }
                 }
 
                 rows[r].cols.clear();
             }
+        }
+        let pivot_r = pivot_r.unwrap();
 
-            // clear for next iteration.
-            for &c in &res {
-                is_in_pivot_row[c] = false;
-            }
-
-            res
-        };
-
-        // choose any absorbed row index to represent pivot row.
-        let pivot_r = *cols[pivot_c].rows.first().unwrap();
+        // clear for next iteration.
+        for &c in &pivot_row {
+            is_in_pivot_row[c] = false;
+        }
 
         // find row set differences
         for &c in &pivot_row {
@@ -128,18 +118,6 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
             }
         }
 
-        // remove absorbed rows from columns
-        for &c in &pivot_row {
-            let mut i = 0;
-            while i < cols[c].rows.len() {
-                if is_absorbed_row[cols[c].rows[i]] {
-                    cols[c].rows.swap_remove(i);
-                } else {
-                    i += 1;
-                }
-            }
-        }
-
         // calculate row set differences with the pivot row
         {
             let mut i = 0;
@@ -156,9 +134,9 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                     // mass elimination: we can order column c now as it will not result
                     // in any additional fill-in.
                     new2orig.push(c);
-                    // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
+                    is_ordered_col[c] = true;
                     pivot_row.swap_remove(i);
-                    cols[c].rows.clear();
+                    // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
                 } else {
                     cols[c].score = diff; // NOTE: not the final score, will be updated later.
                     i += 1;
@@ -179,13 +157,11 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
         // calculate final column scores
         {
-            let pivot_row_len = pivot_row.len();
-            rows[pivot_r].cols = pivot_row;
+            rows[pivot_r].cols = pivot_row.clone();
             is_absorbed_row[pivot_r] = false;
             for &c in &rows[pivot_r].cols {
-                cols[c].rows.push(pivot_r);
-                cols[c].score += pivot_row_len - 1; // TODO: supercolumns
-                cols[c].score = std::cmp::min(cols[c].score, max_score);
+                cols[c].score += pivot_row.len() - 1; // TODO: supercolumns
+                cols[c].score = std::cmp::min(cols[c].score, size - 1);
                 cols_queue.add(c, cols[c].score);
             }
         }
@@ -196,12 +172,17 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         // );
     }
 
-    let mut orig2new = vec![0; cols.len()];
+    let mut orig2new = vec![0; size];
     for (new, &orig) in new2orig.iter().enumerate() {
         orig2new[orig] = new;
     }
 
     Perm { orig2new, new2orig }
+}
+
+#[derive(Clone, Debug)]
+struct Row {
+    cols: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,12 +200,12 @@ struct ColsQueue {
 }
 
 impl ColsQueue {
-    fn new(num_cols: usize, max_score: usize) -> ColsQueue {
+    fn new(num_cols: usize) -> ColsQueue {
         ColsQueue {
-            score2head: vec![None; max_score + 1],
+            score2head: vec![None; num_cols],
             prev: vec![0; num_cols],
             next: vec![0; num_cols],
-            min_score: max_score + 1,
+            min_score: num_cols,
         }
     }
 
