@@ -27,7 +27,7 @@ pub struct Tableau {
     num_slack_vars: usize,
     num_artificial_vars: usize,
 
-    orig_obj: Vec<f64>,           // with negated coeffs
+    orig_obj: Vec<f64>,      // with negated coeffs
     orig_constraints: CsMat, // excluding bounds
     orig_constraints_csc: CsMat,
     orig_bounds: Vec<f64>,
@@ -380,7 +380,7 @@ impl Tableau {
             }
         }
 
-        if f64::abs(self.cur_obj_val) > 1e-8 {
+        if self.cur_obj_val > 1e-8 {
             return Err(Error::Infeasible);
         }
 
@@ -552,11 +552,7 @@ impl Tableau {
 
     // TODO: remove_constraint
 
-    fn add_le_constraint_impl(
-        mut self,
-        mut coeffs: CsVec,
-        orig_bound: f64,
-    ) -> Result<Self, Error> {
+    fn add_le_constraint_impl(mut self, mut coeffs: CsVec, orig_bound: f64) -> Result<Self, Error> {
         assert_eq!(self.num_artificial_vars, 0);
         // TODO: assert optimality.
 
@@ -689,10 +685,6 @@ impl Tableau {
             } else {
                 self.cur_bounds[r] -= pivot_bound * coeff;
             }
-
-            if f64::abs(self.cur_bounds[r]) < 1e-8 {
-                self.cur_bounds[r] = 0.0;
-            }
         }
 
         self.cur_obj_val -= self.cur_obj[c_entering] * pivot_bound;
@@ -703,10 +695,6 @@ impl Tableau {
                 self.cur_obj[c] = -pivot_obj;
             } else {
                 self.cur_obj[c] -= pivot_obj * coeff;
-            }
-
-            if f64::abs(self.cur_obj[c]) < 1e-8 {
-                self.cur_obj[c] = 0.0;
             }
         }
 
@@ -794,7 +782,6 @@ impl Tableau {
                 // Why is that?
                 self.cur_obj[c]
             };
-            // let val = self.cur_obj[c];
             if entering_val.is_none() || val > entering_val.unwrap() {
                 entering = Some(c);
                 entering_val = Some(val);
@@ -1335,6 +1322,16 @@ mod tests {
         assert_eq!(tab.cur_obj_val, -50.0);
 
         assert_eq!(tab.basic_vars, vec![0, 1, 4, 5]);
+
+        let infeasible = Tableau::new(
+            vec![1.0, 1.0],
+            vec![
+                Constraint::Ge(to_sparse(&[1.0, 1.0]), 10.0),
+                Constraint::Le(to_sparse(&[1.0, 1.0]), 5.0),
+            ],
+        )
+        .canonicalize();
+        assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
     }
 
     #[test]
