@@ -20,6 +20,9 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     let mut rows = vec![Row { cols: vec![] }; size];
     let mut cols = Vec::with_capacity(size);
 
+    let mut new2orig = Vec::with_capacity(cols.len());
+
+    let mut col_rows_len = Vec::with_capacity(cols.len());
     for c in 0..size {
         let col_rows = get_col(c);
         for &r in col_rows {
@@ -30,13 +33,69 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
             rows: col_rows.to_vec(),
             score: 0,
         });
+
+        col_rows_len.push(col_rows.len());
     }
 
-    assert_eq!(rows.len(), cols.len());
+    let mut is_ordered_col = vec![false; size];
+    let mut is_absorbed_row = vec![false; size];
+
+    // order columns of size 1
+    let mut stack = vec![];
+    for c in 0..size {
+        if col_rows_len[c] == 0 || col_rows_len[c] > 1 {
+            continue;
+        }
+
+        // all columns on the stack are of size 1
+        stack.clear();
+        stack.push(c);
+        while !stack.is_empty() {
+            let c = stack.pop().unwrap();
+            let r = *cols[c].rows.iter().find(|&&r| !is_absorbed_row[r]).unwrap();
+            for &other_c in &rows[r].cols {
+                col_rows_len[other_c] -= 1;
+                if col_rows_len[other_c] == 1 {
+                    stack.push(other_c);
+                }
+            }
+
+            rows[r].cols.clear();
+            is_absorbed_row[r] = true;
+
+            cols[c].rows.clear();
+            is_ordered_col[c] = true;
+            new2orig.push(c);
+        }
+    }
+
+    // compact columns
+    for c in 0..cols.len() {
+        let col = &mut cols[c];
+        let mut cur_i = 0;
+        for i in 0..col.rows.len() {
+            let r = col.rows[i];
+            if !is_absorbed_row[r] {
+                col.rows[cur_i] = r;
+                cur_i += 1;
+            }
+        }
+        assert_eq!(cur_i, col_rows_len[c]);
+        if !is_ordered_col[c] {
+            assert!(cur_i > 1);
+        }
+        col.rows.truncate(cur_i);
+    }
+
+    // calculate initial scores
 
     let mut cols_queue = ColsQueue::new(cols.len());
 
     for c in 0..cols.len() {
+        if is_ordered_col[c] {
+            continue;
+        }
+
         let col = &mut cols[c];
 
         let mut score = 0;
@@ -53,11 +112,6 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     //     "INIT COLS: {:?}\nROWS: {:?}\nSCORES: {:?}",
     //     cols, rows, col_scores
     // );
-
-    let mut new2orig = Vec::with_capacity(cols.len());
-
-    let mut is_ordered_col = vec![false; size];
-    let mut is_absorbed_row = vec![false; size];
 
     // cleared every iteration
     let mut pivot_row = vec![];
@@ -113,21 +167,27 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                 if row_set_diffs[r] == 0 {
                     // aggressive absorption
                     is_absorbed_row[r] = true;
-                    rows[r].cols.clear();
                 }
             }
         }
 
         // calculate row set differences with the pivot row
         {
-            let mut i = 0;
-            while i < pivot_row.len() {
-                let c = pivot_row[i];
+            let mut cur_pivot_i = 0;
+            for pivot_i in 0..pivot_row.len() {
+                let c = pivot_row[pivot_i];
                 cols_queue.remove(c, cols[c].score);
 
+                // calculate diff, compacting columns on the way
                 let mut diff = 0;
-                for &r in &cols[c].rows {
-                    diff += row_set_diffs[r];
+                let mut cur_i = 0;
+                for i in 0..cols[c].rows.len() {
+                    let r = cols[c].rows[i];
+                    if !is_absorbed_row[r] {
+                        cols[c].rows[cur_i] = r;
+                        cur_i += 1;
+                        diff += row_set_diffs[r];
+                    }
                 }
 
                 if diff == 0 {
@@ -135,13 +195,16 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                     // in any additional fill-in.
                     new2orig.push(c);
                     is_ordered_col[c] = true;
-                    pivot_row.swap_remove(i);
+                    cols[c].rows.clear();
                     // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
                 } else {
                     cols[c].score = diff; // NOTE: not the final score, will be updated later.
-                    i += 1;
+                    cols[c].rows.truncate(cur_i);
+                    pivot_row[cur_pivot_i] = c;
+                    cur_pivot_i += 1;
                 }
             }
+            pivot_row.truncate(cur_pivot_i);
         }
 
         // eprintln!("PIVOT ROW {:?}", pivot_row);
@@ -156,7 +219,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         // TODO: detect supercolumns
 
         // calculate final column scores
-        {
+        if !pivot_row.is_empty() {
             rows[pivot_r].cols = pivot_row.clone();
             is_absorbed_row[pivot_r] = false;
             for &c in &rows[pivot_r].cols {
