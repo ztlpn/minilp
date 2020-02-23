@@ -134,7 +134,7 @@ pub fn lu_factorize<'a>(
         (0..size).map(|c| get_col(c).0.len()).sum::<usize>()
     );
 
-    let col_perm = super::ordering::order_colamd(size, |c| get_col(c).0);
+    let col_perm = super::ordering::order_simple(size, |c| get_col(c).0);
 
     let mut orig_row2elt_count = vec![0; size];
     for col_rows in (0..size).map(|c| get_col(c).0) {

@@ -1,5 +1,25 @@
 use super::sparse::Perm;
 
+/// Simplest preordering: order columns based on their size
+pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
+    let mut cols_queue = ColsQueue::new(size);
+    for c in 0..size {
+        cols_queue.add(c, get_col(c).len() - 1);
+    }
+
+    let mut new2orig = Vec::with_capacity(size);
+    while new2orig.len() < size {
+        new2orig.push(cols_queue.pop_min().unwrap());
+    }
+
+    let mut orig2new = vec![0; size];
+    for (new, &orig) in new2orig.iter().enumerate() {
+        orig2new[orig] = new;
+    }
+
+    Perm { orig2new, new2orig }
+}
+
 pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
     // Implementation of (a part of) the COLAMD algorithm:
     //
@@ -346,7 +366,7 @@ mod tests {
                 .into_raw_storage()
                 .0
         });
-        assert_eq!(&perm.new2orig, &[1, 3, 0, 2]);
-        assert_eq!(&perm.orig2new, &[2, 0, 3, 1]);
+        assert_eq!(&perm.new2orig, &[1, 0, 2, 3]);
+        assert_eq!(&perm.orig2new, &[1, 0, 2, 3]);
     }
 }
