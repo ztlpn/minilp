@@ -152,7 +152,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         let mut pivot_r = None;
         for &r in &cols[pivot_c].rows {
             if !std::mem::replace(&mut is_absorbed_row[r], true) {
-                pivot_r = Some(r);  // choose any absorbed row index to represent pivot row.
+                pivot_r = Some(r); // choose any absorbed row index to represent pivot row.
                 for &c in &rows[r].cols {
                     if !is_ordered_col[c] && !std::mem::replace(&mut is_in_pivot_row[c], true) {
                         pivot_row.push(c);
@@ -335,6 +335,86 @@ impl ColsQueue {
     }
 }
 
+fn find_diag_matching(cols: &[Col], rows: &[Row]) -> Option<Vec<usize>> {
+    let n_cols = cols.len();
+    let n_rows = rows.len();
+
+    const SENTINEL: usize = 0usize.wrapping_sub(1);
+
+    let mut col2visited_on_iter = vec![SENTINEL; n_cols];
+    let mut row2matched_col = vec![SENTINEL; n_rows];
+    // for each col a pointer to the position in its adjacency lists where we last looked for neighbors.
+    let mut cheap = vec![0; n_cols];
+
+    struct Step {
+        col: usize,
+        cur_i: usize,
+    }
+
+    let mut dfs_stack = vec![];
+    for start_c in 0..cols.len() {
+        let mut found = false; // whether the dfs iteration found the match
+
+        dfs_stack.clear();
+        dfs_stack.push(Step {
+            col: start_c,
+            cur_i: 0,
+        });
+
+        'dfs_loop: while !dfs_stack.is_empty() {
+            let mut cur_step = dfs_stack.last_mut().unwrap();
+            let c = cur_step.col;
+            let col_rows = &cols[c].rows;
+
+            if col2visited_on_iter[c] != start_c {
+                col2visited_on_iter[c] = start_c;
+
+                let cur_cheap = &mut cheap[c];
+                while *cur_cheap < col_rows.len() {
+                    let r = col_rows[*cur_cheap];
+                    if row2matched_col[r] == SENTINEL {
+                        row2matched_col[r] = c;
+                        found = true;
+                        dfs_stack.pop();
+                        continue 'dfs_loop;
+                    }
+                    *cur_cheap += 1;
+                }
+            } else {
+                if found {
+                    let r = col_rows[cur_step.cur_i];
+                    row2matched_col[r] = c;
+                    dfs_stack.pop();
+                    continue 'dfs_loop;
+                }
+
+                cur_step.cur_i += 1;
+            }
+
+            while cur_step.cur_i < col_rows.len() {
+                let r = col_rows[cur_step.cur_i];
+                if col2visited_on_iter[row2matched_col[r]] != start_c {
+                    break;
+                }
+                cur_step.cur_i += 1;
+            }
+
+            if cur_step.cur_i == col_rows.len() {
+                dfs_stack.pop();
+            } else {
+                let col = row2matched_col[col_rows[cur_step.cur_i]];
+                dfs_stack.push(Step { col, cur_i: 0 });
+            }
+        }
+
+        if !found {
+            return None;
+        }
+    }
+
+    Some(row2matched_col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +448,43 @@ mod tests {
         });
         assert_eq!(&perm.new2orig, &[1, 0, 2, 3]);
         assert_eq!(&perm.orig2new, &[1, 0, 2, 3]);
+    }
+
+    #[test]
+    fn test_find_diag_matching() {
+        let size = 3;
+        let triplets = [
+            (0, 0, 1.0),
+            (0, 1, 1.0),
+            (0, 2, 1.0),
+
+            (1, 0, 1.0),
+            (1, 2, 1.0),
+
+            (2, 0, 1.0),
+        ];
+        let mut mat = TriMat::<f64>::with_capacity((size, size), triplets.len());
+        for (r, c, val) in &triplets {
+            mat.add_triplet(*r, *c, *val);
+        }
+        let mat = mat.to_csc();
+
+        let mut rows = vec![Row { cols: vec![] }; size];
+        let mut cols = Vec::with_capacity(size);
+        for c in 0..size {
+            let col = mat.outer_view(c).unwrap();
+            let col_rows = col.indices();
+            for &r in col_rows {
+                rows[r].cols.push(c);
+            }
+
+            cols.push(Col {
+                rows: col_rows.to_vec(),
+                score: 0,
+            });
+        }
+
+        let matching = find_diag_matching(&cols, &rows);
+        assert_eq!(matching, Some(vec![1, 2, 0]));
     }
 }
