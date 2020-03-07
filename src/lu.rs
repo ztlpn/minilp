@@ -121,6 +121,119 @@ pub fn lu_factorize<'a>(
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
 ) -> LUFactors {
+    debug!(
+        "lu_factorize: starting, matrix nnz: {}",
+        (0..size).map(|c| get_col(c).0.len()).sum::<usize>()
+    );
+
+    let colamd_perm = super::ordering::order_colamd(size, |c| get_col(c).0);
+    let ret_colamd = lu_factorize_impl(size, &get_col, stability_coeff, scratch, colamd_perm.clone());
+
+    let simple_perm = super::ordering::order_simple(size, |c| get_col(c).0);
+    let ret_simple = lu_factorize_impl(size, &get_col, stability_coeff, scratch, simple_perm.clone());
+
+    if ret_colamd.nnz() > 1_000_000 {
+        let draw = |size: u32, data: &[u8], name: &str| {
+            let path = std::path::Path::new(name);
+            let file = std::fs::File::create(path).unwrap();
+            let ref mut w = std::io::BufWriter::new(file);
+
+            let mut encoder = png::Encoder::new(w, size, size);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&data).unwrap();
+        };
+
+        let mut is_singleton_row = vec![false; size];
+        let mut nonsingletons = vec![];
+        for c in 0..size {
+            let col_rows = get_col(c).0;
+            if col_rows.len() == 1 {
+                is_singleton_row[col_rows[0]] = true;
+            } else {
+                nonsingletons.push(c);
+            }
+        }
+
+        let mut ns_row = 0;
+        let mut row2ns_row = vec![0; size];
+        for r in 0..size {
+            if !is_singleton_row[r] {
+                row2ns_row[r] = ns_row;
+                ns_row += 1;
+            }
+        }
+
+        let ns_size = nonsingletons.len();
+
+        {
+            let mut orig_data = vec![0; ns_size * ns_size];
+            for c in 0..ns_size {
+                for &r in get_col(nonsingletons[c]).0 {
+                    if !is_singleton_row[r] {
+                        orig_data[row2ns_row[r] * ns_size + c] = 255;
+                    }
+                }
+            }
+            draw(ns_size as u32, &orig_data, "orig.png");
+        }
+
+        let draw_reordered = |orig2new_col: &[usize], name: &str| {
+            let mut ordered_ns = nonsingletons.clone();
+            ordered_ns.sort_by_key(|&c| orig2new_col[c]);
+            let mut reordered_data = vec![0; ns_size * ns_size];
+            for c in 0..ns_size {
+                for &r in get_col(ordered_ns[c]).0 {
+                    if !is_singleton_row[r] {
+                        reordered_data[row2ns_row[r] * ns_size + c] = 255;
+                    }
+                }
+            }
+            draw(ns_size as u32, &reordered_data, name);
+        };
+
+        draw_reordered(&colamd_perm.orig2new, "ordered_colamd.png");
+        draw_reordered(&simple_perm.orig2new, "ordered_simple.png");
+
+        let draw_lu = |lu: &LUFactors, name: &str| {
+            let new2orig_row = &lu.row_perm.as_ref().unwrap().new2orig;
+            let orig2new_col = &lu.col_perm.as_ref().unwrap().orig2new;
+
+            let mut ordered_ns = nonsingletons.clone();
+            ordered_ns.sort_by_key(|&c| orig2new_col[c]);
+            let mut reordered_data = vec![0; ns_size * ns_size];
+            for c in 0..ns_size {
+                let orig_c = orig2new_col[ordered_ns[c]];
+                for mat in &[&lu.lower, &lu.upper] {
+                    for &new_r in mat.nondiag.col_rows(orig_c) {
+                        let orig_r = new2orig_row[new_r];
+                        if !is_singleton_row[orig_r] {
+                            reordered_data[row2ns_row[orig_r] * ns_size + c] = 255;
+                        }
+                    }
+                }
+            }
+            draw(ns_size as u32, &reordered_data, name);
+        };
+
+        draw_lu(&ret_colamd, "lu_colamd.png");
+        draw_lu(&ret_simple, "lu_simple.png");
+
+        panic!();
+    }
+
+    debug!("lu_factorize: done, nnz: {}", ret_simple.nnz());
+    ret_simple
+}
+
+fn lu_factorize_impl<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
+    stability_coeff: f64,
+    scratch: &mut ScratchSpace,
+    col_perm: Perm,
+) -> LUFactors {
     // Implementation of the Gilbert-Peierls algorithm:
     //
     // Gilbert, John R., and Tim Peierls. "Sparse partial pivoting in time
@@ -128,13 +241,6 @@ pub fn lu_factorize<'a>(
     // Statistical Computing 9.5 (1988): 862-874.
     //
     // https://ecommons.cornell.edu/bitstream/handle/1813/6623/86-783.pdf
-
-    trace!(
-        "lu_factorize: starting, matrix nnz: {}",
-        (0..size).map(|c| get_col(c).0.len()).sum::<usize>()
-    );
-
-    let col_perm = super::ordering::order_simple(size, |c| get_col(c).0);
 
     let mut orig_row2elt_count = vec![0; size];
     for col_rows in (0..size).map(|c| get_col(c).0) {
@@ -264,12 +370,6 @@ pub fn lu_factorize<'a>(
             *r = orig2new_row[*r];
         }
     }
-
-    trace!(
-        "lu_factorize: done, lower nnz: {}, upper nnz: {}",
-        lower.nnz(),
-        upper.nnz()
-    );
 
     LUFactors {
         lower: TriangleMat {
