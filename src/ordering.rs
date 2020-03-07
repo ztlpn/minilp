@@ -216,7 +216,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                     new2orig.push(c);
                     is_ordered_col[c] = true;
                     cols[c].rows.clear();
-                    // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
+                // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
                 } else {
                     cols[c].score = diff; // NOTE: not the final score, will be updated later.
                     cols[c].rows.truncate(cur_i);
@@ -335,12 +335,12 @@ impl ColsQueue {
     }
 }
 
-fn find_diag_matching<'a>(
+const SENTINEL: usize = 0usize.wrapping_sub(1);
+
+pub fn find_diag_matching<'a>(
     size: usize,
     get_col: impl Fn(usize) -> &'a [usize],
 ) -> Option<Vec<usize>> {
-    const SENTINEL: usize = 0usize.wrapping_sub(1);
-
     let mut col2visited_on_iter = vec![SENTINEL; size];
     let mut row2matched_col = vec![SENTINEL; size];
     // for each col a pointer to the position in its adjacency lists where we last looked for neighbors.
@@ -415,30 +415,158 @@ fn find_diag_matching<'a>(
     Some(row2matched_col)
 }
 
+/// Lower block triangular form of a matrix.
+#[derive(Clone, Debug)]
+pub struct BlockDiagForm {
+    /// Row permutation: for each original row its new row number so that diag is nonzero.
+    pub row2col: Vec<usize>,
+    /// For each block its set of columns (the order of blocks is lower block triangular)
+    pub block_cols: Vec<Vec<usize>>,
+}
+
+pub fn find_block_diag_form<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> &'a [usize],
+) -> BlockDiagForm {
+    let row2col = find_diag_matching(size, &get_col).unwrap();
+
+    struct Step {
+        col: usize,
+        cur_i: usize,
+    }
+
+    let mut dfs_stack = vec![];
+    let mut visited = vec![];
+    let mut is_visited = vec![false; size];
+    for start_c in 0..size {
+        if is_visited[start_c] {
+            continue;
+        }
+
+        dfs_stack.clear();
+        dfs_stack.push(Step {
+            col: start_c,
+            cur_i: 0,
+        });
+        while !dfs_stack.is_empty() {
+            let cur_step = dfs_stack.last_mut().unwrap();
+            let c = cur_step.col;
+            if !is_visited[c] {
+                is_visited[c] = true;
+            } else {
+                cur_step.cur_i += 1;
+            }
+
+            let col_rows = get_col(c);
+            while cur_step.cur_i < col_rows.len() {
+                let next_c = row2col[col_rows[cur_step.cur_i]];
+                if !is_visited[next_c] {
+                    break;
+                }
+                cur_step.cur_i += 1;
+            }
+
+            if cur_step.cur_i < col_rows.len() {
+                let col = row2col[col_rows[cur_step.cur_i]];
+                dfs_stack.push(Step { col, cur_i: 0 });
+            } else {
+                visited.push(c);
+                dfs_stack.pop();
+            }
+        }
+    }
+
+    // Prepare transposed graph
+    // TODO: more efficient transpose without allocating each row.
+    let mut rows = vec![vec![]; size];
+    for c in 0..size {
+        for &r in get_col(c) {
+            rows[row2col[r]].push(c);
+        }
+    }
+
+    is_visited.clear();
+    is_visited.resize(size, false);
+
+    let mut block_cols = vec![];
+
+    // DFS on the transposed graph
+    for &start_c in visited.iter().rev() {
+        if is_visited[start_c] {
+            continue;
+        }
+
+        block_cols.push(vec![]);
+
+        dfs_stack.clear();
+        dfs_stack.push(Step {
+            col: start_c,
+            cur_i: 0,
+        });
+        while !dfs_stack.is_empty() {
+            let cur_step = dfs_stack.last_mut().unwrap();
+            let c = cur_step.col;
+            if !is_visited[c] {
+                is_visited[c] = true;
+                block_cols.last_mut().unwrap().push(c);
+            } else {
+                cur_step.cur_i += 1;
+            }
+
+            let next = &rows[c];
+            while cur_step.cur_i < next.len() {
+                if !is_visited[next[cur_step.cur_i]] {
+                    break;
+                }
+                cur_step.cur_i += 1;
+            }
+
+            if cur_step.cur_i < next.len() {
+                let col = next[cur_step.cur_i];
+                dfs_stack.push(Step { col, cur_i: 0 });
+            } else {
+                dfs_stack.pop();
+            }
+        }
+    }
+
+    BlockDiagForm {
+        row2col,
+        block_cols,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sprs::TriMat;
+    use sprs::{CsMat, TriMat};
+
+    fn mat_from_triplets(rows: usize, cols: usize, triplets: &[(usize, usize)]) -> CsMat<f64> {
+        let mut mat = TriMat::with_capacity((rows, cols), triplets.len());
+        for (r, c) in triplets {
+            mat.add_triplet(*r, *c, 1.0);
+        }
+        mat.to_csc()
+    }
 
     #[test]
-    fn simple() {
-        let triplets = [
-            (0, 0, 1.0),
-            (0, 2, 1.0),
-            (1, 0, 1.0),
-            (1, 2, 1.0),
-            (1, 4, 1.0),
-            (2, 0, 1.0),
-            (2, 1, 1.0),
-            (2, 4, 1.0),
-            (3, 0, 1.0),
-            (3, 4, 1.0),
-        ];
-        let mut mat = TriMat::with_capacity((4, 5), triplets.len());
-        for (r, c, val) in &triplets {
-            mat.add_triplet(*r, *c, *val);
-        }
-        let mat = mat.to_csc();
+    fn colamd() {
+        let mat = mat_from_triplets(
+            4,
+            5,
+            &[
+                (0, 0),
+                (0, 2),
+                (1, 0),
+                (1, 2),
+                (1, 4),
+                (2, 0),
+                (2, 1),
+                (2, 4),
+                (3, 0),
+                (3, 4),
+            ],
+        );
 
         let perm = order_colamd(4, |c| {
             mat.outer_view([0, 1, 2, 4][c])
@@ -451,24 +579,31 @@ mod tests {
     }
 
     #[test]
-    fn test_find_diag_matching() {
+    fn diag_matching() {
         let size = 3;
-        let triplets = [
-            (0, 0, 1.0),
-            (0, 1, 1.0),
-            (0, 2, 1.0),
-            (1, 0, 1.0),
-            (1, 2, 1.0),
-            (2, 0, 1.0),
-        ];
-        let mut mat = TriMat::<f64>::with_capacity((size, size), triplets.len());
-        for (r, c, val) in &triplets {
-            mat.add_triplet(*r, *c, *val);
-        }
-        let mat = mat.to_csc();
+        let mat = mat_from_triplets(
+            size,
+            size,
+            &[(0, 0), (0, 1), (0, 2), (1, 0), (1, 2), (2, 0)],
+        );
 
         let matching =
             find_diag_matching(size, |c| mat.outer_view(c).unwrap().into_raw_storage().0);
         assert_eq!(matching, Some(vec![1, 2, 0]));
+    }
+
+    #[test]
+    fn block_diag_form() {
+        let size = 3;
+        let mat = mat_from_triplets(
+            size,
+            size,
+            &[(1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (0, 2)],
+        );
+
+        let bd_form =
+            find_block_diag_form(size, |c| mat.outer_view(c).unwrap().into_raw_storage().0);
+        assert_eq!(bd_form.row2col, &[2, 0, 1]);
+        assert_eq!(bd_form.block_cols, vec![vec![0, 1], vec![2]]);
     }
 }
