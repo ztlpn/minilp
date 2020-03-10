@@ -202,19 +202,23 @@ pub fn lu_factorize<'a>(
 
             let mut ordered_ns = nonsingletons.clone();
             ordered_ns.sort_by_key(|&c| orig2new_col[c]);
-            let mut reordered_data = vec![0; ns_size * ns_size];
+            let mut data = vec![0; ns_size * ns_size];
             for c in 0..ns_size {
                 let orig_c = orig2new_col[ordered_ns[c]];
+
+                // draw diagonal
+                data[row2ns_row[new2orig_row[orig_c]] * ns_size + c] = 255;
+
                 for mat in &[&lu.lower, &lu.upper] {
                     for &new_r in mat.nondiag.col_rows(orig_c) {
                         let orig_r = new2orig_row[new_r];
                         if !is_singleton_row[orig_r] {
-                            reordered_data[row2ns_row[orig_r] * ns_size + c] = 255;
+                            data[row2ns_row[orig_r] * ns_size + c] = 255;
                         }
                     }
                 }
             }
-            draw(ns_size as u32, &reordered_data, name);
+            draw(ns_size as u32, &data, name);
         };
 
         draw_lu(&ret_colamd, "lu_colamd.png");
