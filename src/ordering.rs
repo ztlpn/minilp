@@ -263,6 +263,51 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     Perm { orig2new, new2orig }
 }
 
+pub fn order_colamd_ffi<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
+    let nnz = (0..size).map(|c| get_col(c).len()).sum::<usize>();
+    let rec_len = unsafe { colamd_rs::colamd_recommended(nnz as i32, size as i32, size as i32) };
+
+    let mut mat = vec![0i32; rec_len as usize];
+    let mut mat_p = Vec::with_capacity(size + 1);
+    mat_p.push(0i32);
+    for c in 0..size {
+        let col_rows = get_col(c);
+        let begin = *mat_p.last().unwrap() as usize;
+        let end = begin + col_rows.len();
+        mat_p.push(end as i32);
+        for i in 0..col_rows.len() {
+            mat[begin + i] = col_rows[i] as i32;
+        }
+    }
+
+    let mut stats = vec![0; colamd_rs::COLAMD_STATS as usize];
+
+    let res = unsafe {
+        colamd_rs::colamd(
+            size as i32,
+            size as i32,
+            rec_len as i32,
+            mat.as_mut_ptr(),
+            mat_p.as_mut_ptr(),
+            std::mem::zeroed(),
+            stats.as_mut_ptr(),
+        )
+    };
+    assert_eq!(res, 1);
+
+    let mut new2orig = vec![0; size];
+    for i in 0..size {
+        new2orig[i] = mat_p[i] as usize;
+    }
+
+    let mut orig2new = vec![0; size];
+    for (new, &orig) in new2orig.iter().enumerate() {
+        orig2new[orig] = new;
+    }
+
+    Perm { orig2new, new2orig }
+}
+
 #[derive(Clone, Debug)]
 struct Row {
     cols: Vec<usize>,
@@ -576,6 +621,14 @@ mod tests {
         });
         assert_eq!(&perm.new2orig, &[1, 0, 2, 3]);
         assert_eq!(&perm.orig2new, &[1, 0, 2, 3]);
+
+        let perm = order_colamd_ffi(4, |c| {
+            mat.outer_view([0, 1, 2, 4][c])
+                .unwrap()
+                .into_raw_storage()
+                .0
+        });
+        eprintln!("PERM {:?}", perm);
     }
 
     #[test]

@@ -132,6 +132,11 @@ pub fn lu_factorize<'a>(
     let simple_perm = super::ordering::order_simple(size, |c| get_col(c).0);
     let ret_simple = lu_factorize_impl(size, &get_col, stability_coeff, scratch, simple_perm.clone());
 
+    let ffi_perm = super::ordering::order_colamd_ffi(size, |c| get_col(c).0);
+    let ret_ffi = lu_factorize_impl(size, &get_col, stability_coeff, scratch, ffi_perm.clone());
+
+    debug!("lu_factorize: done, nnz simple: {}, colamd: {}, ffi: {}", ret_simple.nnz(), ret_colamd.nnz(), ret_ffi.nnz());
+
     if ret_colamd.nnz() > 1_000_000 {
         let draw = |size: u32, data: &[u8], name: &str| {
             let path = std::path::Path::new(name);
@@ -195,6 +200,7 @@ pub fn lu_factorize<'a>(
 
         draw_reordered(&colamd_perm.orig2new, "ordered_colamd.png");
         draw_reordered(&simple_perm.orig2new, "ordered_simple.png");
+        draw_reordered(&ffi_perm.orig2new, "ordered_ffi.png");
 
         let draw_lu = |lu: &LUFactors, name: &str| {
             let new2orig_row = &lu.row_perm.as_ref().unwrap().new2orig;
@@ -223,11 +229,11 @@ pub fn lu_factorize<'a>(
 
         draw_lu(&ret_colamd, "lu_colamd.png");
         draw_lu(&ret_simple, "lu_simple.png");
+        draw_lu(&ret_ffi, "lu_ffi.png");
 
         panic!();
     }
 
-    debug!("lu_factorize: done, nnz: {}", ret_simple.nnz());
     ret_simple
 }
 

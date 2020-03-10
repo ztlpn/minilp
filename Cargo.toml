@@ -11,6 +11,7 @@ sprs = "0.7.1"
 ndarray = "0.13.0"
 log = "0.4.8"
 png = "0.16.1"
+colamd-rs = { path = "../src/colamd-rs" }
 
 [dev-dependencies]
 rand = "0.7"
