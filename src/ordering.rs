@@ -264,40 +264,73 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 }
 
 pub fn order_colamd_ffi<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
-    let nnz = (0..size).map(|c| get_col(c).len()).sum::<usize>();
-    let rec_len = unsafe { colamd_rs::colamd_recommended(nnz as i32, size as i32, size as i32) };
+    let mut new2orig = Vec::with_capacity(size);
 
-    let mut mat = vec![0i32; rec_len as usize];
-    let mut mat_p = Vec::with_capacity(size + 1);
-    mat_p.push(0i32);
+    let mut is_singleton_row = vec![false; size];
+    let mut nonsingleton_cols = vec![];
     for c in 0..size {
         let col_rows = get_col(c);
-        let begin = *mat_p.last().unwrap() as usize;
-        let end = begin + col_rows.len();
-        mat_p.push(end as i32);
-        for i in 0..col_rows.len() {
-            mat[begin + i] = col_rows[i] as i32;
+        if col_rows.len() == 1 {
+            is_singleton_row[col_rows[0]] = true;
+            new2orig.push(c);
+        } else {
+            nonsingleton_cols.push(c);
         }
     }
 
-    let mut stats = vec![0; colamd_rs::COLAMD_STATS as usize];
+    let mut ns_row = 0;
+    let mut row2ns_row = vec![0; size];
+    for r in 0..size {
+        if !is_singleton_row[r] {
+            row2ns_row[r] = ns_row;
+            ns_row += 1;
+        }
+    }
 
-    let res = unsafe {
-        colamd_rs::colamd(
-            size as i32,
-            size as i32,
-            rec_len as i32,
-            mat.as_mut_ptr(),
-            mat_p.as_mut_ptr(),
-            std::mem::zeroed(),
-            stats.as_mut_ptr(),
-        )
-    };
-    assert_eq!(res, 1);
+    let ns_size = nonsingleton_cols.len();
 
-    let mut new2orig = vec![0; size];
-    for i in 0..size {
-        new2orig[i] = mat_p[i] as usize;
+    if ns_size > 0 {
+        let nnz = nonsingleton_cols
+            .iter()
+            .map(|&c| get_col(c).len())
+            .sum::<usize>();
+        let rec_len =
+            unsafe { colamd_rs::colamd_recommended(nnz as i32, ns_size as i32, ns_size as i32) };
+
+        let mut mat = vec![0i32; rec_len as usize];
+        let mut mat_p = Vec::with_capacity(ns_size + 1);
+        mat_p.push(0i32);
+        for &c in &nonsingleton_cols {
+            let col_rows = get_col(c);
+            let begin = *mat_p.last().unwrap() as usize;
+            let mut end = begin;
+            for &r in col_rows {
+                if !is_singleton_row[r] {
+                    mat[end] = row2ns_row[r] as i32;
+                    end += 1;
+                }
+            }
+            mat_p.push(end as i32);
+        }
+
+        let mut stats = vec![0; colamd_rs::COLAMD_STATS as usize];
+
+        let res = unsafe {
+            colamd_rs::colamd(
+                ns_size as i32,
+                ns_size as i32,
+                rec_len as i32,
+                mat.as_mut_ptr(),
+                mat_p.as_mut_ptr(),
+                std::mem::zeroed(),
+                stats.as_mut_ptr(),
+            )
+        };
+        assert_eq!(res, 1);
+
+        for &c in &mat_p[0..ns_size] {
+            new2orig.push(nonsingleton_cols[c as usize]);
+        }
     }
 
     let mut orig2new = vec![0; size];
