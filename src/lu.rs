@@ -121,23 +121,39 @@ pub fn lu_factorize<'a>(
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
 ) -> LUFactors {
-    debug!(
-        "lu_factorize: starting, matrix nnz: {}",
-        (0..size).map(|c| get_col(c).0.len()).sum::<usize>()
-    );
+    let mat_nnz = (0..size).map(|c| get_col(c).0.len()).sum::<usize>();
+    debug!("lu_factorize: starting, matrix nnz: {}, fill-in: {}", mat_nnz, mat_nnz - size);
+
+    let orig_perm = Perm {
+        orig2new: (0..size).collect(),
+        new2orig: (0..size).collect(),
+    };
+    let ret_orig = lu_factorize_impl(size, &get_col, stability_coeff, scratch, orig_perm.clone());
 
     let colamd_perm = super::ordering::order_colamd(size, |c| get_col(c).0);
     let ret_colamd = lu_factorize_impl(size, &get_col, stability_coeff, scratch, colamd_perm.clone());
 
     let simple_perm = super::ordering::order_simple(size, |c| get_col(c).0);
-    let ret_simple = lu_factorize_impl(size, &get_col, stability_coeff, scratch, simple_perm.clone());
+    let ret_simple = lu_factorize_impl(
+        size,
+        &get_col,
+        stability_coeff,
+        scratch,
+        simple_perm.clone(),
+    );
 
     let ffi_perm = super::ordering::order_colamd_ffi(size, |c| get_col(c).0);
     let ret_ffi = lu_factorize_impl(size, &get_col, stability_coeff, scratch, ffi_perm.clone());
 
-    debug!("lu_factorize: done, nnz simple: {}, colamd: {}, ffi: {}", ret_simple.nnz(), ret_colamd.nnz(), ret_ffi.nnz());
+    debug!(
+        "lu_factorize: done, fill-in orig: {}, simple: {}, fill-in colamd: {} fill-in ffi: {}",
+        ret_orig.nnz() - mat_nnz - size,
+        ret_simple.nnz() - mat_nnz - size,
+        ret_colamd.nnz() - mat_nnz - size,
+        ret_ffi.nnz() - mat_nnz - size,
+    );
 
-    if ret_colamd.nnz() > 1_000_000 {
+    if ret_ffi.nnz() as i64 - ret_simple.nnz() as i64 > 20_000 {
         let draw = |size: u32, data: &[u8], name: &str| {
             let path = std::path::Path::new(name);
             let file = std::fs::File::create(path).unwrap();
@@ -227,6 +243,7 @@ pub fn lu_factorize<'a>(
             draw(ns_size as u32, &data, name);
         };
 
+        draw_lu(&ret_orig, "lu_orig.png");
         draw_lu(&ret_colamd, "lu_colamd.png");
         draw_lu(&ret_simple, "lu_simple.png");
         draw_lu(&ret_ffi, "lu_ffi.png");

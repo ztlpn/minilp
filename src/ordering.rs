@@ -313,6 +313,12 @@ pub fn order_colamd_ffi<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize])
             mat_p.push(end as i32);
         }
 
+        let mut knobs = vec![0.0; colamd_rs::COLAMD_KNOBS as usize];
+        unsafe {
+            colamd_rs::colamd_set_defaults(knobs.as_mut_ptr());
+        }
+        knobs[0] = 1.0;
+        knobs[1] = 1.0;
         let mut stats = vec![0; colamd_rs::COLAMD_STATS as usize];
 
         let res = unsafe {
@@ -322,11 +328,15 @@ pub fn order_colamd_ffi<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize])
                 rec_len as i32,
                 mat.as_mut_ptr(),
                 mat_p.as_mut_ptr(),
-                std::mem::zeroed(),
+                knobs.as_mut_ptr(),
                 stats.as_mut_ptr(),
             )
         };
         assert_eq!(res, 1);
+
+        unsafe {
+            colamd_rs::colamd_report(stats.as_mut_ptr());
+        }
 
         for &c in &mat_p[0..ns_size] {
             new2orig.push(nonsingleton_cols[c as usize]);
