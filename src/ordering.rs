@@ -661,7 +661,7 @@ mod tests {
                 .into_raw_storage()
                 .0
         });
-        eprintln!("PERM {:?}", perm);
+        assert_eq!(&perm.new2orig, &[1, 0, 2, 3]);
     }
 
     #[test]
