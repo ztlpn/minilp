@@ -32,15 +32,14 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
     // TODO:
     // * allocate all storage at once
-    // * remove dense rows
-    // * immediately order dense columns
     // * deal with empty columns/rows
     // * supercolumns
 
     let mut rows = vec![Row { cols: vec![] }; size];
     let mut cols = Vec::with_capacity(size);
 
-    let mut new2orig = Vec::with_capacity(cols.len());
+    let mut new2orig = vec![0; size];
+    let mut cur_ordered_col = 0;
 
     let mut col_rows_len = Vec::with_capacity(cols.len());
     for c in 0..size {
@@ -85,11 +84,27 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
             cols[c].rows.clear();
             is_ordered_col[c] = true;
-            new2orig.push(c);
+            new2orig[cur_ordered_col] = c;
+            cur_ordered_col += 1;
         }
     }
 
-    // compact columns
+    let ns_size = size - cur_ordered_col; // number of non-singleton columns.
+
+    // Dense rows make COLAMD bounds on fill-in useless so we exclude them from consideration
+    // and hope that they won't be chosen during pivoting.
+    let dense_row_thresh = std::cmp::max(16, ns_size / 10);
+    for (r, row) in rows.iter_mut().enumerate() {
+        if row.cols.len() >= dense_row_thresh {
+            row.cols.clear();
+            is_absorbed_row[r] = true;
+        }
+    }
+
+    let mut cols_queue = ColsQueue::new(cols.len());
+
+    // compact columns and detect dense ones.
+    let dense_col_thresh = std::cmp::max(16, (ns_size as f64).sqrt() as usize);
     for c in 0..cols.len() {
         let col = &mut cols[c];
         let mut cur_i = 0;
@@ -100,17 +115,25 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                 cur_i += 1;
             }
         }
-        assert_eq!(cur_i, col_rows_len[c]);
-        if !is_ordered_col[c] {
-            assert!(cur_i > 1);
-        }
+
         col.rows.truncate(cur_i);
+
+        if cur_i >= dense_col_thresh {
+            cols_queue.add(c, cur_i); // order dense columns by their size.
+        }
     }
 
-    // calculate initial scores
+    // order dense columns at the end.
+    let num_dense_cols = cols_queue.len();
+    for i in 0..num_dense_cols {
+        let dense_c = cols_queue.pop_min().unwrap();
+        new2orig[size - num_dense_cols + i] = dense_c;
+        is_ordered_col[dense_c] = true;
+    }
+    assert_eq!(cols_queue.len(), 0);
 
-    let mut cols_queue = ColsQueue::new(cols.len());
-
+    // calculate initial scores for sparse columns.
+    // Use the same cols_queue (which was emptied on the previous step).
     for c in 0..cols.len() {
         if is_ordered_col[c] {
             continue;
@@ -141,10 +164,11 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     let mut rows_with_diffs = vec![];
     let mut is_in_diffs = vec![false; size];
 
-    while new2orig.len() < cols.len() {
+    while cols_queue.len() > 0 {
         let pivot_c = cols_queue.pop_min().unwrap();
 
-        new2orig.push(pivot_c);
+        new2orig[cur_ordered_col] = pivot_c;
+        cur_ordered_col += 1;
         is_ordered_col[pivot_c] = true;
         // eprintln!("ORDERED {}", new2orig.last().unwrap());
 
@@ -213,7 +237,8 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                 if diff == 0 {
                     // mass elimination: we can order column c now as it will not result
                     // in any additional fill-in.
-                    new2orig.push(c);
+                    new2orig[cur_ordered_col] = c;
+                    cur_ordered_col += 1;
                     is_ordered_col[c] = true;
                     cols[c].rows.clear();
                 // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
@@ -280,6 +305,7 @@ struct ColsQueue {
     prev: Vec<usize>,
     next: Vec<usize>,
     min_score: usize,
+    len: usize,
 }
 
 impl ColsQueue {
@@ -289,7 +315,12 @@ impl ColsQueue {
             prev: vec![0; num_cols],
             next: vec![0; num_cols],
             min_score: num_cols,
+            len: 0,
         }
+    }
+
+    fn len(&self) -> usize {
+        self.len
     }
 
     fn pop_min(&mut self) -> Option<usize> {
@@ -309,6 +340,7 @@ impl ColsQueue {
 
     fn add(&mut self, col: usize, score: usize) {
         self.min_score = std::cmp::min(self.min_score, score);
+        self.len += 1;
 
         if let Some(head) = self.score2head[score] {
             self.prev[col] = self.prev[head];
@@ -323,6 +355,7 @@ impl ColsQueue {
     }
 
     fn remove(&mut self, col: usize, score: usize) {
+        self.len -= 1;
         if self.next[col] == col {
             self.score2head[score] = None;
         } else {
