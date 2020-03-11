@@ -124,12 +124,6 @@ pub fn lu_factorize<'a>(
     let mat_nnz = (0..size).map(|c| get_col(c).0.len()).sum::<usize>();
     debug!("lu_factorize: starting, matrix nnz: {}, fill-in: {}", mat_nnz, mat_nnz - size);
 
-    let orig_perm = Perm {
-        orig2new: (0..size).collect(),
-        new2orig: (0..size).collect(),
-    };
-    let ret_orig = lu_factorize_impl(size, &get_col, stability_coeff, scratch, orig_perm.clone());
-
     let colamd_perm = super::ordering::order_colamd(size, |c| get_col(c).0);
     let ret_colamd = lu_factorize_impl(size, &get_col, stability_coeff, scratch, colamd_perm.clone());
 
@@ -142,18 +136,14 @@ pub fn lu_factorize<'a>(
         simple_perm.clone(),
     );
 
-    let ffi_perm = super::ordering::order_colamd_ffi(size, |c| get_col(c).0);
-    let ret_ffi = lu_factorize_impl(size, &get_col, stability_coeff, scratch, ffi_perm.clone());
-
+    let fillin_simple = (ret_simple.nnz() - mat_nnz - size) as i64;
+    let fillin_colamd = (ret_colamd.nnz() - mat_nnz - size) as i64;
     debug!(
-        "lu_factorize: done, fill-in orig: {}, simple: {}, fill-in colamd: {} fill-in ffi: {}",
-        ret_orig.nnz() - mat_nnz - size,
-        ret_simple.nnz() - mat_nnz - size,
-        ret_colamd.nnz() - mat_nnz - size,
-        ret_ffi.nnz() - mat_nnz - size,
+        "lu_factorize: done, fill-in simple: {}, fill-in colamd: {}, diff: {}",
+        fillin_simple, fillin_colamd, fillin_simple - fillin_colamd
     );
 
-    if ret_ffi.nnz() as i64 - ret_simple.nnz() as i64 > 20_000 {
+    if fillin_colamd - fillin_simple > 20_000 {
         let draw = |size: u32, data: &[u8], name: &str| {
             let path = std::path::Path::new(name);
             let file = std::fs::File::create(path).unwrap();
@@ -216,7 +206,6 @@ pub fn lu_factorize<'a>(
 
         draw_reordered(&colamd_perm.orig2new, "ordered_colamd.png");
         draw_reordered(&simple_perm.orig2new, "ordered_simple.png");
-        draw_reordered(&ffi_perm.orig2new, "ordered_ffi.png");
 
         let draw_lu = |lu: &LUFactors, name: &str| {
             let new2orig_row = &lu.row_perm.as_ref().unwrap().new2orig;
@@ -243,10 +232,8 @@ pub fn lu_factorize<'a>(
             draw(ns_size as u32, &data, name);
         };
 
-        draw_lu(&ret_orig, "lu_orig.png");
         draw_lu(&ret_colamd, "lu_colamd.png");
         draw_lu(&ret_simple, "lu_simple.png");
-        draw_lu(&ret_ffi, "lu_ffi.png");
 
         panic!();
     }
