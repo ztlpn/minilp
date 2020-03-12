@@ -36,90 +36,123 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     // * supercolumns
 
     let mut rows = vec![Row { cols: vec![] }; size];
-    let mut cols = Vec::with_capacity(size);
+    let mut cols = vec![
+        Col {
+            rows: vec![],
+            score: 0
+        };
+        size
+    ];
 
     let mut new2orig = vec![0; size];
     let mut cur_ordered_col = 0;
 
-    let mut col_rows_len = Vec::with_capacity(cols.len());
-    for c in 0..size {
-        let col_rows = get_col(c);
-        for &r in col_rows {
-            rows[r].cols.push(c);
-        }
-
-        cols.push(Col {
-            rows: col_rows.to_vec(),
-            score: 0,
-        });
-
-        col_rows_len.push(col_rows.len());
-    }
-
     let mut is_ordered_col = vec![false; size];
     let mut is_absorbed_row = vec![false; size];
 
-    // order columns of size 1
-    let mut stack = vec![];
-    for c in 0..size {
-        if col_rows_len[c] == 0 || col_rows_len[c] > 1 {
-            continue;
-        }
-
-        // all columns on the stack are of size 1
-        stack.clear();
-        stack.push(c);
-        while !stack.is_empty() {
-            let c = stack.pop().unwrap();
-            let r = *cols[c].rows.iter().find(|&&r| !is_absorbed_row[r]).unwrap();
-            for &other_c in &rows[r].cols {
-                col_rows_len[other_c] -= 1;
-                if col_rows_len[other_c] == 1 {
-                    stack.push(other_c);
+    {
+        // Gather rows & columns and in the process cheaply order columns of size 1.
+        let mut cur_col = vec![];
+        for c in 0..size {
+            cur_col.clear();
+            for &r in get_col(c) {
+                if !is_absorbed_row[r] {
+                    cur_col.push(r);
                 }
             }
 
-            rows[r].cols.clear();
-            is_absorbed_row[r] = true;
+            if cur_col.len() > 1 {
+                cols[c].rows = cur_col.clone();
+                for &r in &cur_col {
+                    rows[r].cols.push(c);
+                }
+            } else {
+                is_ordered_col[c] = true;
+                new2orig[cur_ordered_col] = c;
+                cur_ordered_col += 1;
 
-            cols[c].rows.clear();
-            is_ordered_col[c] = true;
-            new2orig[cur_ordered_col] = c;
-            cur_ordered_col += 1;
+                is_absorbed_row[cur_col[0]] = true;
+            }
+        }
+    }
+
+    {
+        // Order remaining columns of size 1, taking into account that
+        // eliminating some column can make other columns into singletons.
+        let mut col_rows_len = cols.iter().map(|c| c.rows.len()).collect::<Vec<_>>();
+        let mut stack = vec![];
+        for c in 0..size {
+            if col_rows_len[c] != 1 {
+                continue;
+            }
+
+            // all columns on the stack are of size 1
+            stack.clear();
+            stack.push(c);
+            while !stack.is_empty() {
+                let c = stack.pop().unwrap();
+                let r = *cols[c].rows.iter().find(|&&r| !is_absorbed_row[r]).unwrap();
+                for &other_c in &rows[r].cols {
+                    col_rows_len[other_c] -= 1;
+                    if col_rows_len[other_c] == 1 {
+                        stack.push(other_c);
+                    }
+                }
+
+                rows[r].cols.clear();
+                is_absorbed_row[r] = true;
+
+                cols[c].rows.clear();
+                is_ordered_col[c] = true;
+                new2orig[cur_ordered_col] = c;
+                cur_ordered_col += 1;
+            }
         }
     }
 
     let ns_size = size - cur_ordered_col; // number of non-singleton columns.
 
-    // Dense rows make COLAMD bounds on fill-in useless so we exclude them from consideration
-    // and hope that they won't be chosen during pivoting.
-    let dense_row_thresh = std::cmp::max(16, ns_size / 10);
-    for (r, row) in rows.iter_mut().enumerate() {
-        if row.cols.len() >= dense_row_thresh {
-            row.cols.clear();
-            is_absorbed_row[r] = true;
+    {
+        // Dense rows make COLAMD bounds on fill-in useless so we exclude them from consideration
+        // and hope that they won't be chosen during pivoting.
+        let dense_row_thresh = std::cmp::max(16, ns_size / 4);
+        for (r, row) in rows.iter_mut().enumerate() {
+            if row.cols.len() >= dense_row_thresh {
+                row.cols.clear();
+                is_absorbed_row[r] = true;
+            }
         }
     }
 
     let mut cols_queue = ColsQueue::new(cols.len());
 
-    // compact columns and detect dense ones.
-    let dense_col_thresh = std::cmp::max(16, (ns_size as f64).sqrt() as usize);
-    for c in 0..cols.len() {
-        let col = &mut cols[c];
-        let mut cur_i = 0;
-        for i in 0..col.rows.len() {
-            let r = col.rows[i];
-            if !is_absorbed_row[r] {
-                col.rows[cur_i] = r;
-                cur_i += 1;
+    {
+        // Compact columns and detect dense ones.
+        let dense_col_thresh = std::cmp::max(16, (ns_size as f64).sqrt() as usize);
+        for c in 0..cols.len() {
+            if is_ordered_col[c] {
+                continue;
             }
-        }
 
-        col.rows.truncate(cur_i);
+            let col = &mut cols[c];
+            let mut cur_i = 0;
+            for i in 0..col.rows.len() {
+                let r = col.rows[i];
+                if !is_absorbed_row[r] {
+                    col.rows[cur_i] = r;
+                    cur_i += 1;
+                }
+            }
 
-        if cur_i >= dense_col_thresh {
-            cols_queue.add(c, cur_i); // order dense columns by their size.
+            col.rows.truncate(cur_i);
+
+            if cur_i >= dense_col_thresh {
+                cols_queue.add(c, cur_i); // order dense columns by their size.
+            } else if cur_i == 0 {
+                // This means the column consists only of dense rows.
+                // Order these at the very end.
+                cols_queue.add(c, size - 1);
+            }
         }
     }
 
