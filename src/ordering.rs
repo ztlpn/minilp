@@ -36,13 +36,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     // * supercolumns
 
     let mut rows = vec![Row { cols: vec![] }; size];
-    let mut cols = vec![
-        Col {
-            rows: vec![],
-            score: 0
-        };
-        size
-    ];
+    let mut cols = vec![Col { rows: vec![] }; size];
 
     let mut new2orig = vec![0; size];
     let mut cur_ordered_col = 0;
@@ -156,38 +150,39 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         }
     }
 
-    // order dense columns at the end.
-    let num_dense_cols = cols_queue.len();
-    for i in 0..num_dense_cols {
-        let dense_c = cols_queue.pop_min().unwrap();
-        new2orig[size - num_dense_cols + i] = dense_c;
-        is_ordered_col[dense_c] = true;
-    }
-    assert_eq!(cols_queue.len(), 0);
-
-    // calculate initial scores for sparse columns.
-    // Use the same cols_queue (which was emptied on the previous step).
-    for c in 0..cols.len() {
-        if is_ordered_col[c] {
-            continue;
+    {
+        // order dense columns at the end.
+        let num_dense_cols = cols_queue.len();
+        for i in 0..num_dense_cols {
+            let dense_c = cols_queue.pop_min().unwrap();
+            new2orig[size - num_dense_cols + i] = dense_c;
+            is_ordered_col[dense_c] = true;
         }
-
-        let col = &mut cols[c];
-
-        let mut score = 0;
-        for &r in &col.rows {
-            score += rows[r].cols.len() - 1;
-        }
-        score = std::cmp::min(score, size - 1);
-
-        col.score = score;
-        cols_queue.add(c, score);
+        assert_eq!(cols_queue.len(), 0);
     }
 
-    // eprintln!(
-    //     "INIT COLS: {:?}\nROWS: {:?}\nSCORES: {:?}",
-    //     cols, rows, col_scores
-    // );
+    let mut col_scores = vec![0; size];
+
+    {
+        // Calculate initial scores for sparse columns.
+        // Use the same cols_queue (which was emptied on the previous step).
+        for c in 0..cols.len() {
+            if is_ordered_col[c] {
+                continue;
+            }
+
+            let col = &mut cols[c];
+
+            let mut score = 0;
+            for &r in &col.rows {
+                score += rows[r].cols.len() - 1;
+            }
+            score = std::cmp::min(score, size - 1);
+
+            col_scores[c] = score;
+            cols_queue.add(c, score);
+        }
+    }
 
     // cleared every iteration
     let mut pivot_row = vec![];
@@ -253,7 +248,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
             let mut cur_pivot_i = 0;
             for pivot_i in 0..pivot_row.len() {
                 let c = pivot_row[pivot_i];
-                cols_queue.remove(c, cols[c].score);
+                cols_queue.remove(c, col_scores[c]);
 
                 // calculate diff, compacting columns on the way
                 let mut diff = 0;
@@ -276,7 +271,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                     cols[c].rows.clear();
                 // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
                 } else {
-                    cols[c].score = diff; // NOTE: not the final score, will be updated later.
+                    col_scores[c] = diff; // NOTE: not the final score, will be updated later.
                     cols[c].rows.truncate(cur_i);
                     pivot_row[cur_pivot_i] = c;
                     cur_pivot_i += 1;
@@ -301,9 +296,10 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
             rows[pivot_r].cols = pivot_row.clone();
             is_absorbed_row[pivot_r] = false;
             for &c in &rows[pivot_r].cols {
-                cols[c].score += pivot_row.len() - 1; // TODO: supercolumns
-                cols[c].score = std::cmp::min(cols[c].score, size - 1);
-                cols_queue.add(c, cols[c].score);
+                let score = &mut col_scores[c];
+                *score += pivot_row.len() - 1; // TODO: supercolumns
+                *score = std::cmp::min(*score, size - 1);
+                cols_queue.add(c, *score);
             }
         }
 
@@ -329,7 +325,6 @@ struct Row {
 #[derive(Clone, Debug)]
 struct Col {
     rows: Vec<usize>,
-    score: usize,
 }
 
 #[derive(Debug)]
