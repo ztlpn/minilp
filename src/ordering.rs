@@ -35,24 +35,18 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     // * deal with empty columns/rows
     // * supercolumns
 
-    let mut rows = vec![Row { cols: vec![] }; size];
-    let mut cols = vec![
-        Col {
-            rows_begin: 0,
-            rows_end: 0
-        };
-        size
-    ];
+    let mut cols = vec![Slice { begin: 0, end: 0 }; size];
     let mut row_storage = vec![];
 
     let mut new2orig = vec![0; size];
     let mut cur_ordered_col = 0;
-
     let mut is_ordered_col = vec![false; size];
+
+    let mut rows = vec![Slice { begin: 0, end: 0 }; size];
     let mut is_absorbed_row = vec![false; size];
 
     {
-        // Gather rows & columns and in the process cheaply order columns of size 1.
+        // Gather columns and in the process cheaply order columns of size 1.
         for c in 0..size {
             let rows_begin = row_storage.len();
             for &r in get_col(c) {
@@ -63,10 +57,10 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
             let rows_end = row_storage.len();
             if rows_end - rows_begin > 1 {
-                cols[c].rows_begin = rows_begin;
-                cols[c].rows_end = rows_end;
+                cols[c].begin = rows_begin;
+                cols[c].end = rows_end;
                 for &r in &row_storage[rows_begin..rows_end] {
-                    rows[r].cols.push(c);
+                    rows[r].end += 1;
                 }
             } else {
                 is_ordered_col[c] = true;
@@ -79,13 +73,34 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         }
     }
 
+    let mut col_storage = vec![0; row_storage.len()];
+
+    {
+        // Gather rows.
+        for i in 1..size {
+            let prev_end = rows[i - 1].end;
+            rows[i].begin = prev_end;
+            rows[i].end += prev_end;
+        }
+
+        for c in 0..size {
+            for &r in cols[c].elems(&row_storage) {
+                let row = &mut rows[r];
+                col_storage[row.begin] = c;
+                row.begin += 1;
+            }
+        }
+
+        rows[0].begin = 0;
+        for i in 1..size {
+            rows[i].begin = rows[i - 1].end;
+        }
+    }
+
     {
         // Order remaining columns of size 1, taking into account that
         // eliminating some column can make other columns into singletons.
-        let mut col_rows_len = cols
-            .iter()
-            .map(|c| c.rows_end - c.rows_begin)
-            .collect::<Vec<_>>();
+        let mut col_rows_len = cols.iter().map(|c| c.end - c.begin).collect::<Vec<_>>();
         let mut stack = vec![];
         for c in 0..size {
             if col_rows_len[c] != 1 {
@@ -98,18 +113,17 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
             while !stack.is_empty() {
                 let c = stack.pop().unwrap();
                 let r = *cols[c]
-                    .rows(&row_storage)
+                    .elems(&row_storage)
                     .iter()
                     .find(|&&r| !is_absorbed_row[r])
                     .unwrap();
-                for &other_c in &rows[r].cols {
+                for &other_c in rows[r].elems(&col_storage) {
                     col_rows_len[other_c] -= 1;
                     if col_rows_len[other_c] == 1 {
                         stack.push(other_c);
                     }
                 }
 
-                rows[r].cols.clear();
                 is_absorbed_row[r] = true;
 
                 is_ordered_col[c] = true;
@@ -126,8 +140,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         // and hope that they won't be chosen during pivoting.
         let dense_row_thresh = std::cmp::max(16, ns_size / 4);
         for (r, row) in rows.iter_mut().enumerate() {
-            if row.cols.len() >= dense_row_thresh {
-                row.cols.clear();
+            if row.end - row.begin >= dense_row_thresh {
                 is_absorbed_row[r] = true;
             }
         }
@@ -144,8 +157,8 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
             }
 
             let col = &mut cols[c];
-            let mut cur_end = col.rows_begin;
-            for i in col.rows_begin..col.rows_end {
+            let mut cur_end = col.begin;
+            for i in col.begin..col.end {
                 let r = row_storage[i];
                 if !is_absorbed_row[r] {
                     row_storage[cur_end] = r;
@@ -153,9 +166,9 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                 }
             }
 
-            col.rows_end = cur_end;
+            col.end = cur_end;
 
-            let col_len = cur_end - col.rows_begin;
+            let col_len = cur_end - col.begin;
             if col_len >= dense_col_thresh {
                 cols_queue.add(c, col_len); // order dense columns by their size.
             } else if col_len == 0 {
@@ -190,8 +203,9 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
             let col = &mut cols[c];
 
             let mut score = 0;
-            for &r in col.rows(&row_storage) {
-                score += rows[r].cols.len() - 1;
+            for &r in col.elems(&row_storage) {
+                let row = &rows[r];
+                score += row.end - row.begin - 1;
             }
             score = std::cmp::min(score, size - 1);
 
@@ -201,7 +215,6 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     }
 
     // cleared every iteration
-    let mut pivot_row = vec![];
     let mut is_in_pivot_row = vec![false; cols.len()];
 
     let mut row_set_diffs = vec![0; size];
@@ -210,36 +223,36 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
     while cols_queue.len() > 0 {
         let pivot_c = cols_queue.pop_min().unwrap();
+        let pivot_row_begin = col_storage.len();
 
         new2orig[cur_ordered_col] = pivot_c;
         cur_ordered_col += 1;
         is_ordered_col[pivot_c] = true;
         // eprintln!("ORDERED {}", new2orig.last().unwrap());
 
-        pivot_row.clear();
         let mut pivot_r = None;
-        for &r in cols[pivot_c].rows(&row_storage) {
+        for &r in cols[pivot_c].elems(&row_storage) {
             if !std::mem::replace(&mut is_absorbed_row[r], true) {
                 pivot_r = Some(r); // choose any absorbed row index to represent pivot row.
-                for &c in &rows[r].cols {
+                let row = &rows[r];
+                for i in row.begin..row.end {
+                    let c = col_storage[i];
                     if !is_ordered_col[c] && !std::mem::replace(&mut is_in_pivot_row[c], true) {
-                        pivot_row.push(c);
+                        col_storage.push(c);
                     }
                 }
-
-                rows[r].cols.clear();
             }
         }
         let pivot_r = pivot_r.unwrap();
 
         // clear for next iteration.
-        for &c in &pivot_row {
+        for &c in &col_storage[pivot_row_begin..] {
             is_in_pivot_row[c] = false;
         }
 
         // find row set differences
-        for &c in &pivot_row {
-            for &r in cols[c].rows(&row_storage) {
+        for &c in &col_storage[pivot_row_begin..] {
+            for &r in cols[c].elems(&row_storage) {
                 if is_absorbed_row[r] {
                     continue;
                 }
@@ -247,7 +260,8 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                 if !is_in_diffs[r] {
                     is_in_diffs[r] = true;
                     rows_with_diffs.push(r);
-                    row_set_diffs[r] = rows[r].cols.len();
+                    let row = &rows[r];
+                    row_set_diffs[r] = row.end - row.begin;
                 }
 
                 row_set_diffs[r] -= 1; // TODO: supercolumns
@@ -261,17 +275,17 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
         // calculate row set differences with the pivot row
         {
-            let mut cur_pivot_i = 0;
-            for pivot_i in 0..pivot_row.len() {
-                let c = pivot_row[pivot_i];
+            let mut cur_pivot_i = pivot_row_begin;
+            for pivot_i in pivot_row_begin..col_storage.len() {
+                let c = col_storage[pivot_i];
                 cols_queue.remove(c, col_scores[c]);
 
                 let col = &mut cols[c];
 
                 // calculate diff, compacting columns on the way
                 let mut diff = 0;
-                let mut cur_end = col.rows_begin;
-                for i in col.rows_begin..col.rows_end {
+                let mut cur_end = col.begin;
+                for i in col.begin..col.end {
                     let r = row_storage[i];
                     if !is_absorbed_row[r] {
                         row_storage[cur_end] = r;
@@ -279,7 +293,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                         diff += row_set_diffs[r];
                     }
                 }
-                col.rows_end = cur_end;
+                col.end = cur_end;
 
                 if diff == 0 {
                     // mass elimination: we can order column c now as it will not result
@@ -290,11 +304,11 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                 // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
                 } else {
                     col_scores[c] = diff; // NOTE: not the final score, will be updated later.
-                    pivot_row[cur_pivot_i] = c;
+                    col_storage[cur_pivot_i] = c;
                     cur_pivot_i += 1;
                 }
             }
-            pivot_row.truncate(cur_pivot_i);
+            col_storage.truncate(cur_pivot_i);
         }
 
         // eprintln!("PIVOT ROW {:?}", pivot_row);
@@ -309,12 +323,15 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         // TODO: detect supercolumns
 
         // calculate final column scores
-        if !pivot_row.is_empty() {
-            rows[pivot_r].cols = pivot_row.clone();
+        let pivot_row_len = col_storage.len() - pivot_row_begin;
+        if pivot_row_len > 0 {
+            let row = &mut rows[pivot_r];
+            row.begin = pivot_row_begin;
+            row.end = col_storage.len();
             is_absorbed_row[pivot_r] = false;
-            for &c in &rows[pivot_r].cols {
+            for &c in row.elems(&col_storage) {
                 let score = &mut col_scores[c];
-                *score += pivot_row.len() - 1; // TODO: supercolumns
+                *score += pivot_row_len - 1; // TODO: supercolumns
                 *score = std::cmp::min(*score, size - 1);
                 cols_queue.add(c, *score);
             }
@@ -335,19 +352,14 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 }
 
 #[derive(Clone, Debug)]
-struct Row {
-    cols: Vec<usize>,
+struct Slice {
+    begin: usize,
+    end: usize,
 }
 
-#[derive(Clone, Debug)]
-struct Col {
-    rows_begin: usize,
-    rows_end: usize,
-}
-
-impl Col {
-    fn rows<'a>(&self, storage: &'a [usize]) -> &'a [usize] {
-        &storage[self.rows_begin..self.rows_end]
+impl Slice {
+    fn elems<'a>(&self, storage: &'a [usize]) -> &'a [usize] {
+        &storage[self.begin..self.end]
     }
 }
 
