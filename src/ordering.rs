@@ -31,7 +31,6 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     // https://www.researchgate.net/profile/Tim_Davis2/publication/220492488_A_column_approximate_minimum_degree_ordering_algorithm/links/551b1e100cf251c35b507fe5.pdf
 
     // TODO:
-    // * allocate all storage at once
     // * deal with empty columns/rows
     // * supercolumns
 
