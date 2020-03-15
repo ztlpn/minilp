@@ -44,6 +44,8 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     let mut rows = vec![Slice { begin: 0, end: 0 }; size];
     let mut is_absorbed_row = vec![false; size];
 
+    let mut num_cheap_singletons = 0;
+
     {
         // Gather columns and in the process cheaply order columns of size 1.
         for c in 0..size {
@@ -62,6 +64,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                     rows[r].end += 1;
                 }
             } else {
+                num_cheap_singletons += 1;
                 is_ordered_col[c] = true;
                 new2orig[cur_ordered_col] = c;
                 cur_ordered_col += 1;
@@ -96,6 +99,8 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         }
     }
 
+    let mut num_singletons = num_cheap_singletons;
+
     {
         // Order remaining columns of size 1, taking into account that
         // eliminating some column can make other columns into singletons.
@@ -125,6 +130,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
                 is_absorbed_row[r] = true;
 
+                num_singletons += 1;
                 is_ordered_col[c] = true;
                 new2orig[cur_ordered_col] = c;
                 cur_ordered_col += 1;
@@ -132,7 +138,8 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         }
     }
 
-    let ns_size = size - cur_ordered_col; // number of non-singleton columns.
+    let ns_size = size - num_singletons; // number of non-singleton columns.
+    let mut num_dense_rows = 0;
 
     {
         // Dense rows make COLAMD bounds on fill-in useless so we exclude them from consideration
@@ -141,11 +148,14 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         for (r, row) in rows.iter_mut().enumerate() {
             if row.end - row.begin >= dense_row_thresh {
                 is_absorbed_row[r] = true;
+                num_dense_rows += 1;
             }
         }
     }
 
     let mut cols_queue = ColsQueue::new(cols.len());
+    let mut num_dense_cols = 0;
+    let mut num_cols_only_dense_rows = 0;
 
     {
         // Compact columns and detect dense ones.
@@ -169,10 +179,12 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
             let col_len = cur_end - col.begin;
             if col_len >= dense_col_thresh {
+                num_dense_cols += 1;
                 cols_queue.add(c, col_len); // order dense columns by their size.
             } else if col_len == 0 {
                 // This means the column consists only of dense rows.
                 // Order these at the very end.
+                num_cols_only_dense_rows += 1;
                 cols_queue.add(c, size - 1);
             }
         }
@@ -180,10 +192,10 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
     {
         // order dense columns at the end.
-        let num_dense_cols = cols_queue.len();
-        for i in 0..num_dense_cols {
+        let cols_queue_len = cols_queue.len();
+        for i in 0..cols_queue_len {
             let dense_c = cols_queue.pop_min().unwrap();
-            new2orig[size - num_dense_cols + i] = dense_c;
+            new2orig[size - cols_queue_len + i] = dense_c;
             is_ordered_col[dense_c] = true;
         }
         assert_eq!(cols_queue.len(), 0);
@@ -220,6 +232,8 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     let mut rows_with_diffs = vec![];
     let mut is_in_diffs = vec![false; size];
 
+    let mut num_mass_eliminated = 0;
+
     while cols_queue.len() > 0 {
         let pivot_c = cols_queue.pop_min().unwrap();
         let pivot_row_begin = col_storage.len();
@@ -227,7 +241,6 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         new2orig[cur_ordered_col] = pivot_c;
         cur_ordered_col += 1;
         is_ordered_col[pivot_c] = true;
-        // eprintln!("ORDERED {}", new2orig.last().unwrap());
 
         let mut pivot_r = None;
         for &r in cols[pivot_c].elems(&row_storage) {
@@ -297,10 +310,10 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                 if diff == 0 {
                     // mass elimination: we can order column c now as it will not result
                     // in any additional fill-in.
+                    num_mass_eliminated += 1;
                     new2orig[cur_ordered_col] = c;
                     cur_ordered_col += 1;
                     is_ordered_col[c] = true;
-                // eprintln!("ME: ORDERED {}", new2orig.last().unwrap());
                 } else {
                     col_scores[c] = diff; // NOTE: not the final score, will be updated later.
                     col_storage[cur_pivot_i] = c;
@@ -309,8 +322,6 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
             }
             col_storage.truncate(cur_pivot_i);
         }
-
-        // eprintln!("PIVOT ROW {:?}", pivot_row);
 
         // clear diffs for next iteration
         for &r in &rows_with_diffs {
@@ -335,17 +346,16 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                 cols_queue.add(c, *score);
             }
         }
-
-        // eprintln!(
-        //     "AFTER ORDERING {} COLS:\nCOLS: {:?}\nROWS: {:?}\nSCORES: {:?}",
-        //     new2orig.len(), cols, rows, col_scores
-        // );
     }
 
     let mut orig2new = vec![0; size];
     for (new, &orig) in new2orig.iter().enumerate() {
         orig2new[orig] = new;
     }
+
+    trace!(
+        "COLAMD: ordered {} cols, singletons: {} (cheap: {}), dense_rows: {}, dense_cols: {}, cols_only_dense_rows: {}, mass_eliminated: {}",
+        size, num_singletons, num_cheap_singletons, num_dense_rows, num_dense_cols, num_cols_only_dense_rows, num_mass_eliminated);
 
     Perm { orig2new, new2orig }
 }
