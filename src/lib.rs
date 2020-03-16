@@ -80,20 +80,20 @@ impl std::fmt::Debug for Tableau {
 }
 
 #[derive(Clone, Debug)]
-pub enum Constraint {
-    Eq(CsVec, f64),
-    Le(CsVec, f64),
-    Ge(CsVec, f64),
+pub enum RelOp {
+    Eq,
+    Le,
+    Ge,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Infeasible,
     Unbounded,
 }
 
 impl Tableau {
-    pub fn new(mut obj: Vec<f64>, constraints: Vec<Constraint>) -> Self {
+    pub fn new(mut obj: Vec<f64>, constraints: Vec<(CsVec, RelOp, f64)>) -> Self {
         let enable_steepest_edge = true;
 
         let num_vars = obj.len();
@@ -101,10 +101,10 @@ impl Tableau {
             let mut s = 0;
             let mut a = 0;
             for constr in &constraints {
-                match constr {
-                    Constraint::Le(..) => s += 1,
-                    Constraint::Eq(..) => a += 1,
-                    Constraint::Ge(..) => {
+                match constr.1 {
+                    RelOp::Le => s += 1,
+                    RelOp::Eq => a += 1,
+                    RelOp::Ge => {
                         s += 1;
                         a += 1;
                     }
@@ -131,27 +131,27 @@ impl Tableau {
         let mut basic_vars = vec![];
         let mut basic_vars_inv = vec![SENTINEL; num_total_vars];
 
-        for constr in constraints.into_iter() {
-            let (mut coeffs, bound, basic_idx) = match constr {
-                Constraint::Le(coeffs, bound) => {
+        for (mut coeffs, rel_op, bound) in constraints.into_iter() {
+            let basic_idx = match rel_op {
+                RelOp::Le => {
                     assert_eq!(coeffs.dim(), num_vars);
                     assert!(bound >= 0.0);
                     let basic_idx = cur_slack_var;
                     cur_slack_var += 1;
-                    (coeffs, bound, basic_idx)
+                    basic_idx
                 }
 
-                Constraint::Eq(coeffs, bound) => {
+                RelOp::Eq => {
                     assert_eq!(coeffs.dim(), num_vars);
                     assert!(bound >= 0.0);
                     artificial_obj_val += bound;
                     artificial_multipliers.append(basic_vars.len(), 1.0);
                     let basic_idx = num_slack_vars + cur_artificial_var;
                     cur_artificial_var += 1;
-                    (coeffs, bound, basic_idx)
+                    basic_idx
                 }
 
-                Constraint::Ge(mut coeffs, bound) => {
+                RelOp::Ge => {
                     assert_eq!(coeffs.dim(), num_vars);
                     assert!(bound >= 0.0);
 
@@ -165,7 +165,7 @@ impl Tableau {
                     let basic_idx = num_slack_vars + cur_artificial_var;
                     cur_artificial_var += 1;
 
-                    (coeffs, bound, basic_idx)
+                    basic_idx
                 }
             };
 
@@ -541,11 +541,11 @@ impl Tableau {
         }
     }
 
-    pub fn add_constraint(self, constraint: Constraint) -> Result<Self, Error> {
-        let (coeffs, bound) = match constraint {
-            Constraint::Le(c, b) => (c, b),
-            Constraint::Ge(c, b) => (c.map(|coeff| -coeff), -b),
-            Constraint::Eq(..) => unimplemented!(),
+    pub fn add_constraint(self, coeffs: CsVec, rel_op: RelOp, bound: f64) -> Result<Self, Error> {
+        let (coeffs, bound) = match rel_op {
+            RelOp::Le => (coeffs, bound),
+            RelOp::Ge => (coeffs.map(|coeff| -coeff), -bound),
+            RelOp::Eq => unimplemented!(),
         };
         assert_eq!(coeffs.dim(), self.num_vars);
         self.add_le_constraint_impl(coeffs, bound)
@@ -1270,9 +1270,9 @@ mod tests {
         let tab = Tableau::new(
             vec![2.0, 1.0],
             vec![
-                Constraint::Le(to_sparse(&[1.0, 1.0]), 4.0),
-                Constraint::Ge(to_sparse(&[1.0, 1.0]), 2.0),
-                Constraint::Eq(to_sparse(&[0.0, 1.0]), 3.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
+                (to_sparse(&[0.0, 1.0]), RelOp::Eq, 3.0),
             ],
         );
 
@@ -1305,10 +1305,10 @@ mod tests {
         let tab = Tableau::new(
             vec![-3.0, -4.0],
             vec![
-                Constraint::Ge(to_sparse(&[1.0, 0.0]), 10.0),
-                Constraint::Ge(to_sparse(&[0.0, 1.0]), 5.0),
-                Constraint::Le(to_sparse(&[1.0, 1.0]), 20.0),
-                Constraint::Le(to_sparse(&[-1.0, 4.0]), 20.0),
+                (to_sparse(&[1.0, 0.0]), RelOp::Ge, 10.0),
+                (to_sparse(&[0.0, 1.0]), RelOp::Ge, 5.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Le, 20.0),
+                (to_sparse(&[-1.0, 4.0]), RelOp::Le, 20.0),
             ],
         )
         .canonicalize()
@@ -1328,8 +1328,8 @@ mod tests {
         let infeasible = Tableau::new(
             vec![1.0, 1.0],
             vec![
-                Constraint::Ge(to_sparse(&[1.0, 1.0]), 10.0),
-                Constraint::Le(to_sparse(&[1.0, 1.0]), 5.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 10.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Le, 5.0),
             ],
         )
         .canonicalize();
@@ -1341,10 +1341,10 @@ mod tests {
         let mut tab = Tableau::new(
             vec![-3.0, -4.0],
             vec![
-                Constraint::Ge(to_sparse(&[1.0, 0.0]), 10.0),
-                Constraint::Ge(to_sparse(&[0.0, 1.0]), 5.0),
-                Constraint::Le(to_sparse(&[1.0, 1.0]), 20.0),
-                Constraint::Le(to_sparse(&[-1.0, 4.0]), 20.0),
+                (to_sparse(&[1.0, 0.0]), RelOp::Ge, 10.0),
+                (to_sparse(&[0.0, 1.0]), RelOp::Ge, 5.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Le, 20.0),
+                (to_sparse(&[-1.0, 4.0]), RelOp::Le, 20.0),
             ],
         );
 
@@ -1358,9 +1358,9 @@ mod tests {
         let mut tab = Tableau::new(
             vec![2.0, 1.0],
             vec![
-                Constraint::Le(to_sparse(&[1.0, 1.0]), 4.0),
-                Constraint::Ge(to_sparse(&[1.0, 1.0]), 2.0),
-                Constraint::Eq(to_sparse(&[0.0, 1.0]), 3.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
+                (to_sparse(&[0.0, 1.0]), RelOp::Eq, 3.0),
             ],
         );
 
@@ -1386,8 +1386,8 @@ mod tests {
         let orig_tab = Tableau::new(
             vec![2.0, 1.0],
             vec![
-                Constraint::Le(to_sparse(&[1.0, 1.0]), 4.0),
-                Constraint::Ge(to_sparse(&[1.0, 1.0]), 2.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
             ],
         )
         .optimize()
@@ -1419,8 +1419,8 @@ mod tests {
         let orig_tab = Tableau::new(
             vec![2.0, 1.0],
             vec![
-                Constraint::Le(to_sparse(&[1.0, 1.0]), 4.0),
-                Constraint::Ge(to_sparse(&[1.0, 1.0]), 2.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
             ],
         )
         .optimize()
@@ -1429,7 +1429,7 @@ mod tests {
         {
             let tab = orig_tab
                 .clone()
-                .add_constraint(Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0))
+                .add_constraint(to_sparse(&[-1.0, 1.0]), RelOp::Le, 0.0)
                 .unwrap();
             assert_eq!(tab.cur_solution(), [1.0, 1.0]);
             assert_eq!(tab.cur_obj_val(), 3.0);
@@ -1440,7 +1440,7 @@ mod tests {
                 .clone()
                 .set_var(1, 1.5)
                 .unwrap()
-                .add_constraint(Constraint::Le(to_sparse(&[-1.0, 1.0]), 0.0))
+                .add_constraint(to_sparse(&[-1.0, 1.0]), RelOp::Le, 0.0)
                 .unwrap();
             assert_eq!(tab.cur_solution(), [1.5, 1.5]);
             assert_eq!(tab.cur_obj_val(), 4.5);
@@ -1449,7 +1449,7 @@ mod tests {
         {
             let tab = orig_tab
                 .clone()
-                .add_constraint(Constraint::Ge(to_sparse(&[-1.0, 1.0]), 3.0))
+                .add_constraint(to_sparse(&[-1.0, 1.0]), RelOp::Ge, 3.0)
                 .unwrap();
             assert_eq!(tab.cur_solution(), [0.0, 3.0]);
             assert_eq!(tab.cur_obj_val(), 3.0);
@@ -1461,8 +1461,8 @@ mod tests {
         let mut tab = Tableau::new(
             vec![0.0, -1.0],
             vec![
-                Constraint::Le(to_sparse(&[3.0, 2.0]), 6.0),
-                Constraint::Le(to_sparse(&[-3.0, 2.0]), 0.0),
+                (to_sparse(&[3.0, 2.0]), RelOp::Le, 6.0),
+                (to_sparse(&[-3.0, 2.0]), RelOp::Le, 0.0),
             ],
         )
         .optimize()
