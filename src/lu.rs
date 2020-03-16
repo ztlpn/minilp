@@ -1,4 +1,4 @@
-use crate::sparse::{Perm, ScatteredVec, SparseMat, TriangleMat};
+use crate::sparse::{Error, Perm, ScatteredVec, SparseMat, TriangleMat};
 
 #[derive(Clone)]
 pub struct LUFactors {
@@ -120,7 +120,7 @@ pub fn lu_factorize<'a>(
     get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
-) -> LUFactors {
+) -> Result<LUFactors, Error> {
     // Implementation of the Gilbert-Peierls algorithm:
     //
     // Gilbert, John R., and Tim Peierls. "Sparse partial pivoting in time
@@ -203,6 +203,11 @@ pub fn lu_factorize<'a>(
                     max_abs = abs;
                 }
             }
+
+            if max_abs < 1e-8 {
+                return Err(Error::SingularMatrix);
+            }
+
             assert!(max_abs.is_normal());
 
             // Choose among eligible pivot rows one with the least elements.
@@ -279,7 +284,7 @@ pub fn lu_factorize<'a>(
         lower_nnz + upper_nnz + size - mat_nnz,
     );
 
-    LUFactors {
+    let res = LUFactors {
         lower: TriangleMat {
             nondiag: lower,
             diag: None,
@@ -293,7 +298,9 @@ pub fn lu_factorize<'a>(
             new2orig: new2orig_row,
         }),
         col_perm: Some(col_perm),
-    }
+    };
+
+    Ok(res)
 }
 
 #[derive(Clone, Debug)]
@@ -459,33 +466,42 @@ fn tri_solve_process_col(tri_mat: &TriangleMat, col: usize, rhs: &mut [f64]) {
 mod tests {
     use super::*;
     use crate::helpers::{assert_matrix_eq, to_dense, to_sparse};
-    use sprs::{CsVec, TriMat};
+    use sprs::{CsMat, CsVec, TriMat};
+
+    fn mat_from_triplets(rows: usize, cols: usize, triplets: &[(usize, usize, f64)]) -> CsMat<f64> {
+        let mut mat = TriMat::with_capacity((rows, cols), triplets.len());
+        for (r, c, val) in triplets {
+            mat.add_triplet(*r, *c, *val);
+        }
+        mat.to_csc()
+    }
 
     #[test]
     fn lu_simple() {
-        let triplets = [
-            (0, 1, 2.0),
-            (0, 0, 2.0),
-            (0, 2, 123.0),
-            (1, 2, 456.0),
-            (1, 3, 1.0),
-            (2, 1, 4.0),
-            (2, 0, 3.0),
-            (2, 2, 789.0),
-            (2, 3, 1.0),
-        ];
-        let mut mat = TriMat::with_capacity((3, 4), triplets.len());
-        for (r, c, val) in &triplets {
-            mat.add_triplet(*r, *c, *val);
-        }
-        let mat = mat.to_csc();
+        let mat = mat_from_triplets(
+            3,
+            4,
+            &[
+                (0, 1, 2.0),
+                (0, 0, 2.0),
+                (0, 2, 123.0),
+                (1, 2, 456.0),
+                (1, 3, 1.0),
+                (2, 1, 4.0),
+                (2, 0, 3.0),
+                (2, 2, 789.0),
+                (2, 3, 1.0),
+            ],
+        );
+
         let mut scratch = ScratchSpace::with_capacity(mat.rows());
         let lu = lu_factorize(
             mat.rows(),
             |c| mat.outer_view([1, 0, 3][c]).unwrap().into_raw_storage(),
             0.9,
             &mut scratch,
-        );
+        )
+        .unwrap();
         let lu_transp = lu.transpose();
 
         let l_nondiag_ref = [
@@ -536,6 +552,63 @@ mod tests {
     }
 
     #[test]
+    fn lu_singular() {
+        let size = 3;
+
+        {
+            let symbolically_singular = mat_from_triplets(
+                size,
+                size,
+                &[(0, 0, 1.0), (1, 0, 1.0), (1, 1, 2.0), (1, 2, 3.0)],
+            );
+
+            let mut scratch = ScratchSpace::with_capacity(size);
+            let err = lu_factorize(
+                size,
+                |c| {
+                    symbolically_singular
+                        .outer_view(c)
+                        .unwrap()
+                        .into_raw_storage()
+                },
+                0.9,
+                &mut scratch,
+            );
+            assert_eq!(err.unwrap_err(), Error::SingularMatrix);
+        }
+
+        {
+            let numerically_singular = mat_from_triplets(
+                size,
+                size,
+                &[
+                    (0, 0, 1.0),
+                    (1, 0, 1.0),
+                    (1, 1, 2.0),
+                    (1, 2, 3.0),
+                    (2, 0, 2.0),
+                    (2, 1, 2.0),
+                    (2, 2, 3.0),
+                ],
+            );
+
+            let mut scratch = ScratchSpace::with_capacity(size);
+            let err = lu_factorize(
+                size,
+                |c| {
+                    numerically_singular
+                        .outer_view(c)
+                        .unwrap()
+                        .into_raw_storage()
+                },
+                0.9,
+                &mut scratch,
+            );
+            assert_eq!(err.unwrap_err(), Error::SingularMatrix);
+        }
+    }
+
+    #[test]
     fn lu_rand() {
         let size = 10;
 
@@ -562,7 +635,8 @@ mod tests {
             |c| mat.outer_view(cols[c]).unwrap().into_raw_storage(),
             0.1,
             &mut scratch,
-        );
+        )
+        .unwrap();
         let lu_transp = lu.transpose();
 
         let multiplied = &lu.lower.to_csmat() * &lu.upper.to_csmat();

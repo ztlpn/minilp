@@ -219,7 +219,8 @@ impl Tableau {
             },
             0.1,
             &mut scratch,
-        );
+        )
+        .unwrap();
         let lu_factors_transp = lu_factors.transpose();
 
         let cur_bounds = orig_bounds.clone();
@@ -1173,7 +1174,8 @@ impl BasisSolver {
             },
             0.1,
             &mut self.scratch,
-        );
+        )
+        .unwrap(); // TODO: When is singular basis matrix possible? Report as a proper error.
         self.lu_factors_transp = self.lu_factors.transpose();
     }
 

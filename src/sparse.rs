@@ -333,6 +333,11 @@ pub struct Perm {
     pub(crate) new2orig: Vec<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    SingularMatrix,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

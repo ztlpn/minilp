@@ -1,4 +1,4 @@
-use super::sparse::Perm;
+use super::sparse::{Error, Perm};
 
 /// Simplest preordering: order columns based on their size
 pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
@@ -20,7 +20,10 @@ pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     Perm { orig2new, new2orig }
 }
 
-pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
+pub fn order_colamd<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> &'a [usize],
+) -> Result<Perm, Error> {
     // Implementation of (a part of) the COLAMD algorithm:
     //
     // "An approximate minimum degree column ordering algorithm",
@@ -29,9 +32,15 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     // 1998.  CISE Tech Report TR-98-016.
     //
     // https://www.researchgate.net/profile/Tim_Davis2/publication/220492488_A_column_approximate_minimum_degree_ordering_algorithm/links/551b1e100cf251c35b507fe5.pdf
-
+    //
+    // Additionally, we order columns of size 1 first (as they don't cause any fill-in). COLAMD
+    // works best for *irreducible* matrices so ideally before ordering one should first reduce
+    // the matrix to the block-triangular form and then apply LU factorization (and ordering)
+    // to diagonal blocks. But it is more complicated and in LP most blocks are singletons anyway
+    // so we limit ourselves to singleton columns.
+    //
     // TODO:
-    // * deal with empty columns/rows
+    // * order empty columns/rows
     // * supercolumns
 
     let mut cols = vec![Slice { begin: 0, end: 0 }; size];
@@ -57,7 +66,9 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
             }
 
             let rows_end = row_storage.len();
-            if rows_end - rows_begin > 1 {
+            if rows_end - rows_begin == 0 {
+                return Err(Error::SingularMatrix);
+            } else if rows_end - rows_begin > 1 {
                 cols[c].begin = rows_begin;
                 cols[c].end = rows_end;
                 for &r in &row_storage[rows_begin..rows_end] {
@@ -72,6 +83,12 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
                 is_absorbed_row[row_storage[rows_begin]] = true;
                 row_storage.pop();
             }
+        }
+    }
+
+    for r in 0..size {
+        if rows[r].end == 0 && !is_absorbed_row[r] {
+            return Err(Error::SingularMatrix);
         }
     }
 
@@ -357,7 +374,7 @@ pub fn order_colamd<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         "COLAMD: ordered {} cols, singletons: {} (cheap: {}), dense_rows: {}, dense_cols: {}, cols_only_dense_rows: {}, mass_eliminated: {}",
         size, num_singletons, num_cheap_singletons, num_dense_rows, num_dense_cols, num_cols_only_dense_rows, num_mass_eliminated);
 
-    Perm { orig2new, new2orig }
+    Ok(Perm { orig2new, new2orig })
 }
 
 #[derive(Clone, Debug)]
@@ -679,9 +696,29 @@ mod tests {
                 .unwrap()
                 .into_raw_storage()
                 .0
-        });
+        })
+        .unwrap();
         assert_eq!(&perm.new2orig, &[1, 0, 2, 3]);
         assert_eq!(&perm.orig2new, &[1, 0, 2, 3]);
+    }
+
+    #[test]
+    fn colamd_singular() {
+        {
+            let empty_col_mat = mat_from_triplets(3, 3, &[(0, 0), (1, 0), (1, 1), (1, 2)]);
+            let res = order_colamd(3, |c| {
+                empty_col_mat.outer_view(c).unwrap().into_raw_storage().0
+            });
+            assert_eq!(res.unwrap_err(), Error::SingularMatrix);
+        }
+
+        {
+            let empty_row_mat = mat_from_triplets(3, 3, &[(0, 0), (0, 1), (1, 0), (1, 1), (1, 2)]);
+            let res = order_colamd(3, |c| {
+                empty_row_mat.outer_view(c).unwrap().into_raw_storage().0
+            });
+            assert_eq!(res.unwrap_err(), Error::SingularMatrix);
+        }
     }
 
     #[test]
