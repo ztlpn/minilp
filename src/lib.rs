@@ -21,8 +21,57 @@ use helpers::{resized_view, to_dense};
 
 const SENTINEL: usize = 0usize.wrapping_sub(1);
 
+#[derive(Clone, Debug)]
+pub enum RelOp {
+    Eq,
+    Le,
+    Ge,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    Infeasible,
+    Unbounded,
+}
+
+pub struct Problem {
+    obj: Vec<f64>,
+    constraints: Vec<(CsVec, RelOp, f64)>,
+}
+
+impl Problem {
+    pub fn new(obj: &[f64]) -> Self {
+        Problem {
+            obj: obj.to_vec(),
+            constraints: vec![],
+        }
+    }
+
+    pub fn add_constraint(&mut self, coeffs: CsVec, rel_op: RelOp, bound: f64) {
+        self.constraints.push((coeffs, rel_op, bound));
+    }
+
+    pub fn add_constraints(&mut self, constraints: &[(CsVec, RelOp, f64)]) {
+        self.constraints.extend_from_slice(constraints);
+    }
+
+    pub fn solve(&self) -> Result<Solution, Error> {
+        let mut sol = Solution::new(self.obj.clone(), self.constraints.clone());
+        debug!(
+            "initialized solver: num_vars={} num_slack_vars={} num_artificial_vars={} num_constraints={}, constraints nnz={}",
+            sol.num_vars,
+            sol.num_slack_vars,
+            sol.num_artificial_vars,
+            sol.orig_constraints.rows(),
+            sol.orig_constraints.nnz(),
+        );
+        sol.optimize()?;
+        Ok(sol)
+    }
+}
+
 #[derive(Clone)]
-pub struct Tableau {
+pub struct Solution {
     num_vars: usize,
     num_slack_vars: usize,
     num_artificial_vars: usize,
@@ -57,7 +106,7 @@ pub struct Tableau {
     cur_obj_val: f64,
 }
 
-impl std::fmt::Debug for Tableau {
+impl std::fmt::Debug for Solution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -79,21 +128,109 @@ impl std::fmt::Debug for Tableau {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum RelOp {
-    Eq,
-    Le,
-    Ge,
-}
+impl Solution {
+    pub fn objective(&self) -> f64 {
+        self.cur_obj_val
+    }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Error {
-    Infeasible,
-    Unbounded,
-}
+    pub fn variable_values(&self) -> Vec<f64> {
+        let mut values = vec![0.0; self.num_vars];
+        for (i, bv) in self.basic_vars.iter().enumerate() {
+            if *bv < self.num_vars {
+                values[*bv] = self.cur_bounds[i];
+            }
+        }
+        for (&var, &val) in self.set_vars.iter() {
+            assert_eq!(values[var], 0.0);
+            values[var] = val;
+        }
+        values
+    }
 
-impl Tableau {
-    pub fn new(mut obj: Vec<f64>, constraints: Vec<(CsVec, RelOp, f64)>) -> Self {
+    pub fn set_var(mut self, var: usize, val: f64) -> Result<Self, Error> {
+        assert_eq!(self.num_artificial_vars, 0);
+        assert!(self.set_vars.insert(var, val).is_none());
+
+        let basic_row = self.basic_vars.iter().position(|&v| v == var);
+        let non_basic_col = self.non_basic_vars.iter().position(|&v| v == var);
+
+        if let Some(r) = basic_row {
+            // if var was basic, remove it.
+            self.cur_bounds[r] -= val;
+            self.calc_row_coeffs(r);
+            let (c_entering, pivot_coeff) = self.choose_entering_col_dual()?;
+            self.calc_col_coeffs(c_entering);
+            self.pivot(c_entering, r, pivot_coeff);
+        } else if let Some(c) = non_basic_col {
+            self.calc_col_coeffs(c);
+            for (r, coeff) in self.col_coeffs.iter() {
+                self.cur_bounds[r] -= val * coeff;
+            }
+            self.cur_obj_val -= val * self.cur_obj[c];
+        } else {
+            panic!(
+                "couldn't find var {} in either basic or non-basic variables",
+                var
+            );
+        }
+
+        self.restore_feasibility()?;
+        self.optimize().unwrap();
+        Ok(self)
+    }
+
+    /// Return true if the var was really unset.
+    pub fn unset_var(mut self, var: usize) -> Result<(Self, bool), Error> {
+        if let Some(val) = self.set_vars.remove(&var) {
+            let col = self.non_basic_vars.iter().position(|&v| v == var).unwrap();
+            self.calc_col_coeffs(col);
+            for (r, coeff) in self.col_coeffs.iter() {
+                self.cur_bounds[r] += val * coeff;
+            }
+            self.cur_obj_val += val * self.cur_obj[col];
+
+            self.restore_feasibility()?;
+            self.optimize().unwrap();
+            Ok((self, true))
+        } else {
+            Ok((self, false))
+        }
+    }
+
+    pub fn add_constraint(self, coeffs: CsVec, rel_op: RelOp, bound: f64) -> Result<Self, Error> {
+        let (coeffs, bound) = match rel_op {
+            RelOp::Le => (coeffs, bound),
+            RelOp::Ge => (coeffs.map(|coeff| -coeff), -bound),
+            RelOp::Eq => unimplemented!(),
+        };
+        assert_eq!(coeffs.dim(), self.num_vars);
+        self.add_le_constraint_impl(coeffs, bound)
+    }
+
+    // TODO: remove_constraint
+
+    pub fn add_gomory_cut(mut self, var: usize) -> Result<Self, Error> {
+        // TODO: assert optimality
+
+        let basic_row = self.basic_vars_inv[var];
+        if basic_row == SENTINEL {
+            panic!("var {} is not basic!", var);
+        }
+
+        self.calc_row_coeffs(basic_row);
+
+        let mut cut_coeffs = SparseVec::new();
+        for (col, &coeff) in self.row_coeffs.iter() {
+            let var = self.non_basic_vars[col];
+            cut_coeffs.push(var, coeff.floor() - coeff);
+        }
+
+        let cut_bound = self.cur_bounds[basic_row].floor() - self.cur_bounds[basic_row];
+        let num_total_vars = self.num_total_vars();
+        self.add_le_constraint_impl(cut_coeffs.into_csvec(num_total_vars), cut_bound)
+    }
+
+    fn new(mut obj: Vec<f64>, constraints: Vec<(CsVec, RelOp, f64)>) -> Self {
         let enable_steepest_edge = true;
 
         let num_vars = obj.len();
@@ -224,7 +361,7 @@ impl Tableau {
         let lu_factors_transp = lu_factors.transpose();
 
         let cur_bounds = orig_bounds.clone();
-        Tableau {
+        Solution {
             num_vars,
             num_slack_vars,
             num_artificial_vars,
@@ -256,33 +393,8 @@ impl Tableau {
         }
     }
 
-    pub fn num_total_vars(&self) -> usize {
-        self.num_vars + self.num_slack_vars + self.num_artificial_vars
-    }
-
-    pub fn num_constraints(&self) -> usize {
-        self.orig_constraints.rows()
-    }
-
-    pub fn cur_obj_val(&self) -> f64 {
-        self.cur_obj_val
-    }
-
-    pub fn cur_solution(&self) -> Vec<f64> {
-        let mut values = vec![0.0; self.num_vars];
-        for (i, bv) in self.basic_vars.iter().enumerate() {
-            if *bv < self.num_vars {
-                values[*bv] = self.cur_bounds[i];
-            }
-        }
-        for (&var, &val) in self.set_vars.iter() {
-            assert_eq!(values[var], 0.0);
-            values[var] = val;
-        }
-        values
-    }
-
-    pub fn move_to_solution(mut self, solution: &[f64]) -> Result<Self, Error> {
+    #[allow(dead_code)]
+    fn move_to_solution(mut self, solution: &[f64]) -> Result<Self, Error> {
         assert_eq!(solution.len(), self.num_vars);
 
         // fill the slack variables.
@@ -344,13 +456,20 @@ impl Tableau {
         Ok(self)
     }
 
-    pub fn canonicalize(mut self) -> Result<Self, Error> {
+    fn num_constraints(&self) -> usize {
+        self.orig_constraints.rows()
+    }
+
+    fn num_total_vars(&self) -> usize {
+        self.num_vars + self.num_slack_vars + self.num_artificial_vars
+    }
+
+    fn find_initial_bfs(&mut self) -> Result<(), Error> {
         let mut cur_artificial_vars = self.num_artificial_vars;
-        trace!("TAB {:?}", self);
         for iter in 0.. {
             if iter % 100 == 0 {
                 debug!(
-                    "canonicalize iter {}: art. objective: {}, art. vars: {}, nnz: {}",
+                    "find initial BFS iter {}: art. objective: {}, art. vars: {}, nnz: {}",
                     iter,
                     self.cur_obj_val,
                     cur_artificial_vars,
@@ -359,7 +478,11 @@ impl Tableau {
             }
 
             if cur_artificial_vars == 0 {
-                debug!("canonicalized in {} iters, nnz: {}", iter + 1, self.nnz());
+                debug!(
+                    "found initial BFS in {} iters, nnz: {}",
+                    iter + 1,
+                    self.nnz()
+                );
                 break;
             }
 
@@ -415,14 +538,12 @@ impl Tableau {
             .truncate(self.non_basic_vars.len());
 
         self.recalc_cur_obj();
-
-        trace!("CANONICAL TAB {:?}", self);
-        Ok(self)
+        Ok(())
     }
 
-    pub fn optimize(mut self) -> Result<Self, Error> {
+    fn optimize(&mut self) -> Result<(), Error> {
         if self.num_artificial_vars > 0 {
-            self = self.canonicalize()?;
+            self.find_initial_bfs()?;
         }
 
         for iter in 0.. {
@@ -430,7 +551,7 @@ impl Tableau {
                 debug!(
                     "optimize iter {}: objective: {}, nnz: {}",
                     iter,
-                    self.cur_obj_val(),
+                    self.cur_obj_val,
                     self.nnz()
                 );
             }
@@ -443,7 +564,7 @@ impl Tableau {
             } else {
                 debug!(
                     "found optimum: {} in {} iterations, nnz: {}",
-                    self.cur_obj_val(),
+                    self.cur_obj_val,
                     iter + 1,
                     self.nnz(),
                 );
@@ -451,21 +572,18 @@ impl Tableau {
             }
         }
 
-        trace!("OPTIMIZED TAB {:?}", self);
-        Ok(self)
+        Ok(())
     }
 
-    pub fn restore_feasibility(mut self) -> Result<Self, Error> {
-        if self.num_artificial_vars > 0 {
-            self = self.canonicalize()?;
-        }
+    fn restore_feasibility(&mut self) -> Result<(), Error> {
+        assert_eq!(self.num_artificial_vars, 0);
 
         for iter in 0.. {
             if iter % 100 == 0 {
                 debug!(
                     "restore feasibility iter {}: objective: {}, nnz: {}",
                     iter,
-                    self.cur_obj_val(),
+                    self.cur_obj_val,
                     self.nnz(),
                 );
             }
@@ -486,72 +604,8 @@ impl Tableau {
             self.pivot(c_entering, r_pivot, pivot_coeff);
         }
 
-        Ok(self)
+        Ok(())
     }
-
-    /// Precondition: optimality
-    pub fn set_var(mut self, var: usize, val: f64) -> Result<Self, Error> {
-        assert_eq!(self.num_artificial_vars, 0);
-        assert!(self.set_vars.insert(var, val).is_none());
-
-        let basic_row = self.basic_vars.iter().position(|&v| v == var);
-        let non_basic_col = self.non_basic_vars.iter().position(|&v| v == var);
-
-        if let Some(r) = basic_row {
-            // if var was basic, remove it.
-            self.cur_bounds[r] -= val;
-            self.calc_row_coeffs(r);
-            let (c_entering, pivot_coeff) = self.choose_entering_col_dual()?;
-            self.calc_col_coeffs(c_entering);
-            self.pivot(c_entering, r, pivot_coeff);
-        } else if let Some(c) = non_basic_col {
-            self.calc_col_coeffs(c);
-            for (r, coeff) in self.col_coeffs.iter() {
-                self.cur_bounds[r] -= val * coeff;
-            }
-            self.cur_obj_val -= val * self.cur_obj[c];
-        } else {
-            panic!(
-                "couldn't find var {} in either basic or non-basic variables",
-                var
-            );
-        }
-
-        self = self.restore_feasibility()?;
-        self = self.optimize().unwrap();
-        Ok(self)
-    }
-
-    /// Precondition: optimality.
-    /// Return true if the var was really unset.
-    pub fn unset_var(mut self, var: usize) -> Result<(Self, bool), Error> {
-        if let Some(val) = self.set_vars.remove(&var) {
-            let col = self.non_basic_vars.iter().position(|&v| v == var).unwrap();
-            self.calc_col_coeffs(col);
-            for (r, coeff) in self.col_coeffs.iter() {
-                self.cur_bounds[r] += val * coeff;
-            }
-            self.cur_obj_val += val * self.cur_obj[col];
-
-            self = self.restore_feasibility()?;
-            self = self.optimize().unwrap();
-            Ok((self, true))
-        } else {
-            Ok((self, false))
-        }
-    }
-
-    pub fn add_constraint(self, coeffs: CsVec, rel_op: RelOp, bound: f64) -> Result<Self, Error> {
-        let (coeffs, bound) = match rel_op {
-            RelOp::Le => (coeffs, bound),
-            RelOp::Ge => (coeffs.map(|coeff| -coeff), -bound),
-            RelOp::Eq => unimplemented!(),
-        };
-        assert_eq!(coeffs.dim(), self.num_vars);
-        self.add_le_constraint_impl(coeffs, bound)
-    }
-
-    // TODO: remove_constraint
 
     fn add_le_constraint_impl(mut self, mut coeffs: CsVec, orig_bound: f64) -> Result<Self, Error> {
         assert_eq!(self.num_artificial_vars, 0);
@@ -597,41 +651,9 @@ impl Tableau {
             }
         }
 
-        self = self.restore_feasibility()?;
-        self = self.optimize().unwrap();
+        self.restore_feasibility()?;
+        self.optimize().unwrap();
         Ok(self)
-    }
-
-    pub fn add_gomory_cut(mut self, var: usize) -> Result<Self, Error> {
-        // TODO: assert optimality
-
-        let basic_row = self.basic_vars_inv[var];
-        if basic_row == SENTINEL {
-            panic!("var {} is not basic!", var);
-        }
-
-        self.calc_row_coeffs(basic_row);
-
-        let mut cut_coeffs = SparseVec::new();
-        for (col, &coeff) in self.row_coeffs.iter() {
-            let var = self.non_basic_vars[col];
-            cut_coeffs.push(var, coeff.floor() - coeff);
-        }
-
-        let cut_bound = self.cur_bounds[basic_row].floor() - self.cur_bounds[basic_row];
-        let num_total_vars = self.num_total_vars();
-        self.add_le_constraint_impl(cut_coeffs.into_csvec(num_total_vars), cut_bound)
-    }
-
-    pub fn print_stats(&self) {
-        info!(
-            "tableau stats: num_vars={} num_slack_vars={} num_artificial_vars={} num_constraints={}, constraints nnz={}",
-            self.num_vars,
-            self.num_slack_vars,
-            self.num_artificial_vars,
-            self.orig_constraints.rows(),
-            self.orig_constraints.nnz(),
-        );
     }
 
     fn nnz(&self) -> usize {
@@ -1267,7 +1289,7 @@ mod tests {
 
     #[test]
     fn initialize() {
-        let tab = Tableau::new(
+        let sol = Solution::new(
             vec![2.0, 1.0],
             vec![
                 (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
@@ -1276,69 +1298,33 @@ mod tests {
             ],
         );
 
-        assert_eq!(tab.num_vars, 2);
-        assert_eq!(tab.num_slack_vars, 2);
-        assert_eq!(tab.num_artificial_vars, 2);
+        assert_eq!(sol.num_vars, 2);
+        assert_eq!(sol.num_slack_vars, 2);
+        assert_eq!(sol.num_artificial_vars, 2);
 
-        assert_eq!(tab.orig_obj, vec![-2.0, -1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(sol.orig_obj, vec![-2.0, -1.0, 0.0, 0.0, 0.0, 0.0]);
 
         let orig_constraints_ref = vec![
             vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
             vec![1.0, 1.0, 0.0, -1.0, 1.0, 0.0],
             vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         ];
-        assert_matrix_eq(&tab.orig_constraints, &orig_constraints_ref);
+        assert_matrix_eq(&sol.orig_constraints, &orig_constraints_ref);
 
-        assert_eq!(tab.basic_vars, vec![2, 4, 5]);
-        assert_eq!(tab.cur_bounds, vec![4.0, 2.0, 3.0]);
+        assert_eq!(sol.basic_vars, vec![2, 4, 5]);
+        assert_eq!(sol.cur_bounds, vec![4.0, 2.0, 3.0]);
 
-        assert_eq!(tab.non_basic_vars, vec![0, 1, 3]);
-        assert_eq!(tab.cur_obj, vec![1.0, 2.0, -1.0]);
+        assert_eq!(sol.non_basic_vars, vec![0, 1, 3]);
+        assert_eq!(sol.cur_obj, vec![1.0, 2.0, -1.0]);
 
-        assert_eq!(tab.cur_obj_val, 5.0);
+        assert_eq!(sol.cur_obj_val, 5.0);
 
-        assert_eq!(tab.basic_vars, vec![2, 4, 5]);
+        assert_eq!(sol.basic_vars, vec![2, 4, 5]);
     }
 
     #[test]
-    fn canonicalize() {
-        let tab = Tableau::new(
-            vec![-3.0, -4.0],
-            vec![
-                (to_sparse(&[1.0, 0.0]), RelOp::Ge, 10.0),
-                (to_sparse(&[0.0, 1.0]), RelOp::Ge, 5.0),
-                (to_sparse(&[1.0, 1.0]), RelOp::Le, 20.0),
-                (to_sparse(&[-1.0, 4.0]), RelOp::Le, 20.0),
-            ],
-        )
-        .canonicalize()
-        .unwrap();
-
-        assert_eq!(tab.num_vars, 2);
-        assert_eq!(tab.num_slack_vars, 4);
-        assert_eq!(tab.num_artificial_vars, 0);
-
-        assert_eq!(tab.cur_bounds, vec![10.0, 5.0, 5.0, 10.0]);
-        assert_eq!(tab.non_basic_vars, vec![2, 3]);
-        assert_eq!(tab.cur_obj, vec![3.0, 4.0]);
-        assert_eq!(tab.cur_obj_val, -50.0);
-
-        assert_eq!(tab.basic_vars, vec![0, 1, 4, 5]);
-
-        let infeasible = Tableau::new(
-            vec![1.0, 1.0],
-            vec![
-                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 10.0),
-                (to_sparse(&[1.0, 1.0]), RelOp::Le, 5.0),
-            ],
-        )
-        .canonicalize();
-        assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
-    }
-
-    #[test]
-    fn optimize() {
-        let mut tab = Tableau::new(
+    fn find_initial_bfs() {
+        let mut sol = Solution::new(
             vec![-3.0, -4.0],
             vec![
                 (to_sparse(&[1.0, 0.0]), RelOp::Ge, 10.0),
@@ -1347,15 +1333,48 @@ mod tests {
                 (to_sparse(&[-1.0, 4.0]), RelOp::Le, 20.0),
             ],
         );
+        sol.find_initial_bfs().unwrap();
 
-        tab = tab.optimize().unwrap();
-        assert_eq!(tab.cur_solution(), vec![12.0, 8.0]);
-        assert_eq!(tab.cur_obj_val(), -68.0);
+        assert_eq!(sol.num_vars, 2);
+        assert_eq!(sol.num_slack_vars, 4);
+        assert_eq!(sol.num_artificial_vars, 0);
+
+        assert_eq!(sol.cur_bounds, vec![10.0, 5.0, 5.0, 10.0]);
+        assert_eq!(sol.non_basic_vars, vec![2, 3]);
+        assert_eq!(sol.cur_obj, vec![3.0, 4.0]);
+        assert_eq!(sol.cur_obj_val, -50.0);
+
+        assert_eq!(sol.basic_vars, vec![0, 1, 4, 5]);
+
+        let infeasible = Solution::new(
+            vec![1.0, 1.0],
+            vec![
+                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 10.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Le, 5.0),
+            ],
+        )
+        .find_initial_bfs();
+        assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
+    }
+
+    #[test]
+    fn optimize() {
+        let mut problem = Problem::new(&[-3.0, -4.0]);
+        problem.add_constraints(&[
+            (to_sparse(&[1.0, 0.0]), RelOp::Ge, 10.0),
+            (to_sparse(&[0.0, 1.0]), RelOp::Ge, 5.0),
+            (to_sparse(&[1.0, 1.0]), RelOp::Le, 20.0),
+            (to_sparse(&[-1.0, 4.0]), RelOp::Le, 20.0),
+        ]);
+
+        let sol = problem.solve().unwrap();
+        assert_eq!(sol.variable_values(), vec![12.0, 8.0]);
+        assert_eq!(sol.objective(), -68.0);
     }
 
     #[test]
     fn move_to_solution() {
-        let mut tab = Tableau::new(
+        let mut sol = Solution::new(
             vec![2.0, 1.0],
             vec![
                 (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
@@ -1365,122 +1384,112 @@ mod tests {
         );
 
         assert_eq!(
-            tab.clone().move_to_solution(&[0.0, 4.0]).err(),
+            sol.clone().move_to_solution(&[0.0, 4.0]).err(),
             Some(Error::Infeasible)
         );
         assert_eq!(
-            tab.clone().move_to_solution(&[0.5, 3.0]).err(),
+            sol.clone().move_to_solution(&[0.5, 3.0]).err(),
             Some(Error::Infeasible)
         );
 
-        tab = tab.move_to_solution(&[1.0, 3.0]).unwrap();
-        assert_eq!(tab.cur_obj_val(), 5.0);
+        sol = sol.move_to_solution(&[1.0, 3.0]).unwrap();
+        assert_eq!(sol.objective(), 5.0);
 
-        tab = tab.optimize().unwrap();
-        assert_eq!(tab.cur_solution(), vec![0.0, 3.0]);
-        assert_eq!(tab.cur_obj_val(), 3.0);
+        sol.optimize().unwrap();
+        assert_eq!(sol.variable_values(), vec![0.0, 3.0]);
+        assert_eq!(sol.objective(), 3.0);
     }
 
     #[test]
     fn set_unset_var() {
-        let orig_tab = Tableau::new(
-            vec![2.0, 1.0],
-            vec![
-                (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
-                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
-            ],
-        )
-        .optimize()
-        .unwrap();
+        let mut problem = Problem::new(&[2.0, 1.0]);
+        problem.add_constraints(&[
+            (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
+            (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
+        ]);
+        let orig_sol = problem.solve().unwrap();
 
         {
-            let mut tab = orig_tab.clone().set_var(0, 3.0).unwrap();
-            assert_eq!(tab.cur_solution(), vec![3.0, 0.0]);
-            assert_eq!(tab.cur_obj_val(), 6.0);
+            let mut sol = orig_sol.clone().set_var(0, 3.0).unwrap();
+            assert_eq!(sol.variable_values(), vec![3.0, 0.0]);
+            assert_eq!(sol.objective(), 6.0);
 
-            tab = tab.unset_var(0).unwrap().0;
-            assert_eq!(tab.cur_solution(), vec![0.0, 2.0]);
-            assert_eq!(tab.cur_obj_val(), 2.0);
+            sol = sol.unset_var(0).unwrap().0;
+            assert_eq!(sol.variable_values(), vec![0.0, 2.0]);
+            assert_eq!(sol.objective(), 2.0);
         }
 
         {
-            let mut tab = orig_tab.clone().set_var(1, 3.0).unwrap();
-            assert_eq!(tab.cur_solution(), vec![0.0, 3.0]);
-            assert_eq!(tab.cur_obj_val(), 3.0);
+            let mut sol = orig_sol.clone().set_var(1, 3.0).unwrap();
+            assert_eq!(sol.variable_values(), vec![0.0, 3.0]);
+            assert_eq!(sol.objective(), 3.0);
 
-            tab = tab.unset_var(1).unwrap().0;
-            assert_eq!(tab.cur_solution(), vec![0.0, 2.0]);
-            assert_eq!(tab.cur_obj_val(), 2.0);
+            sol = sol.unset_var(1).unwrap().0;
+            assert_eq!(sol.variable_values(), vec![0.0, 2.0]);
+            assert_eq!(sol.objective(), 2.0);
         }
     }
 
     #[test]
     fn add_constraint() {
-        let orig_tab = Tableau::new(
-            vec![2.0, 1.0],
-            vec![
-                (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
-                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
-            ],
-        )
-        .optimize()
-        .unwrap();
+        let mut problem = Problem::new(&[2.0, 1.0]);
+        problem.add_constraints(&[
+            (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
+            (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
+        ]);
+        let orig_sol = problem.solve().unwrap();
 
         {
-            let tab = orig_tab
+            let sol = orig_sol
                 .clone()
                 .add_constraint(to_sparse(&[-1.0, 1.0]), RelOp::Le, 0.0)
                 .unwrap();
-            assert_eq!(tab.cur_solution(), [1.0, 1.0]);
-            assert_eq!(tab.cur_obj_val(), 3.0);
+            assert_eq!(sol.variable_values(), [1.0, 1.0]);
+            assert_eq!(sol.objective(), 3.0);
         }
 
         {
-            let tab = orig_tab
+            let sol = orig_sol
                 .clone()
                 .set_var(1, 1.5)
                 .unwrap()
                 .add_constraint(to_sparse(&[-1.0, 1.0]), RelOp::Le, 0.0)
                 .unwrap();
-            assert_eq!(tab.cur_solution(), [1.5, 1.5]);
-            assert_eq!(tab.cur_obj_val(), 4.5);
+            assert_eq!(sol.variable_values(), [1.5, 1.5]);
+            assert_eq!(sol.objective(), 4.5);
         }
 
         {
-            let tab = orig_tab
+            let sol = orig_sol
                 .clone()
                 .add_constraint(to_sparse(&[-1.0, 1.0]), RelOp::Ge, 3.0)
                 .unwrap();
-            assert_eq!(tab.cur_solution(), [0.0, 3.0]);
-            assert_eq!(tab.cur_obj_val(), 3.0);
+            assert_eq!(sol.variable_values(), [0.0, 3.0]);
+            assert_eq!(sol.objective(), 3.0);
         }
     }
 
     #[test]
     fn gomory_cut() {
-        let mut tab = Tableau::new(
-            vec![0.0, -1.0],
-            vec![
-                (to_sparse(&[3.0, 2.0]), RelOp::Le, 6.0),
-                (to_sparse(&[-3.0, 2.0]), RelOp::Le, 0.0),
-            ],
-        )
-        .optimize()
-        .unwrap();
+        let mut problem = Problem::new(&[0.0, -1.0]);
+        problem.add_constraints(&[
+            (to_sparse(&[3.0, 2.0]), RelOp::Le, 6.0),
+            (to_sparse(&[-3.0, 2.0]), RelOp::Le, 0.0),
+        ]);
+        let mut sol = problem.solve().unwrap();
+        assert_eq!(sol.variable_values(), [1.0, 1.5]);
+        assert_eq!(sol.objective(), -1.5);
 
-        assert_eq!(tab.cur_solution(), [1.0, 1.5]);
-        assert_eq!(tab.cur_obj_val(), -1.5);
-
-        tab = tab.add_gomory_cut(1).unwrap();
-        let solution = tab.cur_solution();
+        sol = sol.add_gomory_cut(1).unwrap();
+        let solution = sol.variable_values();
         assert!(f64::abs(solution[0] - 2.0 / 3.0) < 1e-8);
         assert_eq!(solution[1], 1.0);
-        assert_eq!(tab.cur_obj_val(), -1.0);
+        assert_eq!(sol.objective(), -1.0);
 
-        tab = tab.add_gomory_cut(0).unwrap();
-        let solution = tab.cur_solution();
+        sol = sol.add_gomory_cut(0).unwrap();
+        let solution = sol.variable_values();
         assert!(f64::abs(solution[0] - 1.0) < 1e-8);
         assert_eq!(solution[1], 1.0);
-        assert_eq!(tab.cur_obj_val(), -1.0);
+        assert_eq!(sol.objective(), -1.0);
     }
 }
