@@ -12,9 +12,14 @@ use sparse::{ScatteredVec, SparseMat, SparseVec};
 mod helpers;
 use helpers::{resized_view, to_dense};
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Variable(usize);
+
+impl Variable {
+    pub fn idx(&self) -> usize {
+        self.0
+    }
+}
 
 pub struct LinearExpr {
     vars: Vec<usize>,
@@ -51,12 +56,12 @@ impl<'a> From<&'a (Variable, f64)> for LinearTerm {
 
 impl<I: IntoIterator<Item = impl Into<LinearTerm>>> From<I> for LinearExpr {
     fn from(iter: I) -> Self {
-        let mut coeffs = LinearExpr::empty();
+        let mut expr = LinearExpr::empty();
         for term in iter {
             let LinearTerm(var, coeff) = term.into();
-            coeffs.add(var, coeff);
+            expr.add(var, coeff);
         }
-        coeffs
+        expr
     }
 }
 
@@ -92,10 +97,10 @@ impl Problem {
         var
     }
 
-    pub fn add_constraint(&mut self, coeffs: impl Into<LinearExpr>, rel_op: RelOp, bound: f64) {
-        let coeffs = coeffs.into();
+    pub fn add_constraint(&mut self, expr: impl Into<LinearExpr>, rel_op: RelOp, bound: f64) {
+        let expr = expr.into();
         self.constraints.push((
-            CsVec::new(self.obj.len(), coeffs.vars, coeffs.coeffs),
+            CsVec::new(self.obj.len(), expr.vars, expr.coeffs),
             rel_op,
             bound,
         ));
@@ -202,12 +207,12 @@ impl Solution {
         values
     }
 
-    pub fn set_var(mut self, var: usize, val: f64) -> Result<Self, Error> {
+    pub fn set_var(mut self, var: Variable, val: f64) -> Result<Self, Error> {
         assert_eq!(self.num_artificial_vars, 0);
-        assert!(self.set_vars.insert(var, val).is_none());
+        assert!(self.set_vars.insert(var.idx(), val).is_none());
 
-        let basic_row = self.basic_vars.iter().position(|&v| v == var);
-        let non_basic_col = self.non_basic_vars.iter().position(|&v| v == var);
+        let basic_row = self.basic_vars.iter().position(|&v| v == var.idx());
+        let non_basic_col = self.non_basic_vars.iter().position(|&v| v == var.idx());
 
         if let Some(r) = basic_row {
             // if var was basic, remove it.
@@ -224,7 +229,7 @@ impl Solution {
             self.cur_obj_val -= val * self.cur_obj[c];
         } else {
             panic!(
-                "couldn't find var {} in either basic or non-basic variables",
+                "couldn't find var {:?} in either basic or non-basic variables",
                 var
             );
         }
@@ -235,9 +240,13 @@ impl Solution {
     }
 
     /// Return true if the var was really unset.
-    pub fn unset_var(mut self, var: usize) -> Result<(Self, bool), Error> {
-        if let Some(val) = self.set_vars.remove(&var) {
-            let col = self.non_basic_vars.iter().position(|&v| v == var).unwrap();
+    pub fn unset_var(mut self, var: Variable) -> Result<(Self, bool), Error> {
+        if let Some(val) = self.set_vars.remove(&var.idx()) {
+            let col = self
+                .non_basic_vars
+                .iter()
+                .position(|&v| v == var.idx())
+                .unwrap();
             self.calc_col_coeffs(col);
             for (r, coeff) in self.col_coeffs.iter() {
                 self.cur_bounds[r] += val * coeff;
@@ -252,22 +261,33 @@ impl Solution {
         }
     }
 
-    pub fn add_constraint(self, coeffs: CsVec, rel_op: RelOp, bound: f64) -> Result<Self, Error> {
+    pub fn add_constraint(
+        self,
+        expr: impl Into<LinearExpr>,
+        rel_op: RelOp,
+        bound: f64,
+    ) -> Result<Self, Error> {
+        let LinearExpr { vars, mut coeffs } = expr.into();
         let (coeffs, bound) = match rel_op {
             RelOp::Le => (coeffs, bound),
-            RelOp::Ge => (coeffs.map(|coeff| -coeff), -bound),
+            RelOp::Ge => {
+                for c in &mut coeffs {
+                    *c = -*c;
+                }
+                (coeffs, -bound)
+            }
             RelOp::Eq => unimplemented!(),
         };
-        assert_eq!(coeffs.dim(), self.num_vars);
-        self.add_le_constraint_impl(coeffs, bound)
+        let coeffs_csvec = CsVec::new(self.num_vars, vars, coeffs);
+        self.add_le_constraint_impl(coeffs_csvec, bound)
     }
 
     // TODO: remove_constraint
 
-    pub fn add_gomory_cut(mut self, var: usize) -> Result<Self, Error> {
-        let basic_row = self.basic_vars_inv[var];
+    pub fn add_gomory_cut(mut self, var: Variable) -> Result<Self, Error> {
+        let basic_row = self.basic_vars_inv[var.idx()];
         if basic_row == SENTINEL {
-            panic!("var {} is not basic!", var);
+            panic!("var {:?} is not basic!", var);
         }
 
         self.calc_row_coeffs(basic_row);
@@ -1461,21 +1481,21 @@ mod tests {
         let orig_sol = problem.solve().unwrap();
 
         {
-            let mut sol = orig_sol.clone().set_var(0, 3.0).unwrap();
+            let mut sol = orig_sol.clone().set_var(v1, 3.0).unwrap();
             assert_eq!(sol.variable_values(), vec![3.0, 0.0]);
             assert_eq!(sol.objective(), 6.0);
 
-            sol = sol.unset_var(0).unwrap().0;
+            sol = sol.unset_var(v1).unwrap().0;
             assert_eq!(sol.variable_values(), vec![0.0, 2.0]);
             assert_eq!(sol.objective(), 2.0);
         }
 
         {
-            let mut sol = orig_sol.clone().set_var(1, 3.0).unwrap();
+            let mut sol = orig_sol.clone().set_var(v2, 3.0).unwrap();
             assert_eq!(sol.variable_values(), vec![0.0, 3.0]);
             assert_eq!(sol.objective(), 3.0);
 
-            sol = sol.unset_var(1).unwrap().0;
+            sol = sol.unset_var(v2).unwrap().0;
             assert_eq!(sol.variable_values(), vec![0.0, 2.0]);
             assert_eq!(sol.objective(), 2.0);
         }
@@ -1494,7 +1514,7 @@ mod tests {
         {
             let sol = orig_sol
                 .clone()
-                .add_constraint(to_sparse(&[-1.0, 1.0]), RelOp::Le, 0.0)
+                .add_constraint(&[(v1, -1.0), (v2, 1.0)], RelOp::Le, 0.0)
                 .unwrap();
             assert_eq!(sol.variable_values(), [1.0, 1.0]);
             assert_eq!(sol.objective(), 3.0);
@@ -1503,9 +1523,9 @@ mod tests {
         {
             let sol = orig_sol
                 .clone()
-                .set_var(1, 1.5)
+                .set_var(v2, 1.5)
                 .unwrap()
-                .add_constraint(to_sparse(&[-1.0, 1.0]), RelOp::Le, 0.0)
+                .add_constraint(&[(v1, -1.0), (v2, 1.0)], RelOp::Le, 0.0)
                 .unwrap();
             assert_eq!(sol.variable_values(), [1.5, 1.5]);
             assert_eq!(sol.objective(), 4.5);
@@ -1514,7 +1534,7 @@ mod tests {
         {
             let sol = orig_sol
                 .clone()
-                .add_constraint(to_sparse(&[-1.0, 1.0]), RelOp::Ge, 3.0)
+                .add_constraint(&[(v1, -1.0), (v2, 1.0)], RelOp::Ge, 3.0)
                 .unwrap();
             assert_eq!(sol.variable_values(), [0.0, 3.0]);
             assert_eq!(sol.objective(), 3.0);
@@ -1533,13 +1553,13 @@ mod tests {
         assert_eq!(sol.variable_values(), [1.0, 1.5]);
         assert_eq!(sol.objective(), -1.5);
 
-        sol = sol.add_gomory_cut(1).unwrap();
+        sol = sol.add_gomory_cut(v2).unwrap();
         let solution = sol.variable_values();
         assert!(f64::abs(solution[0] - 2.0 / 3.0) < 1e-8);
         assert_eq!(solution[1], 1.0);
         assert_eq!(sol.objective(), -1.0);
 
-        sol = sol.add_gomory_cut(0).unwrap();
+        sol = sol.add_gomory_cut(v1).unwrap();
         let solution = sol.variable_values();
         assert!(f64::abs(solution[0] - 1.0) < 1e-8);
         assert_eq!(solution[1], 1.0);
