@@ -20,6 +20,7 @@ pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     Perm { orig2new, new2orig }
 }
 
+#[allow(dead_code)]
 pub fn order_colamd<'a>(
     size: usize,
     get_col: impl Fn(usize) -> &'a [usize],
@@ -460,6 +461,7 @@ impl ColsQueue {
 
 const SENTINEL: usize = 0usize.wrapping_sub(1);
 
+#[allow(dead_code)]
 pub fn find_diag_matching<'a>(
     size: usize,
     get_col: impl Fn(usize) -> &'a [usize],
@@ -547,6 +549,7 @@ pub struct BlockDiagForm {
     pub block_cols: Vec<Vec<usize>>,
 }
 
+#[allow(dead_code)]
 pub fn find_block_diag_form<'a>(
     size: usize,
     get_col: impl Fn(usize) -> &'a [usize],
