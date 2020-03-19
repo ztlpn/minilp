@@ -6,22 +6,61 @@ use lu::{lu_factorize, LUFactors, ScratchSpace};
 
 pub mod ordering;
 
-pub type CsVec = sprs::CsVecI<f64, usize>;
-type CsMat = sprs::CsMatI<f64, usize>;
-type ArrayVec = ndarray::Array1<f64>;
-
-use sprs::CompressedStorage;
-use std::collections::{BTreeSet, HashMap};
-
 mod sparse;
 use sparse::{ScatteredVec, SparseMat, SparseVec};
 
 mod helpers;
 use helpers::{resized_view, to_dense};
 
-const SENTINEL: usize = 0usize.wrapping_sub(1);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Variable(usize);
+
+pub struct LinearExpr {
+    vars: Vec<usize>,
+    coeffs: Vec<f64>,
+}
+
+impl LinearExpr {
+    pub fn empty() -> Self {
+        Self {
+            vars: vec![],
+            coeffs: vec![],
+        }
+    }
+
+    pub fn add(&mut self, var: Variable, coeff: f64) {
+        self.vars.push(var.0);
+        self.coeffs.push(coeff);
+    }
+}
+
+pub struct LinearTerm(Variable, f64);
+
+impl From<(Variable, f64)> for LinearTerm {
+    fn from(term: (Variable, f64)) -> Self {
+        LinearTerm(term.0, term.1)
+    }
+}
+
+impl<'a> From<&'a (Variable, f64)> for LinearTerm {
+    fn from(term: &'a (Variable, f64)) -> Self {
+        LinearTerm(term.0, term.1)
+    }
+}
+
+impl<I: IntoIterator<Item = impl Into<LinearTerm>>> From<I> for LinearExpr {
+    fn from(iter: I) -> Self {
+        let mut coeffs = LinearExpr::empty();
+        for term in iter {
+            let LinearTerm(var, coeff) = term.into();
+            coeffs.add(var, coeff);
+        }
+        coeffs
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum RelOp {
     Eq,
     Le,
@@ -40,19 +79,26 @@ pub struct Problem {
 }
 
 impl Problem {
-    pub fn new(obj: &[f64]) -> Self {
+    pub fn new() -> Self {
         Problem {
-            obj: obj.to_vec(),
+            obj: vec![],
             constraints: vec![],
         }
     }
 
-    pub fn add_constraint(&mut self, coeffs: CsVec, rel_op: RelOp, bound: f64) {
-        self.constraints.push((coeffs, rel_op, bound));
+    pub fn add_var(&mut self, obj_coeff: f64) -> Variable {
+        let var = Variable(self.obj.len());
+        self.obj.push(obj_coeff);
+        var
     }
 
-    pub fn add_constraints(&mut self, constraints: &[(CsVec, RelOp, f64)]) {
-        self.constraints.extend_from_slice(constraints);
+    pub fn add_constraint(&mut self, coeffs: impl Into<LinearExpr>, rel_op: RelOp, bound: f64) {
+        let coeffs = coeffs.into();
+        self.constraints.push((
+            CsVec::new(self.obj.len(), coeffs.vars, coeffs.coeffs),
+            rel_op,
+            bound,
+        ));
     }
 
     pub fn solve(&self) -> Result<Solution, Error> {
@@ -69,6 +115,15 @@ impl Problem {
         Ok(sol)
     }
 }
+
+use sprs::CompressedStorage;
+use std::collections::{BTreeSet, HashMap};
+
+type CsVec = sprs::CsVecI<f64, usize>;
+type CsMat = sprs::CsMatI<f64, usize>;
+type ArrayVec = ndarray::Array1<f64>;
+
+const SENTINEL: usize = 0usize.wrapping_sub(1);
 
 #[derive(Clone)]
 pub struct Solution {
@@ -210,8 +265,6 @@ impl Solution {
     // TODO: remove_constraint
 
     pub fn add_gomory_cut(mut self, var: usize) -> Result<Self, Error> {
-        // TODO: assert optimality
-
         let basic_row = self.basic_vars_inv[var];
         if basic_row == SENTINEL {
             panic!("var {} is not basic!", var);
@@ -271,7 +324,6 @@ impl Solution {
         for (mut coeffs, rel_op, bound) in constraints.into_iter() {
             let basic_idx = match rel_op {
                 RelOp::Le => {
-                    assert_eq!(coeffs.dim(), num_vars);
                     assert!(bound >= 0.0);
                     let basic_idx = cur_slack_var;
                     cur_slack_var += 1;
@@ -279,7 +331,6 @@ impl Solution {
                 }
 
                 RelOp::Eq => {
-                    assert_eq!(coeffs.dim(), num_vars);
                     assert!(bound >= 0.0);
                     artificial_obj_val += bound;
                     artificial_multipliers.append(basic_vars.len(), 1.0);
@@ -289,7 +340,6 @@ impl Solution {
                 }
 
                 RelOp::Ge => {
-                    assert_eq!(coeffs.dim(), num_vars);
                     assert!(bound >= 0.0);
 
                     coeffs = into_resized(coeffs, num_total_vars);
@@ -1359,13 +1409,13 @@ mod tests {
 
     #[test]
     fn optimize() {
-        let mut problem = Problem::new(&[-3.0, -4.0]);
-        problem.add_constraints(&[
-            (to_sparse(&[1.0, 0.0]), RelOp::Ge, 10.0),
-            (to_sparse(&[0.0, 1.0]), RelOp::Ge, 5.0),
-            (to_sparse(&[1.0, 1.0]), RelOp::Le, 20.0),
-            (to_sparse(&[-1.0, 4.0]), RelOp::Le, 20.0),
-        ]);
+        let mut problem = Problem::new();
+        let v1 = problem.add_var(-3.0);
+        let v2 = problem.add_var(-4.0);
+        problem.add_constraint(&[(v1, 1.0)], RelOp::Ge, 10.0);
+        problem.add_constraint(&[(v2, 1.0)], RelOp::Ge, 5.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 20.0);
+        problem.add_constraint(&[(v2, 4.0), (v1, -1.0)], RelOp::Le, 20.0);
 
         let sol = problem.solve().unwrap();
         assert_eq!(sol.variable_values(), vec![12.0, 8.0]);
@@ -1402,11 +1452,12 @@ mod tests {
 
     #[test]
     fn set_unset_var() {
-        let mut problem = Problem::new(&[2.0, 1.0]);
-        problem.add_constraints(&[
-            (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
-            (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
-        ]);
+        let mut problem = Problem::new();
+        let v1 = problem.add_var(2.0);
+        let v2 = problem.add_var(1.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 4.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Ge, 2.0);
+
         let orig_sol = problem.solve().unwrap();
 
         {
@@ -1432,11 +1483,12 @@ mod tests {
 
     #[test]
     fn add_constraint() {
-        let mut problem = Problem::new(&[2.0, 1.0]);
-        problem.add_constraints(&[
-            (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
-            (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
-        ]);
+        let mut problem = Problem::new();
+        let v1 = problem.add_var(2.0);
+        let v2 = problem.add_var(1.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 4.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Ge, 2.0);
+
         let orig_sol = problem.solve().unwrap();
 
         {
@@ -1471,11 +1523,12 @@ mod tests {
 
     #[test]
     fn gomory_cut() {
-        let mut problem = Problem::new(&[0.0, -1.0]);
-        problem.add_constraints(&[
-            (to_sparse(&[3.0, 2.0]), RelOp::Le, 6.0),
-            (to_sparse(&[-3.0, 2.0]), RelOp::Le, 0.0),
-        ]);
+        let mut problem = Problem::new();
+        let v1 = problem.add_var(0.0);
+        let v2 = problem.add_var(-1.0);
+        problem.add_constraint(&[(v1, 3.0), (v2, 2.0)], RelOp::Le, 6.0);
+        problem.add_constraint(&[(v1, -3.0), (v2, 2.0)], RelOp::Le, 0.0);
+
         let mut sol = problem.solve().unwrap();
         assert_eq!(sol.variable_values(), [1.0, 1.5]);
         assert_eq!(sol.objective(), -1.5);
