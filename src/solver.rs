@@ -243,18 +243,17 @@ impl Solver {
         res
     }
 
-    pub(crate) fn variable_values(&self) -> Vec<f64> {
-        let mut values = vec![0.0; self.num_vars];
-        for (i, bv) in self.basic_vars.iter().enumerate() {
-            if *bv < self.num_vars {
-                values[*bv] = self.cur_bounds[i];
-            }
+    pub(crate) fn get_value(&self, var: usize) -> &f64 {
+        if let Some(val) = self.set_vars.get(&var) {
+            return val;
         }
-        for (&var, &val) in self.set_vars.iter() {
-            assert_eq!(values[var], 0.0);
-            values[var] = val;
+
+        let basic_idx = self.basic_vars_inv[var];
+        if basic_idx == SENTINEL {
+            &0.0
+        } else {
+            &self.cur_bounds[basic_idx]
         }
-        values
     }
 
     pub(crate) fn set_var(&mut self, var: usize, val: f64) -> Result<(), Error> {
@@ -1318,7 +1317,8 @@ mod tests {
         assert_eq!(sol.cur_obj_val, 5.0);
 
         sol.optimize().unwrap();
-        assert_eq!(sol.variable_values(), vec![0.0, 3.0]);
+        assert_eq!(*sol.get_value(0), 0.0);
+        assert_eq!(*sol.get_value(1), 3.0);
         assert_eq!(sol.cur_obj_val, 3.0);
     }
 }

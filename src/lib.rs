@@ -1,11 +1,11 @@
 #[macro_use]
 extern crate log;
 
-mod solver;
+mod helpers;
 mod lu;
 mod ordering;
+mod solver;
 mod sparse;
-mod helpers;
 
 use solver::Solver;
 
@@ -126,8 +126,12 @@ impl Solution {
         self.solver.cur_obj_val
     }
 
-    pub fn variable_values(&self) -> Vec<f64> {
-        self.solver.variable_values()
+    pub fn get(&self, var: Variable) -> &f64 {
+        self.solver.get_value(var.idx())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Variable, &f64)> {
+        (0..self.num_vars).map(move |idx| (Variable(idx), self.solver.get_value(idx)))
     }
 
     pub fn set_var(mut self, var: Variable, val: f64) -> Result<Self, Error> {
@@ -174,6 +178,14 @@ impl Solution {
     }
 }
 
+impl std::ops::Index<Variable> for Solution {
+    type Output = f64;
+
+    fn index(&self, var: Variable) -> &Self::Output {
+        self.get(var)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,7 +201,8 @@ mod tests {
         problem.add_constraint(&[(v2, 4.0), (v1, -1.0)], RelOp::Le, 20.0);
 
         let sol = problem.solve().unwrap();
-        assert_eq!(sol.variable_values(), vec![12.0, 8.0]);
+        assert_eq!(sol[v1], 12.0);
+        assert_eq!(sol[v2], 8.0);
         assert_eq!(sol.objective(), -68.0);
     }
 
@@ -205,21 +218,25 @@ mod tests {
 
         {
             let mut sol = orig_sol.clone().set_var(v1, 3.0).unwrap();
-            assert_eq!(sol.variable_values(), vec![3.0, 0.0]);
+            assert_eq!(sol[v1], 3.0);
+            assert_eq!(sol[v2], 0.0);
             assert_eq!(sol.objective(), 6.0);
 
             sol = sol.unset_var(v1).unwrap().0;
-            assert_eq!(sol.variable_values(), vec![0.0, 2.0]);
+            assert_eq!(sol[v1], 0.0);
+            assert_eq!(sol[v2], 2.0);
             assert_eq!(sol.objective(), 2.0);
         }
 
         {
             let mut sol = orig_sol.clone().set_var(v2, 3.0).unwrap();
-            assert_eq!(sol.variable_values(), vec![0.0, 3.0]);
+            assert_eq!(sol[v1], 0.0);
+            assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 3.0);
 
             sol = sol.unset_var(v2).unwrap().0;
-            assert_eq!(sol.variable_values(), vec![0.0, 2.0]);
+            assert_eq!(sol[v1], 0.0);
+            assert_eq!(sol[v2], 2.0);
             assert_eq!(sol.objective(), 2.0);
         }
     }
@@ -239,7 +256,9 @@ mod tests {
                 .clone()
                 .add_constraint(&[(v1, -1.0), (v2, 1.0)], RelOp::Le, 0.0)
                 .unwrap();
-            assert_eq!(sol.variable_values(), [1.0, 1.0]);
+
+            assert_eq!(sol[v1], 1.0);
+            assert_eq!(sol[v2], 1.0);
             assert_eq!(sol.objective(), 3.0);
         }
 
@@ -250,7 +269,8 @@ mod tests {
                 .unwrap()
                 .add_constraint(&[(v1, -1.0), (v2, 1.0)], RelOp::Le, 0.0)
                 .unwrap();
-            assert_eq!(sol.variable_values(), [1.5, 1.5]);
+            assert_eq!(sol[v1], 1.5);
+            assert_eq!(sol[v2], 1.5);
             assert_eq!(sol.objective(), 4.5);
         }
 
@@ -259,7 +279,9 @@ mod tests {
                 .clone()
                 .add_constraint(&[(v1, -1.0), (v2, 1.0)], RelOp::Ge, 3.0)
                 .unwrap();
-            assert_eq!(sol.variable_values(), [0.0, 3.0]);
+
+            assert_eq!(sol[v1], 0.0);
+            assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 3.0);
         }
     }
@@ -273,19 +295,18 @@ mod tests {
         problem.add_constraint(&[(v1, -3.0), (v2, 2.0)], RelOp::Le, 0.0);
 
         let mut sol = problem.solve().unwrap();
-        assert_eq!(sol.variable_values(), [1.0, 1.5]);
+        assert_eq!(sol[v1], 1.0);
+        assert_eq!(sol[v2], 1.5);
         assert_eq!(sol.objective(), -1.5);
 
         sol = sol.add_gomory_cut(v2).unwrap();
-        let solution = sol.variable_values();
-        assert!(f64::abs(solution[0] - 2.0 / 3.0) < 1e-8);
-        assert_eq!(solution[1], 1.0);
+        assert!(f64::abs(sol[v1] - 2.0 / 3.0) < 1e-8);
+        assert_eq!(sol[v2], 1.0);
         assert_eq!(sol.objective(), -1.0);
 
         sol = sol.add_gomory_cut(v1).unwrap();
-        let solution = sol.variable_values();
-        assert!(f64::abs(solution[0] - 1.0) < 1e-8);
-        assert_eq!(solution[1], 1.0);
+        assert!(f64::abs(sol[v1] - 1.0) < 1e-8);
+        assert_eq!(sol[v2], 1.0);
         assert_eq!(sol.objective(), -1.0);
     }
 }
