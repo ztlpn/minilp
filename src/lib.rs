@@ -18,6 +18,7 @@ impl Variable {
     }
 }
 
+#[derive(Clone)]
 pub struct LinearExpr {
     vars: Vec<usize>,
     coeffs: Vec<f64>,
@@ -97,6 +98,7 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[derive(Clone)]
 pub struct Problem {
     obj: Vec<f64>,
     constraints: Vec<(CsVec, RelOp, f64)>,
@@ -128,7 +130,7 @@ impl Problem {
     }
 
     pub fn solve(&self) -> Result<Solution, Error> {
-        let mut solver = Solver::new(self.obj.clone(), self.constraints.clone());
+        let mut solver = Solver::try_new(&self.obj, &self.constraints)?;
         solver.optimize()?;
         Ok(Solution {
             num_vars: self.obj.len(),
@@ -179,19 +181,12 @@ impl Solution {
         rel_op: RelOp,
         bound: f64,
     ) -> Result<Self, Error> {
-        let LinearExpr { vars, mut coeffs } = expr.into();
-        let (coeffs, bound) = match rel_op {
-            RelOp::Le => (coeffs, bound),
-            RelOp::Ge => {
-                for c in &mut coeffs {
-                    *c = -*c;
-                }
-                (coeffs, -bound)
-            }
-            RelOp::Eq => unimplemented!(),
-        };
-        let coeffs_csvec = CsVec::new(self.solver.num_vars, vars, coeffs);
-        self.solver.add_le_constraint(coeffs_csvec, bound)?;
+        let expr = expr.into();
+        self.solver.add_constraint(
+            CsVec::new(self.num_vars, expr.vars, expr.coeffs),
+            rel_op,
+            bound,
+        )?;
         Ok(self)
     }
 
@@ -250,14 +245,58 @@ mod tests {
         let v1 = problem.add_var(-3.0);
         let v2 = problem.add_var(-4.0);
         problem.add_constraint(&[(v1, 1.0)], RelOp::Ge, 10.0);
-        problem.add_constraint(&[(v2, 1.0)], RelOp::Ge, 5.0);
+        problem.add_constraint(&[(v2, -1.0)], RelOp::Le, -5.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 20.0);
-        problem.add_constraint(&[(v2, 4.0), (v1, -1.0)], RelOp::Le, 20.0);
+        problem.add_constraint(&[(v2, -4.0), (v1, 1.0)], RelOp::Ge, -20.0);
 
         let sol = problem.solve().unwrap();
         assert_eq!(sol[v1], 12.0);
         assert_eq!(sol[v2], 8.0);
         assert_eq!(sol.objective(), -68.0);
+    }
+
+    #[test]
+    fn empty_expr_constraints() {
+        let trivial = [
+            (LinearExpr::empty(), RelOp::Eq, 0.0),
+            (LinearExpr::empty(), RelOp::Ge, -1.0),
+            (LinearExpr::empty(), RelOp::Le, 1.0),
+        ];
+
+        let mut problem = Problem::new();
+        let _ = problem.add_var(1.0);
+        for (expr, op, b) in trivial.iter().cloned() {
+            problem.add_constraint(expr, op, b);
+        }
+        assert_eq!(problem.solve().map(|s| s.objective()), Ok(0.0));
+
+        {
+            let mut sol = problem.solve().unwrap();
+            for (expr, op, b) in trivial.iter().cloned() {
+                sol = sol.add_constraint(expr, op, b).unwrap();
+            }
+            assert_eq!(sol.objective(), 0.0);
+        }
+
+        let infeasible = [
+            (LinearExpr::empty(), RelOp::Eq, 12.0),
+            (LinearExpr::empty(), RelOp::Ge, 34.0),
+            (LinearExpr::empty(), RelOp::Le, -56.0),
+        ];
+
+        for (expr, op, b) in infeasible.iter().cloned() {
+            let mut cloned = problem.clone();
+            cloned.add_constraint(expr, op, b);
+            assert_eq!(cloned.solve().map(|_| "solved"), Err(Error::Infeasible));
+        }
+
+        for (expr, op, b) in infeasible.iter().cloned() {
+            let sol = problem.solve().unwrap().add_constraint(expr, op, b);
+            assert_eq!(sol.map(|_| "solved"), Err(Error::Infeasible));
+        }
+
+        let _ = problem.add_var(-1.0);
+        assert_eq!(problem.solve().map(|_| "solved"), Err(Error::Unbounded));
     }
 
     #[test]

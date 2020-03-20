@@ -72,10 +72,43 @@ impl std::fmt::Debug for Solver {
 }
 
 impl Solver {
-    pub(crate) fn new(mut obj: Vec<f64>, constraints: Vec<(CsVec, RelOp, f64)>) -> Self {
+    pub(crate) fn try_new(
+        orig_obj: &[f64],
+        orig_constraints: &[(CsVec, RelOp, f64)],
+    ) -> Result<Self, Error> {
         let enable_steepest_edge = true;
 
-        let num_vars = obj.len();
+        let mut constraints = vec![];
+        for (coeffs, rel_op, bound) in orig_constraints {
+            if coeffs.indices().is_empty() {
+                let is_tautological = match rel_op {
+                    RelOp::Eq => 0.0 == *bound,
+                    RelOp::Le => 0.0 <= *bound,
+                    RelOp::Ge => 0.0 >= *bound,
+                };
+
+                if is_tautological {
+                    continue;
+                } else {
+                    return Err(Error::Infeasible);
+                }
+            }
+
+            let constr = if *bound < 0.0 {
+                match rel_op {
+                    RelOp::Eq => (coeffs.clone(), *rel_op, *bound),
+                    RelOp::Ge => (coeffs.map(|x| -x), RelOp::Le, -bound),
+                    RelOp::Le => (coeffs.map(|x| -x), RelOp::Ge, -bound),
+                }
+            } else {
+                (coeffs.clone(), *rel_op, *bound)
+            };
+
+            constraints.push(constr);
+        }
+
+        let num_vars = orig_obj.len();
+
         let (num_slack_vars, num_artificial_vars) = {
             let mut s = 0;
             let mut a = 0;
@@ -94,9 +127,7 @@ impl Solver {
         let num_total_vars = num_vars + num_slack_vars + num_artificial_vars;
         let num_constraints = constraints.len();
 
-        for val in &mut obj {
-            *val *= -1.0;
-        }
+        let mut obj = orig_obj.iter().map(|c| -c).collect::<Vec<_>>();
         obj.extend(std::iter::repeat(0.0).take(num_slack_vars + num_artificial_vars));
 
         let mut cur_slack_var = 0;
@@ -120,7 +151,6 @@ impl Solver {
                 }
 
                 RelOp::Eq => {
-                    assert!(bound >= 0.0);
                     artificial_obj_val += bound;
                     artificial_multipliers.append(basic_vars.len(), 1.0);
                     let basic_idx = num_slack_vars + cur_artificial_var;
@@ -240,7 +270,7 @@ impl Solver {
             res.orig_constraints.nnz(),
         );
 
-        res
+        Ok(res)
     }
 
     pub(crate) fn get_value(&self, var: usize) -> &f64 {
@@ -322,7 +352,7 @@ impl Solver {
 
         let cut_bound = self.cur_bounds[basic_row].floor() - self.cur_bounds[basic_row];
         let num_total_vars = self.num_total_vars();
-        self.add_le_constraint(cut_coeffs.into_csvec(num_total_vars), cut_bound)
+        self.add_constraint(cut_coeffs.into_csvec(num_total_vars), RelOp::Le, cut_bound)
     }
 
     #[allow(dead_code)]
@@ -539,11 +569,35 @@ impl Solver {
         Ok(())
     }
 
-    pub(crate) fn add_le_constraint(
+    pub(crate) fn add_constraint(
         &mut self,
         mut coeffs: CsVec,
-        orig_bound: f64,
+        rel_op: RelOp,
+        mut bound: f64,
     ) -> Result<(), Error> {
+        if coeffs.indices().is_empty() {
+            let is_tautological = match rel_op {
+                RelOp::Eq => 0.0 == bound,
+                RelOp::Le => 0.0 <= bound,
+                RelOp::Ge => 0.0 >= bound,
+            };
+
+            if is_tautological {
+                return Ok(());
+            } else {
+                return Err(Error::Infeasible);
+            }
+        }
+
+        match rel_op {
+            RelOp::Eq => unimplemented!(),
+            RelOp::Le => {}
+            RelOp::Ge => {
+                coeffs.map_inplace(|x| -x);
+                bound = -bound;
+            }
+        }
+
         assert_eq!(self.num_artificial_vars, 0);
         // TODO: assert optimality.
 
@@ -564,7 +618,7 @@ impl Solver {
         coeffs.append(slack_var, 1.0);
         new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
 
-        self.orig_bounds.push(orig_bound);
+        self.orig_bounds.push(bound);
 
         self.basic_vars_inv.push(self.basic_vars.len());
         self.basic_vars.push(slack_var);
@@ -1225,14 +1279,15 @@ mod tests {
 
     #[test]
     fn initialize() {
-        let sol = Solver::new(
-            vec![2.0, 1.0],
-            vec![
+        let sol = Solver::try_new(
+            &[2.0, 1.0],
+            &[
                 (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
                 (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
                 (to_sparse(&[0.0, 1.0]), RelOp::Eq, 3.0),
             ],
-        );
+        )
+        .unwrap();
 
         assert_eq!(sol.num_vars, 2);
         assert_eq!(sol.num_slack_vars, 2);
@@ -1260,15 +1315,16 @@ mod tests {
 
     #[test]
     fn find_initial_bfs() {
-        let mut sol = Solver::new(
-            vec![-3.0, -4.0],
-            vec![
+        let mut sol = Solver::try_new(
+            &[-3.0, -4.0],
+            &[
                 (to_sparse(&[1.0, 0.0]), RelOp::Ge, 10.0),
                 (to_sparse(&[0.0, 1.0]), RelOp::Ge, 5.0),
                 (to_sparse(&[1.0, 1.0]), RelOp::Le, 20.0),
                 (to_sparse(&[-1.0, 4.0]), RelOp::Le, 20.0),
             ],
-        );
+        )
+        .unwrap();
         sol.find_initial_bfs().unwrap();
 
         assert_eq!(sol.num_vars, 2);
@@ -1282,27 +1338,29 @@ mod tests {
 
         assert_eq!(sol.basic_vars, vec![0, 1, 4, 5]);
 
-        let infeasible = Solver::new(
-            vec![1.0, 1.0],
-            vec![
+        let infeasible = Solver::try_new(
+            &[1.0, 1.0],
+            &[
                 (to_sparse(&[1.0, 1.0]), RelOp::Ge, 10.0),
                 (to_sparse(&[1.0, 1.0]), RelOp::Le, 5.0),
             ],
         )
+        .unwrap()
         .find_initial_bfs();
         assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
     }
 
     #[test]
     fn move_to_solution() {
-        let mut sol = Solver::new(
-            vec![2.0, 1.0],
-            vec![
+        let mut sol = Solver::try_new(
+            &[2.0, 1.0],
+            &[
                 (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
                 (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
                 (to_sparse(&[0.0, 1.0]), RelOp::Eq, 3.0),
             ],
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             sol.clone().move_to_solution(&[0.0, 4.0]).err(),
