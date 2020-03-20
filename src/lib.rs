@@ -62,6 +62,16 @@ impl<I: IntoIterator<Item = impl Into<LinearTerm>>> From<I> for LinearExpr {
     }
 }
 
+impl std::iter::FromIterator<(Variable, f64)> for LinearExpr {
+    fn from_iter<I: IntoIterator<Item = (Variable, f64)>>(iter: I) -> Self {
+        let mut expr = LinearExpr::empty();
+        for term in iter {
+            expr.add(term.0, term.1)
+        }
+        expr
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum RelOp {
     Eq,
@@ -69,18 +79,30 @@ pub enum RelOp {
     Ge,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Error {
     Infeasible,
     Unbounded,
 }
 
-type CsVec = sprs::CsVecI<f64, usize>;
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let msg = match self {
+            Error::Infeasible => "problem is infeasible",
+            Error::Unbounded => "problem is unbounded",
+        };
+        msg.fmt(f)
+    }
+}
+
+impl std::error::Error for Error {}
 
 pub struct Problem {
     obj: Vec<f64>,
     constraints: Vec<(CsVec, RelOp, f64)>,
 }
+
+type CsVec = sprs::CsVecI<f64, usize>;
 
 impl Problem {
     pub fn new() -> Self {
@@ -127,11 +149,15 @@ impl Solution {
     }
 
     pub fn get(&self, var: Variable) -> &f64 {
+        assert!(var.idx() < self.num_vars);
         self.solver.get_value(var.idx())
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (Variable, &f64)> {
-        (0..self.num_vars).map(move |idx| (Variable(idx), self.solver.get_value(idx)))
+    pub fn iter(&self) -> IterSolution {
+        IterSolution {
+            solution: self,
+            var_idx: 0,
+        }
     }
 
     pub fn set_var(mut self, var: Variable, val: f64) -> Result<Self, Error> {
@@ -183,6 +209,34 @@ impl std::ops::Index<Variable> for Solution {
 
     fn index(&self, var: Variable) -> &Self::Output {
         self.get(var)
+    }
+}
+
+pub struct IterSolution<'a> {
+    solution: &'a Solution,
+    var_idx: usize,
+}
+
+impl<'a> Iterator for IterSolution<'a> {
+    type Item = (Variable, &'a f64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.var_idx < self.solution.num_vars {
+            let var_idx = self.var_idx;
+            self.var_idx += 1;
+            Some((Variable(var_idx), self.solution.solver.get_value(var_idx)))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Solution {
+    type Item = (Variable, &'a f64);
+    type IntoIter = IterSolution<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
