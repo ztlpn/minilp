@@ -114,9 +114,21 @@ impl Problem {
         }
     }
 
-    pub fn add_var(&mut self, obj_coeff: f64) -> Variable {
+    pub fn add_var(&mut self, min: Option<f64>, max: Option<f64>, obj_coeff: f64) -> Variable {
         let var = Variable(self.obj.len());
         self.obj.push(obj_coeff);
+        if let Some(min) = min {
+            if min < 0.0 {
+                unimplemented!();
+            } else if min > 0.0 {
+                self.add_constraint(&[(var, 1.0)], RelOp::Ge, min);
+            }
+        } else {
+            unimplemented!();
+        }
+        if let Some(max) = max {
+            self.add_constraint(&[(var, 1.0)], RelOp::Le, max);
+        }
         var
     }
 
@@ -242,10 +254,8 @@ mod tests {
     #[test]
     fn optimize() {
         let mut problem = Problem::new();
-        let v1 = problem.add_var(-3.0);
-        let v2 = problem.add_var(-4.0);
-        problem.add_constraint(&[(v1, 1.0)], RelOp::Ge, 10.0);
-        problem.add_constraint(&[(v2, -1.0)], RelOp::Le, -5.0);
+        let v1 = problem.add_var(Some(12.0), None, -3.0);
+        let v2 = problem.add_var(Some(5.0), None, -4.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 20.0);
         problem.add_constraint(&[(v2, -4.0), (v1, 1.0)], RelOp::Ge, -20.0);
 
@@ -264,7 +274,7 @@ mod tests {
         ];
 
         let mut problem = Problem::new();
-        let _ = problem.add_var(1.0);
+        let _ = problem.add_var(Some(0.0), None, 1.0);
         for (expr, op, b) in trivial.iter().cloned() {
             problem.add_constraint(expr, op, b);
         }
@@ -295,15 +305,15 @@ mod tests {
             assert_eq!(sol.map(|_| "solved"), Err(Error::Infeasible));
         }
 
-        let _ = problem.add_var(-1.0);
+        let _ = problem.add_var(Some(0.0), None, -1.0);
         assert_eq!(problem.solve().map(|_| "solved"), Err(Error::Unbounded));
     }
 
     #[test]
     fn set_unset_var() {
         let mut problem = Problem::new();
-        let v1 = problem.add_var(2.0);
-        let v2 = problem.add_var(1.0);
+        let v1 = problem.add_var(Some(0.0), None, 2.0);
+        let v2 = problem.add_var(Some(0.0), None, 1.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 4.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Ge, 2.0);
 
@@ -337,8 +347,8 @@ mod tests {
     #[test]
     fn add_constraint() {
         let mut problem = Problem::new();
-        let v1 = problem.add_var(2.0);
-        let v2 = problem.add_var(1.0);
+        let v1 = problem.add_var(Some(0.0), None, 2.0);
+        let v2 = problem.add_var(Some(0.0), None, 1.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 4.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Ge, 2.0);
 
@@ -382,8 +392,8 @@ mod tests {
     #[test]
     fn gomory_cut() {
         let mut problem = Problem::new();
-        let v1 = problem.add_var(0.0);
-        let v2 = problem.add_var(-1.0);
+        let v1 = problem.add_var(Some(0.0), None, 0.0);
+        let v2 = problem.add_var(Some(0.0), None, -1.0);
         problem.add_constraint(&[(v1, 3.0), (v2, 2.0)], RelOp::Le, 6.0);
         problem.add_constraint(&[(v1, -3.0), (v2, 2.0)], RelOp::Le, 0.0);
 
