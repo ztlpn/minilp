@@ -9,7 +9,6 @@ use sprs::CompressedStorage;
 use std::collections::{BTreeSet, HashMap};
 
 type CsMat = sprs::CsMatI<f64, usize>;
-type ArrayVec = ndarray::Array1<f64>;
 
 const SENTINEL: usize = 0usize.wrapping_sub(1);
 
@@ -19,7 +18,9 @@ pub(crate) struct Solver {
     num_slack_vars: usize,
     num_artificial_vars: usize,
 
-    orig_obj: Vec<f64>,      // with negated coeffs
+    orig_obj: Vec<f64>, // with negated coeffs
+    orig_var_mins: Vec<f64>,
+    orig_var_maxs: Vec<f64>,
     orig_constraints: CsMat, // excluding bounds
     orig_constraints_csc: CsMat,
     orig_bounds: Vec<f64>,
@@ -37,13 +38,18 @@ pub(crate) struct Solver {
     row_coeffs: ScatteredVec,
 
     // Updated on each pivot
-    basic_vars: Vec<usize>, // for each constraint the corresponding basic var.
-    basic_vars_inv: Vec<usize>, // (var -> idx if basic or sentinel) for all vars
+    /// for each constraint the corresponding basic var.
+    basic_vars: Vec<usize>,
+    /// (var -> idx if basic or sentinel) for all vars
+    basic_vars_inv: Vec<usize>,
     cur_bounds: Vec<f64>,
 
-    non_basic_vars: Vec<usize>,     // remaining variables. (idx -> var)
-    non_basic_vars_inv: Vec<usize>, // (var -> idx if non-basic or sentinel) for all vars
+    /// remaining variables. (idx -> var)
+    non_basic_vars: Vec<usize>,
+    /// (var -> idx if non-basic or sentinel) for all vars
+    non_basic_vars_inv: Vec<usize>,
     cur_obj: Vec<f64>,
+    non_basic_vals: Vec<f64>,
     non_basic_col_sq_norms: Vec<f64>,
 
     pub(crate) cur_obj_val: f64,
@@ -74,17 +80,69 @@ impl std::fmt::Debug for Solver {
 impl Solver {
     pub(crate) fn try_new(
         orig_obj: &[f64],
+        orig_var_mins: &[f64],
+        orig_var_maxs: &[f64],
         orig_constraints: &[(CsVec, RelOp, f64)],
     ) -> Result<Self, Error> {
-        let enable_steepest_edge = true;
+        let enable_steepest_edge = true; // TODO: make user-settable.
+
+        let num_vars = orig_obj.len();
+
+        let mut obj = orig_obj.iter().map(|c| -c).collect::<Vec<_>>();
+
+        assert_eq!(num_vars, orig_var_mins.len());
+        assert_eq!(num_vars, orig_var_maxs.len());
+        let mut orig_var_mins = orig_var_mins.to_vec();
+        let mut orig_var_maxs = orig_var_maxs.to_vec();
+
+        let mut non_basic_vars = vec![];
+        let mut non_basic_vars_inv = vec![SENTINEL; num_vars];
+
+        let mut obj_val = 0.0;
+        let mut non_basic_vals = vec![];
+
+        for v in 0..num_vars {
+            // choose initial variable values
+
+            let min = orig_var_mins[v];
+            let max = orig_var_maxs[v];
+            if min > max {
+                return Err(Error::Infeasible);
+            }
+
+            // initially all user-created variables are non-basic
+            non_basic_vars_inv[v] = non_basic_vars.len();
+            non_basic_vars.push(v);
+
+            let init_val = if min.is_finite() {
+                min
+            } else if max.is_finite() {
+                max
+            } else {
+                unimplemented!();
+            };
+            non_basic_vals.push(init_val);
+            obj_val -= init_val * obj[v];
+        }
+
+        #[derive(Debug)]
+        struct ConstraintInfo {
+            coeffs: CsVec,
+            bound: f64,
+            lhs_val: f64,
+            slack_var_coeff: Option<i8>,
+            need_art_var: bool,
+        }
 
         let mut constraints = vec![];
         for (coeffs, rel_op, bound) in orig_constraints {
+            let bound = *bound;
+
             if coeffs.indices().is_empty() {
                 let is_tautological = match rel_op {
-                    RelOp::Eq => 0.0 == *bound,
-                    RelOp::Le => 0.0 <= *bound,
-                    RelOp::Ge => 0.0 >= *bound,
+                    RelOp::Eq => 0.0 == bound,
+                    RelOp::Le => 0.0 <= bound,
+                    RelOp::Ge => 0.0 >= bound,
                 };
 
                 if is_tautological {
@@ -94,124 +152,110 @@ impl Solver {
                 }
             }
 
-            let constr = if *bound < 0.0 {
-                match rel_op {
-                    RelOp::Eq => (coeffs.clone(), *rel_op, *bound),
-                    RelOp::Ge => (coeffs.map(|x| -x), RelOp::Le, -bound),
-                    RelOp::Le => (coeffs.map(|x| -x), RelOp::Ge, -bound),
-                }
-            } else {
-                (coeffs.clone(), *rel_op, *bound)
+            let mut lhs_val = 0.0;
+            for (var, &coeff) in coeffs.iter() {
+                lhs_val += coeff * non_basic_vals[var];
+            }
+
+            let (slack_var_coeff, need_art_var) = match rel_op {
+                RelOp::Le => (Some(1), lhs_val > bound),
+                RelOp::Ge => (Some(-1), lhs_val < bound),
+                RelOp::Eq => (None, true),
             };
 
-            constraints.push(constr);
+            constraints.push(ConstraintInfo {
+                coeffs: coeffs.clone(),
+                bound,
+                lhs_val,
+                slack_var_coeff,
+                need_art_var,
+            });
         }
 
-        let num_vars = orig_obj.len();
-
-        let (num_slack_vars, num_artificial_vars) = {
-            let mut s = 0;
-            let mut a = 0;
-            for constr in &constraints {
-                match constr.1 {
-                    RelOp::Le => s += 1,
-                    RelOp::Eq => a += 1,
-                    RelOp::Ge => {
-                        s += 1;
-                        a += 1;
-                    }
-                }
-            }
-            (s, a)
-        };
-        let num_total_vars = num_vars + num_slack_vars + num_artificial_vars;
         let num_constraints = constraints.len();
 
-        let mut obj = orig_obj.iter().map(|c| -c).collect::<Vec<_>>();
-        obj.extend(std::iter::repeat(0.0).take(num_slack_vars + num_artificial_vars));
+        let num_slack_vars = constraints
+            .iter()
+            .filter(|c| c.slack_var_coeff.is_some())
+            .count();
+        let num_artificial_vars = constraints.iter().filter(|c| c.need_art_var).count();
+        let num_total_vars = num_vars + num_slack_vars + num_artificial_vars;
 
-        let mut cur_slack_var = 0;
-        let mut cur_artificial_var = 0;
+        obj.resize(num_total_vars, 0.0);
+
+        // slack and artificial vars are always [0, inf)
+        orig_var_mins.resize(num_total_vars, 0.0);
+        orig_var_maxs.resize(num_total_vars, f64::INFINITY);
+        // will be updated later
+        non_basic_vars_inv.resize(num_total_vars, SENTINEL);
+
+        let mut cur_slack_var = num_vars;
+        let mut cur_artificial_var = num_vars + num_slack_vars;
 
         let mut artificial_multipliers = CsVec::empty(num_constraints);
         let mut artificial_obj_val = 0.0;
 
         let mut orig_constraints = CsMat::empty(CompressedStorage::CSR, num_total_vars);
         let mut orig_bounds = Vec::with_capacity(num_constraints);
+        let mut cur_bounds = Vec::with_capacity(num_constraints);
         let mut basic_vars = vec![];
         let mut basic_vars_inv = vec![SENTINEL; num_total_vars];
 
-        for (mut coeffs, rel_op, bound) in constraints.into_iter() {
-            let basic_idx = match rel_op {
-                RelOp::Le => {
-                    assert!(bound >= 0.0);
-                    let basic_idx = cur_slack_var;
-                    cur_slack_var += 1;
-                    basic_idx
+        for constr in constraints.into_iter() {
+            if constr.need_art_var {
+                if constr.slack_var_coeff.is_some() {
+                    non_basic_vars_inv[cur_slack_var] = non_basic_vars.len();
+                    non_basic_vars.push(cur_slack_var);
+                    non_basic_vals.push(0.0);
                 }
 
-                RelOp::Eq => {
-                    artificial_obj_val += bound;
-                    artificial_multipliers.append(basic_vars.len(), 1.0);
-                    let basic_idx = num_slack_vars + cur_artificial_var;
-                    cur_artificial_var += 1;
-                    basic_idx
-                }
+                basic_vars_inv[cur_artificial_var] = basic_vars.len();
+                basic_vars.push(cur_artificial_var);
+            } else {
+                basic_vars_inv[cur_slack_var] = basic_vars.len();
+                basic_vars.push(cur_slack_var);
+            }
 
-                RelOp::Ge => {
-                    assert!(bound >= 0.0);
+            let mut coeffs = into_resized(constr.coeffs, num_total_vars);
+            if let Some(coeff) = constr.slack_var_coeff {
+                coeffs.append(cur_slack_var, coeff as f64);
+                cur_slack_var += 1;
+            }
+            if constr.need_art_var {
+                let diff = constr.bound - constr.lhs_val;
+                artificial_obj_val += diff.abs();
+                artificial_multipliers.append(basic_vars.len() - 1, diff.signum());
+                coeffs.append(cur_artificial_var, diff.signum());
+                cur_artificial_var += 1;
+            }
 
-                    coeffs = into_resized(coeffs, num_total_vars);
-                    coeffs.append(num_vars + cur_slack_var, -1.0);
-                    cur_slack_var += 1;
-
-                    artificial_obj_val += bound;
-                    artificial_multipliers.append(basic_vars.len(), 1.0);
-
-                    let basic_idx = num_slack_vars + cur_artificial_var;
-                    cur_artificial_var += 1;
-
-                    basic_idx
-                }
-            };
-
-            basic_vars_inv[num_vars + basic_idx] = basic_vars.len();
-            basic_vars.push(num_vars + basic_idx);
-            coeffs = into_resized(coeffs, num_total_vars);
-            coeffs.append(num_vars + basic_idx, 1.0);
             orig_constraints = orig_constraints.append_outer_csvec(coeffs.view());
-            orig_bounds.push(bound);
+            orig_bounds.push(constr.bound);
+            cur_bounds.push(f64::abs(constr.bound - constr.lhs_val));
         }
 
         let orig_constraints_csc = orig_constraints.to_csc();
 
-        let mut non_basic_vars = vec![];
-        let mut non_basic_vars_inv = vec![SENTINEL; num_total_vars];
         let mut cur_obj = vec![];
         let mut non_basic_col_sq_norms = vec![];
-        for var in 0..num_total_vars {
-            if basic_vars_inv[var] == SENTINEL {
-                non_basic_vars_inv[var] = non_basic_vars.len();
-                non_basic_vars.push(var);
+        for &var in &non_basic_vars {
+            let col = orig_constraints_csc.outer_view(var).unwrap();
 
-                let col = orig_constraints_csc.outer_view(var).unwrap();
+            if num_artificial_vars > 0 {
+                cur_obj.push(artificial_multipliers.dot(&col));
+            } else {
+                cur_obj.push(obj[var]);
+            }
 
-                if num_artificial_vars > 0 {
-                    cur_obj.push(artificial_multipliers.dot(&col));
-                } else {
-                    cur_obj.push(obj[var]);
-                }
-
-                if enable_steepest_edge {
-                    non_basic_col_sq_norms.push(col.squared_l2_norm());
-                }
+            if enable_steepest_edge {
+                non_basic_col_sq_norms.push(col.squared_l2_norm());
             }
         }
 
         let cur_obj_val = if num_artificial_vars > 0 {
             artificial_obj_val
         } else {
-            0.0
+            obj_val
         };
 
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
@@ -229,12 +273,13 @@ impl Solver {
         .unwrap();
         let lu_factors_transp = lu_factors.transpose();
 
-        let cur_bounds = orig_bounds.clone();
         let res = Self {
             num_vars,
             num_slack_vars,
             num_artificial_vars,
             orig_obj: obj,
+            orig_var_mins,
+            orig_var_maxs,
             orig_constraints,
             orig_constraints_csc,
             orig_bounds,
@@ -257,6 +302,7 @@ impl Solver {
             non_basic_vars,
             non_basic_vars_inv,
             cur_obj,
+            non_basic_vals,
             non_basic_col_sq_norms,
             cur_obj_val,
         };
@@ -280,7 +326,8 @@ impl Solver {
 
         let basic_idx = self.basic_vars_inv[var];
         if basic_idx == SENTINEL {
-            &0.0
+            let nb_idx = self.non_basic_vars_inv[var];
+            &self.non_basic_vals[nb_idx]
         } else {
             &self.cur_bounds[basic_idx]
         }
@@ -929,6 +976,8 @@ impl Solver {
                 .reset(&self.orig_constraints_csc, &self.basic_vars);
         }
 
+        type ArrayVec = ndarray::Array1<f64>;
+
         let multipliers = {
             let mut obj_coeffs = vec![0.0; self.num_constraints()];
             for (c, &var) in self.basic_vars.iter().enumerate() {
@@ -1279,8 +1328,11 @@ mod tests {
     fn initialize() {
         let sol = Solver::try_new(
             &[2.0, 1.0],
+            &[f64::NEG_INFINITY, 5.0],
+            &[0.0, f64::INFINITY],
             &[
-                (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
+                (to_sparse(&[1.0, 1.0]), RelOp::Le, 6.0),
+                (to_sparse(&[1.0, 2.0]), RelOp::Le, 8.0),
                 (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
                 (to_sparse(&[0.0, 1.0]), RelOp::Eq, 3.0),
             ],
@@ -1288,36 +1340,56 @@ mod tests {
         .unwrap();
 
         assert_eq!(sol.num_vars, 2);
-        assert_eq!(sol.num_slack_vars, 2);
+        assert_eq!(sol.num_slack_vars, 3);
         assert_eq!(sol.num_artificial_vars, 2);
 
-        assert_eq!(sol.orig_obj, vec![-2.0, -1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&sol.orig_obj, &[-2.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        assert_eq!(
+            &sol.orig_var_mins,
+            &[f64::NEG_INFINITY, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            &sol.orig_var_maxs,
+            &[
+                0.0,
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::INFINITY
+            ]
+        );
 
         let orig_constraints_ref = vec![
-            vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
-            vec![1.0, 1.0, 0.0, -1.0, 1.0, 0.0],
-            vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            vec![1.0, 2.0, 0.0, 1.0, 0.0, -1.0, 0.0],
+            vec![1.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0],
         ];
         assert_matrix_eq(&sol.orig_constraints, &orig_constraints_ref);
 
-        assert_eq!(sol.basic_vars, vec![2, 4, 5]);
-        assert_eq!(sol.cur_bounds, vec![4.0, 2.0, 3.0]);
+        assert_eq!(&sol.orig_bounds, &[6.0, 8.0, 2.0, 3.0]);
 
-        assert_eq!(sol.non_basic_vars, vec![0, 1, 3]);
-        assert_eq!(sol.cur_obj, vec![1.0, 2.0, -1.0]);
+        assert_eq!(&sol.basic_vars, &[2, 5, 4, 6]);
+        assert_eq!(&sol.cur_bounds, &[1.0, 2.0, 3.0, 2.0]);
 
-        assert_eq!(sol.cur_obj_val, 5.0);
+        assert_eq!(&sol.non_basic_vars, &[0, 1, 3]);
+        assert_eq!(&sol.cur_obj, &[-1.0, -3.0, -1.0]);
+        assert_eq!(&sol.non_basic_vals, &[0.0, 5.0, 0.0]);
+        assert_eq!(&sol.non_basic_col_sq_norms, &[3.0, 7.0, 1.0]);
 
-        assert_eq!(sol.basic_vars, vec![2, 4, 5]);
+        assert_eq!(sol.cur_obj_val, 4.0);
     }
 
     #[test]
     fn find_initial_bfs() {
         let mut sol = Solver::try_new(
             &[-3.0, -4.0],
+            &[10.0, 5.0],
+            &[f64::INFINITY, f64::INFINITY],
             &[
-                (to_sparse(&[1.0, 0.0]), RelOp::Ge, 10.0),
-                (to_sparse(&[0.0, 1.0]), RelOp::Ge, 5.0),
                 (to_sparse(&[1.0, 1.0]), RelOp::Le, 20.0),
                 (to_sparse(&[-1.0, 4.0]), RelOp::Le, 20.0),
             ],
@@ -1338,6 +1410,8 @@ mod tests {
 
         let infeasible = Solver::try_new(
             &[1.0, 1.0],
+            &[0.0, 0.0],
+            &[f64::INFINITY, f64::INFINITY],
             &[
                 (to_sparse(&[1.0, 1.0]), RelOp::Ge, 10.0),
                 (to_sparse(&[1.0, 1.0]), RelOp::Le, 5.0),
@@ -1352,6 +1426,8 @@ mod tests {
     fn move_to_solution() {
         let mut sol = Solver::try_new(
             &[2.0, 1.0],
+            &[0.0, 0.0],
+            &[f64::INFINITY, f64::INFINITY],
             &[
                 (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
                 (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),

@@ -101,6 +101,8 @@ impl std::error::Error for Error {}
 #[derive(Clone)]
 pub struct Problem {
     obj: Vec<f64>,
+    var_mins: Vec<f64>,
+    var_maxs: Vec<f64>,
     constraints: Vec<(CsVec, RelOp, f64)>,
 }
 
@@ -110,6 +112,8 @@ impl Problem {
     pub fn new() -> Self {
         Problem {
             obj: vec![],
+            var_mins: vec![],
+            var_maxs: vec![],
             constraints: vec![],
         }
     }
@@ -117,18 +121,8 @@ impl Problem {
     pub fn add_var(&mut self, min: Option<f64>, max: Option<f64>, obj_coeff: f64) -> Variable {
         let var = Variable(self.obj.len());
         self.obj.push(obj_coeff);
-        if let Some(min) = min {
-            if min < 0.0 {
-                unimplemented!();
-            } else if min > 0.0 {
-                self.add_constraint(&[(var, 1.0)], RelOp::Ge, min);
-            }
-        } else {
-            unimplemented!();
-        }
-        if let Some(max) = max {
-            self.add_constraint(&[(var, 1.0)], RelOp::Le, max);
-        }
+        self.var_mins.push(min.unwrap_or(f64::NEG_INFINITY));
+        self.var_maxs.push(max.unwrap_or(f64::INFINITY));
         var
     }
 
@@ -142,7 +136,12 @@ impl Problem {
     }
 
     pub fn solve(&self) -> Result<Solution, Error> {
-        let mut solver = Solver::try_new(&self.obj, &self.constraints)?;
+        let mut solver = Solver::try_new(
+            &self.obj,
+            &self.var_mins,
+            &self.var_maxs,
+            &self.constraints,
+        )?;
         solver.optimize()?;
         Ok(Solution {
             num_vars: self.obj.len(),
