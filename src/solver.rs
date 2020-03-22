@@ -290,27 +290,24 @@ impl Solver {
         assert_eq!(self.num_artificial_vars, 0);
         assert!(self.set_vars.insert(var, val).is_none());
 
-        let basic_row = self.basic_vars.iter().position(|&v| v == var);
-        let non_basic_col = self.non_basic_vars.iter().position(|&v| v == var);
+        let basic_row = self.basic_vars_inv[var];
+        let non_basic_col = self.non_basic_vars_inv[var];
 
-        if let Some(r) = basic_row {
+        if basic_row != SENTINEL {
             // if var was basic, remove it.
-            self.cur_bounds[r] -= val;
-            self.calc_row_coeffs(r);
+            self.cur_bounds[basic_row] -= val;
+            self.calc_row_coeffs(basic_row);
             let (c_entering, pivot_coeff) = self.choose_entering_col_dual()?;
             self.calc_col_coeffs(c_entering);
-            self.pivot(c_entering, r, pivot_coeff);
-        } else if let Some(c) = non_basic_col {
-            self.calc_col_coeffs(c);
+            self.pivot(c_entering, basic_row, pivot_coeff);
+        } else if non_basic_col != SENTINEL {
+            self.calc_col_coeffs(non_basic_col);
             for (r, coeff) in self.col_coeffs.iter() {
                 self.cur_bounds[r] -= val * coeff;
             }
-            self.cur_obj_val -= val * self.cur_obj[c];
+            self.cur_obj_val -= val * self.cur_obj[non_basic_col];
         } else {
-            panic!(
-                "couldn't find var {:?} in either basic or non-basic variables",
-                var
-            );
+            unreachable!();
         }
 
         self.restore_feasibility()?;
@@ -321,7 +318,8 @@ impl Solver {
     /// Return true if the var was really unset.
     pub(crate) fn unset_var(&mut self, var: usize) -> Result<bool, Error> {
         if let Some(val) = self.set_vars.remove(&var) {
-            let col = self.non_basic_vars.iter().position(|&v| v == var).unwrap();
+            let col = self.non_basic_vars_inv[var];
+            assert_ne!(col, SENTINEL);
             self.calc_col_coeffs(col);
             for (r, coeff) in self.col_coeffs.iter() {
                 self.cur_bounds[r] += val * coeff;
