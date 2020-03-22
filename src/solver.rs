@@ -555,7 +555,7 @@ impl Solver {
         &mut self,
         mut coeffs: CsVec,
         rel_op: RelOp,
-        mut bound: f64,
+        bound: f64,
     ) -> Result<(), Error> {
         if coeffs.indices().is_empty() {
             let is_tautological = match rel_op {
@@ -571,20 +571,18 @@ impl Solver {
             }
         }
 
-        match rel_op {
+        // each >=/<= constraint adds a slack var
+        let new_num_total_vars = self.num_total_vars() + 1;
+
+        let slack_var_coeff = match rel_op {
+            RelOp::Le => 1,
+            RelOp::Ge => -1,
             RelOp::Eq => unimplemented!(),
-            RelOp::Le => {}
-            RelOp::Ge => {
-                coeffs.map_inplace(|x| -x);
-                bound = -bound;
-            }
-        }
+        };
 
         assert_eq!(self.num_artificial_vars, 0);
         // TODO: assert optimality.
 
-        // each <= constraint adds a slack var
-        let new_num_total_vars = self.num_total_vars() + 1;
         let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_num_total_vars);
         for row in self.orig_constraints.outer_iterator() {
             new_orig_constraints =
@@ -595,9 +593,11 @@ impl Solver {
         self.num_slack_vars += 1;
 
         self.orig_obj.push(0.0);
+        self.orig_var_mins.push(0.0);
+        self.orig_var_maxs.push(f64::INFINITY);
 
         coeffs = into_resized(coeffs, new_num_total_vars);
-        coeffs.append(slack_var, 1.0);
+        coeffs.append(slack_var, slack_var_coeff as f64);
         new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
 
         self.orig_bounds.push(bound);
@@ -891,11 +891,20 @@ impl Solver {
 
     fn recalc_cur_bounds(&mut self) {
         let mut cur_bounds = self.orig_bounds.clone();
-        for (&var, &val) in self.set_vars.iter() {
-            for (r, &coeff) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
-                cur_bounds[r] -= val * coeff;
+        for (i, var) in self.non_basic_vars.iter().enumerate() {
+            let val = if let Some(val) = self.set_vars.get(var) {
+                *val
+            } else {
+                self.non_basic_vals[i]
+            };
+
+            if val != 0.0 {
+                for (r, &coeff) in self.orig_constraints_csc.outer_view(*var).unwrap().iter() {
+                    cur_bounds[r] -= val * coeff;
+                }
             }
         }
+
         self.basis_solver
             .lu_factors
             .solve_dense(&mut cur_bounds, &mut self.basis_solver.scratch);
