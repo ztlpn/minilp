@@ -6,7 +6,7 @@ use crate::{
 };
 
 use sprs::CompressedStorage;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 type CsMat = sprs::CsMatI<f64, usize>;
 
@@ -398,69 +398,6 @@ impl Solver {
         let cut_bound = self.cur_bounds[basic_row].floor() - self.cur_bounds[basic_row];
         let num_total_vars = self.num_total_vars();
         self.add_constraint(cut_coeffs.into_csvec(num_total_vars), RelOp::Le, cut_bound)
-    }
-
-    #[allow(dead_code)]
-    fn move_to_solution(mut self, solution: &[f64]) -> Result<Self, Error> {
-        assert_eq!(solution.len(), self.num_vars);
-
-        // fill the slack variables.
-        let mut values = Vec::with_capacity(self.num_vars + self.num_slack_vars);
-        values.extend_from_slice(solution);
-        values.resize(self.num_vars + self.num_slack_vars, 0.0);
-
-        for (r, coeffs) in self.orig_constraints.outer_iterator().enumerate() {
-            let bound = self.orig_bounds[r];
-
-            let mut relevant_vars = CsVec::empty(coeffs.dim());
-            for &i in coeffs.indices() {
-                if i >= self.num_vars {
-                    break;
-                }
-
-                relevant_vars.append(i, values[i]);
-            }
-
-            let mut accum = 0.0;
-            for (i, coeff) in coeffs.iter() {
-                if i < self.num_vars {
-                    accum += coeff * values[i];
-                } else if i < self.num_vars + self.num_slack_vars {
-                    let mut val = (bound - accum) / coeff;
-                    if f64::abs(val) < 1e-8 {
-                        val = 0.0;
-                    } else if val < 0.0 {
-                        error!(
-                            "Constraint #{} {:?}={} not satisfied, relevant vars: {:?}, slack var: {}",
-                            r, coeffs, bound, relevant_vars, i
-                        );
-                        return Err(Error::Infeasible);
-                    }
-                    values[i] = val;
-                    accum = bound;
-                    break;
-                } else {
-                    break;
-                }
-            }
-
-            if f64::abs(accum - bound) > 1e-8 {
-                // necessary to check in case of equality constraint.
-                error!(
-                    "Equality constraint #{} {:?}={} not satisfied, relevant vars: {:?}",
-                    r, coeffs, bound, relevant_vars
-                );
-                return Err(Error::Infeasible);
-            }
-        }
-
-        let basic_vars = self.assign_basic_vars(&values)?;
-
-        // Transition is feasible, we can remove artificial vars.
-        self.remove_artificial_vars();
-        self.set_vars.clear();
-        self.reset_basis(basic_vars);
-        Ok(self)
     }
 
     fn num_constraints(&self) -> usize {
@@ -1017,6 +954,7 @@ impl Solver {
         }
     }
 
+    #[allow(dead_code)]
     fn reset_basis(&mut self, basic_vars: Vec<usize>) {
         assert_eq!(self.num_artificial_vars, 0);
         assert_eq!(basic_vars.len(), self.num_constraints());
@@ -1047,160 +985,6 @@ impl Solver {
         if self.enable_steepest_edge {
             self.recalc_cur_sq_norms();
         }
-    }
-
-    /// for each constraint try to find a basic var using depth-first search.
-    fn assign_basic_vars(&self, values: &[f64]) -> Result<Vec<usize>, Error> {
-        assert_eq!(values.len(), self.num_vars + self.num_slack_vars);
-
-        let mut is_var_used = vec![false; self.num_vars + self.num_slack_vars];
-        let mut non_zero_vars_left = (0..values.len())
-            .filter(|v| f64::abs(values[*v]) > 1e-8)
-            .count();
-
-        let (constr2vars, var2constrs) = {
-            let mut c2vs = Vec::with_capacity(self.num_constraints());
-            let mut v2cs = vec![vec![]; self.orig_constraints.cols()];
-            for (c, row) in self.orig_constraints.outer_iterator().enumerate() {
-                let mut step_vars: Vec<usize> = row
-                    .iter()
-                    .filter(|(v, coeff)| *v < values.len() && f64::abs(**coeff) > 1e-8)
-                    .map(|(v, _)| v)
-                    .collect();
-                // try non-zero variables first.
-                step_vars.sort_by_key(|v| (f64::abs(values[*v]) < 1e-8) as u32);
-                for &v in &step_vars {
-                    v2cs[v].push(c);
-                }
-                c2vs.push(step_vars);
-            }
-            (c2vs, v2cs)
-        };
-
-        #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
-        struct ConstraintInfo {
-            is_used: bool,
-            num_free_vars: usize,
-            idx: usize,
-        }
-
-        let mut constr2info: Vec<ConstraintInfo> = constr2vars
-            .iter()
-            .enumerate()
-            .map(|(idx, vs)| ConstraintInfo {
-                is_used: false,
-                num_free_vars: vs.len(),
-                idx,
-            })
-            .collect();
-        let mut sorted_constr_infos: BTreeSet<ConstraintInfo> =
-            constr2info.iter().cloned().collect();
-
-        struct Step<'a> {
-            constraint: usize,
-            vars: &'a [usize],
-            cur_idx: usize,
-            is_first: bool,
-        }
-
-        let new_step = |constr2info: &mut Vec<ConstraintInfo>,
-                        sorted_constr_infos: &mut BTreeSet<ConstraintInfo>|
-         -> Step {
-            // choose constraint with the least number of free (undecided) vars.
-            let mut info = sorted_constr_infos.iter().next().unwrap().clone();
-            assert!(!info.is_used);
-            sorted_constr_infos.take(&info).unwrap();
-            info.is_used = true;
-            constr2info[info.idx] = info.clone();
-            sorted_constr_infos.insert(info.clone());
-
-            Step {
-                constraint: info.idx,
-                vars: &constr2vars[info.idx],
-                cur_idx: 0,
-                is_first: true,
-            }
-        };
-
-        let mut dfs_stack = vec![new_step(&mut constr2info, &mut sorted_constr_infos)];
-        loop {
-            let cur_constr = dfs_stack.len() - 1;
-            let mut cur_step = dfs_stack.last_mut().unwrap();
-            if cur_step.is_first {
-                cur_step.is_first = false;
-            } else {
-                let var = cur_step.vars[cur_step.cur_idx];
-
-                is_var_used[var] = false;
-                for &c in &var2constrs[var] {
-                    let mut info = constr2info[c].clone();
-                    sorted_constr_infos.take(&info).unwrap();
-                    info.num_free_vars += 1;
-                    constr2info[info.idx] = info.clone();
-                    sorted_constr_infos.insert(info.clone());
-                }
-
-                if f64::abs(values[var]) > 1e-8 {
-                    non_zero_vars_left += 1;
-                }
-                cur_step.cur_idx += 1;
-            }
-
-            while cur_step.cur_idx < cur_step.vars.len()
-                && is_var_used[cur_step.vars[cur_step.cur_idx]]
-            {
-                cur_step.cur_idx += 1;
-            }
-
-            if cur_step.cur_idx == cur_step.vars.len() {
-                let mut info = constr2info[cur_step.constraint].clone();
-                assert!(info.is_used);
-                sorted_constr_infos.take(&info).unwrap();
-                info.is_used = false;
-                constr2info[info.idx] = info.clone();
-                sorted_constr_infos.insert(info.clone());
-
-                dfs_stack.pop();
-                if dfs_stack.is_empty() {
-                    error!("solution is not basic!");
-                    return Err(Error::Infeasible);
-                }
-                continue;
-            }
-
-            let cur_var = cur_step.vars[cur_step.cur_idx];
-            is_var_used[cur_var] = true;
-            for &c in &var2constrs[cur_var] {
-                let mut info = constr2info[c].clone();
-                sorted_constr_infos.take(&info).unwrap();
-                info.num_free_vars -= 1;
-                constr2info[info.idx] = info.clone();
-                sorted_constr_infos.insert(info.clone());
-            }
-            if f64::abs(values[cur_var]) > 1e-8 {
-                non_zero_vars_left -= 1;
-            }
-
-            if non_zero_vars_left > self.num_constraints() - cur_constr - 1 {
-                // Even if all the following basic vars are non-zero,
-                // some non-zero vars will still be non-basic, which is prohibited.
-                // Thus we need to backtrack.
-                continue;
-            }
-
-            if dfs_stack.len() < self.num_constraints() {
-                dfs_stack.push(new_step(&mut constr2info, &mut sorted_constr_infos));
-            } else {
-                break;
-            }
-        }
-
-        let mut basic_vars = vec![0; self.num_constraints()];
-        for step in &dfs_stack {
-            basic_vars[step.constraint] = step.vars[step.cur_idx];
-        }
-
-        Ok(basic_vars)
     }
 }
 
@@ -1420,37 +1204,5 @@ mod tests {
         .unwrap()
         .find_initial_bfs();
         assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
-    }
-
-    #[test]
-    fn move_to_solution() {
-        let mut sol = Solver::try_new(
-            &[2.0, 1.0],
-            &[0.0, 0.0],
-            &[f64::INFINITY, f64::INFINITY],
-            &[
-                (to_sparse(&[1.0, 1.0]), RelOp::Le, 4.0),
-                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
-                (to_sparse(&[0.0, 1.0]), RelOp::Eq, 3.0),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            sol.clone().move_to_solution(&[0.0, 4.0]).err(),
-            Some(Error::Infeasible)
-        );
-        assert_eq!(
-            sol.clone().move_to_solution(&[0.5, 3.0]).err(),
-            Some(Error::Infeasible)
-        );
-
-        sol = sol.move_to_solution(&[1.0, 3.0]).unwrap();
-        assert_eq!(sol.cur_obj_val, 5.0);
-
-        sol.optimize().unwrap();
-        assert_eq!(*sol.get_value(0), 0.0);
-        assert_eq!(*sol.get_value(1), 3.0);
-        assert_eq!(sol.cur_obj_val, 3.0);
     }
 }
