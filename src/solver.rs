@@ -889,11 +889,14 @@ impl Solver {
         if let Some(row) = leaving_r {
             self.calc_row_coeffs(row);
 
+            let entering_diff = (self.cur_bounds[row] - leaving_new_val) / leaving_coeff;
+            let entering_new_val = entering_cur_val + entering_diff;
+
             Some(PivotInfo {
                 entering_c,
                 entering_var,
-                entering_new_val: entering_cur_val + min_entering_diff * entering_diff_sign,
-                entering_diff: min_entering_diff * entering_diff_sign,
+                entering_new_val,
+                entering_diff,
                 leaving_r: Some(PivotLeavingRow {
                     r: row,
                     var: leaving_var,
