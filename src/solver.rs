@@ -320,10 +320,6 @@ impl Solver {
     }
 
     pub(crate) fn get_value(&self, var: usize) -> &f64 {
-        if let Some(val) = self.set_vars.get(&var) {
-            return val;
-        }
-
         let basic_idx = self.basic_vars_inv[var];
         if basic_idx == SENTINEL {
             let nb_idx = self.non_basic_vars_inv[var];
@@ -347,18 +343,19 @@ impl Solver {
 
         if basic_row != SENTINEL {
             // if var was basic, remove it.
-            self.cur_bounds[basic_row] -= val;
             self.calc_row_coeffs(basic_row);
-            let is_positive_direction = self.cur_bounds[basic_row] < val;
-            let pivot_info = self.choose_entering_col_dual(basic_row, is_positive_direction)?;
+            let pivot_info = self.choose_entering_col_dual(basic_row, val)?;
             self.calc_col_coeffs(pivot_info.entering_c);
             self.pivot(&pivot_info);
         } else if non_basic_col != SENTINEL {
             self.calc_col_coeffs(non_basic_col);
+
+            let diff = val - self.non_basic_vals[non_basic_col];
             for (r, coeff) in self.col_coeffs.iter() {
-                self.cur_bounds[r] -= val * coeff;
+                self.cur_bounds[r] -= diff * coeff;
             }
-            self.cur_obj_val -= val * self.cur_obj[non_basic_col];
+            self.cur_obj_val -= diff * self.cur_obj[non_basic_col];
+            self.non_basic_vals[non_basic_col] = val;
         } else {
             unreachable!();
         }
@@ -374,10 +371,23 @@ impl Solver {
             let col = self.non_basic_vars_inv[var];
             assert_ne!(col, SENTINEL);
             self.calc_col_coeffs(col);
-            for (r, coeff) in self.col_coeffs.iter() {
-                self.cur_bounds[r] += val * coeff;
+
+            let new_val = if self.cur_obj[col] > 0.0 {
+                self.orig_var_maxs[var]
+            } else {
+                self.orig_var_mins[var]
+            };
+
+            if new_val.is_infinite() {
+                return Err(Error::Unbounded);
             }
-            self.cur_obj_val += val * self.cur_obj[col];
+
+            let diff = new_val - val;
+            for (r, coeff) in self.col_coeffs.iter() {
+                self.cur_bounds[r] -= diff * coeff;
+            }
+            self.cur_obj_val -= diff * self.cur_obj[col];
+            self.non_basic_vals[col] = new_val;
 
             self.restore_feasibility()?;
             self.optimize().unwrap();
@@ -545,9 +555,9 @@ impl Solver {
                 );
             }
 
-            if let Some((row, is_positive_direction)) = self.choose_pivot_row_dual() {
+            if let Some((row, leaving_new_val)) = self.choose_pivot_row_dual() {
                 self.calc_row_coeffs(row);
-                let pivot_info = self.choose_entering_col_dual(row, is_positive_direction)?;
+                let pivot_info = self.choose_entering_col_dual(row, leaving_new_val)?;
                 self.calc_col_coeffs(pivot_info.entering_c);
                 self.pivot(&pivot_info);
             } else {
@@ -685,12 +695,6 @@ impl Solver {
         // TODO: periodically (say, every 1000 pivots) recalc cur_bounds and cur_obj
         // from scratch for numerical stability.
 
-        // eprintln!("------------- PIVOT BEGINS -----------");
-        // eprintln!("CUR OBJ {:?} ({})", self.cur_obj, self.cur_obj_val);
-        // eprintln!("BV: {:?}", self.basic_vars);
-        // eprintln!("BV VALUES {:?}", self.cur_bounds);
-        // eprintln!("NBV VALUES {:?}", self.non_basic_vals);
-
         self.cur_obj_val -= self.cur_obj[info.entering_c] * info.entering_diff;
 
         if info.leaving_r.is_none() {
@@ -774,15 +778,6 @@ impl Solver {
             self.basis_solver
                 .reset(&self.orig_constraints_csc, &self.basic_vars);
         }
-
-        // eprintln!(
-        //     "PIVOT entering {} (col #{}) nv: {} leaving {} (row #{}) nv {}",
-        //     info.entering_var, info.entering_c, info.entering_new_val, leaving.var, leaving.r, leaving.new_val
-        // );
-        // eprintln!("CUR OBJ {:?} ({})", self.cur_obj, self.cur_obj_val);
-        // eprintln!("BV: {:?}", self.basic_vars);
-        // eprintln!("BV VALUES {:?}", self.cur_bounds);
-        // eprintln!("NBV VALUES {:?}", self.non_basic_vals);
     }
 
     fn choose_pivot(&mut self) -> Option<PivotInfo> {
@@ -790,9 +785,6 @@ impl Solver {
             let mut best_col = None;
             let mut best_score = f64::NEG_INFINITY;
             let mut best_var = 0;
-            // eprintln!("CUR OBJ {:?} ({})", self.cur_obj, self.cur_obj_val);
-            // eprintln!("BV VALUES {:?}", self.cur_bounds);
-            // eprintln!("NBV VALUES {:?}", self.non_basic_vals);
             for col in 0..self.cur_obj.len() {
                 let var = self.non_basic_vars[col];
                 let direction = if self.non_basic_vals[col] == self.orig_var_mins[var] {
@@ -800,11 +792,6 @@ impl Solver {
                 } else {
                     -self.cur_obj[col]
                 };
-
-                // eprintln!(
-                //     "COL {} DIR {} min {} max {}",
-                //     col, direction, self.orig_var_mins[var], self.orig_var_maxs[var]
-                // );
 
                 // set_vars.is_empty() check results in a small, but significant perf improvement.
                 if direction < 1e-8
@@ -846,10 +833,6 @@ impl Solver {
             }
         };
         let entering_diff_sign = (entering_other_val - entering_cur_val).signum();
-        // eprintln!(
-        //     "ENTERING cv {} ov {} ds {}",
-        //     entering_cur_val, entering_other_val, entering_diff_sign
-        // );
 
         self.calc_col_coeffs(entering_c);
 
@@ -871,10 +854,6 @@ impl Solver {
             };
 
             let cur_entering_diff = f64::abs((limit_val - self.cur_bounds[r]) / coeff);
-            // eprintln!(
-            //     "ROW {} COEFF {} VAL {} LIMIT {} DIFF {}",
-            //     r, coeff, self.cur_bounds[r], limit_val, cur_entering_diff
-            // );
 
             let should_choose = cur_entering_diff < min_entering_diff - 1e-8
                 || (cur_entering_diff < min_entering_diff + 1e-8
@@ -925,31 +904,31 @@ impl Solver {
         }
     }
 
-    fn choose_pivot_row_dual(&self) -> Option<(usize, bool)> {
+    fn choose_pivot_row_dual(&self) -> Option<(usize, f64)> {
         let mut leaving_r = None;
         let mut max_infeasibility = f64::NEG_INFINITY;
-        let mut is_positive_direction = false;
+        let mut leaving_new_val = f64::NAN;
         for r in 0..self.num_constraints() {
             let var = self.basic_vars[r];
             let val = self.cur_bounds[r];
             let min = self.orig_var_mins[var];
             let max = self.orig_var_maxs[var];
-            let (cur_infeasibility, is_positive) = if val < min - 1e-8 {
-                (min - val, true)
+            let (cur_infeasibility, new_val) = if val < min - 1e-8 {
+                (min - val, min)
             } else if val > max + 1e-8 {
-                (val - max, false)
+                (val - max, max)
             } else {
                 continue;
             };
             if cur_infeasibility > max_infeasibility {
                 leaving_r = Some(r);
                 max_infeasibility = cur_infeasibility;
-                is_positive_direction = is_positive;
+                leaving_new_val = new_val;
             }
         }
 
         if let Some(r) = leaving_r {
-            Some((r, is_positive_direction))
+            Some((r, leaving_new_val))
         } else {
             None
         }
@@ -959,8 +938,10 @@ impl Solver {
     fn choose_entering_col_dual(
         &self,
         leaving_r: usize,
-        is_positive_direction: bool,
+        leaving_new_val: f64,
     ) -> Result<PivotInfo, Error> {
+        let is_positive_direction = leaving_new_val > self.cur_bounds[leaving_r];
+
         let mut entering_c = None;
         let mut min_diff = f64::INFINITY;
         let mut pivot_coeff_abs = f64::NEG_INFINITY;
@@ -1008,31 +989,21 @@ impl Solver {
 
         if let Some(c) = entering_c {
             let var = self.non_basic_vars[c];
-            let leaving_new_val = if -self.cur_obj[c] / pivot_coeff < 0.0 {
-                self.orig_var_mins[var]
-            } else {
-                self.orig_var_maxs[var]
-            };
+            let entering_diff = (self.cur_bounds[leaving_r] - leaving_new_val) / pivot_coeff;
+            let entering_new_val = self.non_basic_vals[c] + entering_diff;
 
-            if leaving_new_val.is_infinite() {
-                // TODO: is it possible?
-                Err(Error::Infeasible)
-            } else {
-                let entering_diff = (self.cur_bounds[leaving_r] - leaving_new_val) / pivot_coeff;
-                let entering_new_val = self.non_basic_vals[c] + entering_diff;
-                Ok(PivotInfo {
-                    entering_c: c,
-                    entering_var: var,
-                    entering_new_val,
-                    entering_diff,
-                    leaving_r: Some(PivotLeavingRow {
-                        r: leaving_r,
-                        var: self.basic_vars[leaving_r],
-                        new_val: leaving_new_val,
-                        coeff: pivot_coeff,
-                    }),
-                })
-            }
+            Ok(PivotInfo {
+                entering_c: c,
+                entering_var: var,
+                entering_new_val,
+                entering_diff,
+                leaving_r: Some(PivotLeavingRow {
+                    r: leaving_r,
+                    var: self.basic_vars[leaving_r],
+                    new_val: leaving_new_val,
+                    coeff: pivot_coeff,
+                }),
+            })
         } else {
             Err(Error::Infeasible)
         }
@@ -1058,12 +1029,7 @@ impl Solver {
     fn recalc_cur_bounds(&mut self) {
         let mut cur_bounds = self.orig_bounds.clone();
         for (i, var) in self.non_basic_vars.iter().enumerate() {
-            let val = if let Some(val) = self.set_vars.get(var) {
-                *val
-            } else {
-                self.non_basic_vals[i]
-            };
-
+            let val = self.non_basic_vals[i];
             if val != 0.0 {
                 for (r, &coeff) in self.orig_constraints_csc.outer_view(*var).unwrap().iter() {
                     cur_bounds[r] -= val * coeff;
@@ -1117,9 +1083,6 @@ impl Solver {
         }
         for (c, &var) in self.non_basic_vars.iter().enumerate() {
             self.cur_obj_val -= self.orig_obj[var] * self.non_basic_vals[c];
-        }
-        for (&var, &val) in self.set_vars.iter() {
-            self.cur_obj_val -= self.orig_obj[var] * val;
         }
     }
 

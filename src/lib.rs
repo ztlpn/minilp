@@ -311,35 +311,35 @@ mod tests {
     #[test]
     fn set_unset_var() {
         let mut problem = Problem::new();
-        let v1 = problem.add_var(Some(0.0), None, 2.0);
-        let v2 = problem.add_var(Some(0.0), None, 1.0);
+        let v1 = problem.add_var(Some(0.0), Some(3.0), -1.0);
+        let v2 = problem.add_var(Some(0.0), Some(3.0), -2.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 4.0);
-        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Ge, 2.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Ge, 1.0);
 
         let orig_sol = problem.solve().unwrap();
 
         {
-            let mut sol = orig_sol.clone().set_var(v1, 3.0).unwrap();
-            assert_eq!(sol[v1], 3.0);
-            assert_eq!(sol[v2], 0.0);
-            assert_eq!(sol.objective(), 6.0);
+            let mut sol = orig_sol.clone().set_var(v1, 0.5).unwrap();
+            assert_eq!(sol[v1], 0.5);
+            assert_eq!(sol[v2], 3.0);
+            assert_eq!(sol.objective(), -6.5);
 
             sol = sol.unset_var(v1).unwrap().0;
-            assert_eq!(sol[v1], 0.0);
-            assert_eq!(sol[v2], 2.0);
-            assert_eq!(sol.objective(), 2.0);
+            assert_eq!(sol[v1], 1.0);
+            assert_eq!(sol[v2], 3.0);
+            assert_eq!(sol.objective(), -7.0);
         }
 
         {
-            let mut sol = orig_sol.clone().set_var(v2, 3.0).unwrap();
-            assert_eq!(sol[v1], 0.0);
-            assert_eq!(sol[v2], 3.0);
-            assert_eq!(sol.objective(), 3.0);
+            let mut sol = orig_sol.clone().set_var(v2, 2.5).unwrap();
+            assert_eq!(sol[v1], 1.5);
+            assert_eq!(sol[v2], 2.5);
+            assert_eq!(sol.objective(), -6.5);
 
             sol = sol.unset_var(v2).unwrap().0;
-            assert_eq!(sol[v1], 0.0);
-            assert_eq!(sol[v2], 2.0);
-            assert_eq!(sol.objective(), 2.0);
+            assert_eq!(sol[v1], 1.0);
+            assert_eq!(sol[v2], 3.0);
+            assert_eq!(sol.objective(), -7.0);
         }
     }
 
