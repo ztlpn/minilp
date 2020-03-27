@@ -334,8 +334,12 @@ impl Solver {
     }
 
     pub(crate) fn set_var(&mut self, var: usize, val: f64) -> Result<(), Error> {
-        unimplemented!();
         assert_eq!(self.num_artificial_vars, 0);
+
+        if val < self.orig_var_mins[var] || val > self.orig_var_maxs[var] {
+            return Err(Error::Infeasible);
+        }
+
         assert!(self.set_vars.insert(var, val).is_none());
 
         let basic_row = self.basic_vars_inv[var];
@@ -345,9 +349,10 @@ impl Solver {
             // if var was basic, remove it.
             self.cur_bounds[basic_row] -= val;
             self.calc_row_coeffs(basic_row);
-            let (c_entering, pivot_coeff) = self.choose_entering_col_dual()?;
-            self.calc_col_coeffs(c_entering);
-            // self.pivot(c_entering, basic_row, pivot_coeff);
+            let is_positive_direction = self.cur_bounds[basic_row] < val;
+            let pivot_info = self.choose_entering_col_dual(basic_row, is_positive_direction)?;
+            self.calc_col_coeffs(pivot_info.entering_c);
+            self.pivot(&pivot_info);
         } else if non_basic_col != SENTINEL {
             self.calc_col_coeffs(non_basic_col);
             for (r, coeff) in self.col_coeffs.iter() {
@@ -528,7 +533,6 @@ impl Solver {
     }
 
     pub(crate) fn restore_feasibility(&mut self) -> Result<(), Error> {
-        unimplemented!();
         assert_eq!(self.num_artificial_vars, 0);
 
         for iter in 0.. {
@@ -541,20 +545,19 @@ impl Solver {
                 );
             }
 
-            let r_pivot = self.choose_pivot_row_dual();
-            if self.cur_bounds[r_pivot] >= -1e-8 {
+            if let Some((row, is_positive_direction)) = self.choose_pivot_row_dual() {
+                self.calc_row_coeffs(row);
+                let pivot_info = self.choose_entering_col_dual(row, is_positive_direction)?;
+                self.calc_col_coeffs(pivot_info.entering_c);
+                self.pivot(&pivot_info);
+            } else {
                 debug!(
-                    "restored feasibility in {} iterations, nnz: {}",
+                    "restored feasibility in in {} iterations, nnz: {}",
                     iter + 1,
-                    self.nnz()
+                    self.nnz(),
                 );
                 break;
             }
-
-            self.calc_row_coeffs(r_pivot);
-            let (c_entering, pivot_coeff) = self.choose_entering_col_dual()?;
-            self.calc_col_coeffs(c_entering);
-            // self.pivot(c_entering, r_pivot, pivot_coeff);
         }
 
         Ok(())
@@ -682,6 +685,12 @@ impl Solver {
         // TODO: periodically (say, every 1000 pivots) recalc cur_bounds and cur_obj
         // from scratch for numerical stability.
 
+        // eprintln!("------------- PIVOT BEGINS -----------");
+        // eprintln!("CUR OBJ {:?} ({})", self.cur_obj, self.cur_obj_val);
+        // eprintln!("BV: {:?}", self.basic_vars);
+        // eprintln!("BV VALUES {:?}", self.cur_bounds);
+        // eprintln!("NBV VALUES {:?}", self.non_basic_vals);
+
         self.cur_obj_val -= self.cur_obj[info.entering_c] * info.entering_diff;
 
         if info.leaving_r.is_none() {
@@ -771,6 +780,7 @@ impl Solver {
         //     info.entering_var, info.entering_c, info.entering_new_val, leaving.var, leaving.r, leaving.new_val
         // );
         // eprintln!("CUR OBJ {:?} ({})", self.cur_obj, self.cur_obj_val);
+        // eprintln!("BV: {:?}", self.basic_vars);
         // eprintln!("BV VALUES {:?}", self.cur_bounds);
         // eprintln!("NBV VALUES {:?}", self.non_basic_vals);
     }
@@ -915,120 +925,117 @@ impl Solver {
         }
     }
 
-    // index in the non_basic_vars permutation.
-    fn choose_entering_col(&self) -> Option<usize> {
-        let mut entering = None;
-        let mut entering_val = None;
-        for c in 0..self.cur_obj.len() {
-            let var = self.non_basic_vars[c];
-            // set_vars.is_empty() check results in a small, but significant perf improvement.
-            if self.cur_obj[c] < 1e-8
-                || (!self.set_vars.is_empty() && self.set_vars.contains_key(&var))
-            {
-                continue;
-            }
-
-            let val = if self.num_artificial_vars == 0 && self.enable_steepest_edge {
-                self.cur_obj[c] * self.cur_obj[c] / (self.non_basic_col_sq_norms[c] + 1.0)
+    fn choose_pivot_row_dual(&self) -> Option<(usize, bool)> {
+        let mut leaving_r = None;
+        let mut max_infeasibility = f64::NEG_INFINITY;
+        let mut is_positive_direction = false;
+        for r in 0..self.num_constraints() {
+            let var = self.basic_vars[r];
+            let val = self.cur_bounds[r];
+            let min = self.orig_var_mins[var];
+            let max = self.orig_var_maxs[var];
+            let (cur_infeasibility, is_positive) = if val < min - 1e-8 {
+                (min - val, true)
+            } else if val > max + 1e-8 {
+                (val - max, false)
             } else {
-                // TODO: simple "biggest coeff" rule seems to perform much better than
-                // the steepest edge rule for minimizing artificial objective (phase 1).
-                // Why is that?
-                self.cur_obj[c]
-            };
-            if entering_val.is_none() || val > entering_val.unwrap() {
-                entering = Some(c);
-                entering_val = Some(val);
-            }
-        }
-
-        entering
-    }
-
-    /// returns index into basic_vars
-    fn choose_pivot_row(&self) -> Result<(usize, f64), Error> {
-        let mut leaving = 0;
-        let mut leaving_val = None;
-        let mut leaving_coeff = 0.0;
-        for (r, &coeff) in self.col_coeffs.iter() {
-            if coeff < 1e-8 {
                 continue;
-            }
-
-            let cur_val = self.cur_bounds[r] / coeff;
-
-            let should_choose = leaving_val.is_none()
-                || cur_val < leaving_val.unwrap() - 1e-8
-                || (cur_val < leaving_val.unwrap() + 1e-8
-                    // There is uncertainty in choosing the leaving variable row.
-                    // Choose the one with the biggest absolute coeff for the reasons of
-                    // numerical stability. (NOTE: coeff is positive).
-                    && (coeff > leaving_coeff + 1e-8
-                        || coeff > leaving_coeff - 1e-8
-                            // There is still uncertainty, choose based on the column index.
-                            // NOTE: this still doesn't guarantee the absence of cycling.
-                            && r < leaving));
-
-            if should_choose {
-                leaving = r;
-                leaving_val = Some(cur_val);
-                leaving_coeff = coeff;
+            };
+            if cur_infeasibility > max_infeasibility {
+                leaving_r = Some(r);
+                max_infeasibility = cur_infeasibility;
+                is_positive_direction = is_positive;
             }
         }
 
-        if leaving_val.is_none() {
-            return Err(Error::Unbounded);
+        if let Some(r) = leaving_r {
+            Some((r, is_positive_direction))
+        } else {
+            None
         }
-
-        Ok((leaving, leaving_coeff))
-    }
-
-    fn choose_pivot_row_dual(&self) -> usize {
-        let mut i_row = 0;
-        let mut coeff = self.cur_bounds[0];
-        for i in 1..self.num_constraints() {
-            if self.cur_bounds[i] < coeff {
-                i_row = i;
-                coeff = self.cur_bounds[i];
-            }
-        }
-
-        i_row
     }
 
     /// returns index into non_basic_vars
-    fn choose_entering_col_dual(&self) -> Result<(usize, f64), Error> {
-        let mut entering = 0;
-        let mut entering_val = None;
-        let mut entering_coeff = 0.0;
+    fn choose_entering_col_dual(
+        &self,
+        leaving_r: usize,
+        is_positive_direction: bool,
+    ) -> Result<PivotInfo, Error> {
+        let mut entering_c = None;
+        let mut min_diff = f64::INFINITY;
+        let mut pivot_coeff_abs = f64::NEG_INFINITY;
+        let mut pivot_coeff = 0.0;
         for (c, &coeff) in self.row_coeffs.iter() {
-            let var = self.non_basic_vars[c];
-            // set_vars.is_empty() check results in a small, but significant perf improvement.
-            if coeff > -1e-8 || (!self.set_vars.is_empty() && self.set_vars.contains_key(&var)) {
+            let coeff_abs = coeff.abs();
+            if coeff_abs < 1e-8 {
                 continue;
             }
 
-            let cur_val = self.cur_obj[c] / coeff; // obj[v] and row[v] are both negative
+            let obj_coeff = self.cur_obj[c];
+            if (is_positive_direction
+                && ((coeff > 0.0 && obj_coeff < 0.0) || (coeff < 0.0 && obj_coeff > 0.0)))
+                || (!is_positive_direction
+                    && ((coeff < 0.0 && obj_coeff < 0.0) || (coeff > 0.0 && obj_coeff > 0.0)))
+            {
+                // We want to find entering variable that will *increase* objective function.
+                // (less optimal BFS means more feasible BFS).
+                // Because obj_val_diff = -obj_coeff * entering_diff = obj_coeff * leaving_diff / coeff,
+                // sign(obj_val_diff) = sign(obj_coeff) * sign(leaving_diff) * sign(coeff).
+                continue;
+            }
 
-            // See comments in `choose_pivot_row`. NOTE: coeff is negative.
-            let should_choose = entering_val.is_none()
-                || cur_val < entering_val.unwrap() - 1e-8
-                || (cur_val < entering_val.unwrap() + 1e-8
-                    && (-coeff > -entering_coeff + 1e-8
-                        || -coeff > -entering_coeff - 1e-8 && c < entering));
+            let var = self.non_basic_vars[c];
+            // set_vars.is_empty() check results in a small, but significant perf improvement.
+            if !self.set_vars.is_empty() && self.set_vars.contains_key(&var) {
+                continue;
+            }
+
+            let cur_diff = f64::abs(obj_coeff / coeff);
+
+            // See comments in `choose_pivot_row`.
+            let should_choose = cur_diff < min_diff - 1e-8
+                || (cur_diff < min_diff + 1e-8
+                    && (coeff_abs > pivot_coeff_abs + 1e-8
+                        || coeff_abs > pivot_coeff_abs - 1e-8 && c < entering_c.unwrap()));
 
             if should_choose {
-                entering = c;
-                entering_val = Some(cur_val);
-                entering_coeff = coeff;
+                entering_c = Some(c);
+                min_diff = cur_diff;
+                pivot_coeff_abs = coeff_abs;
+                pivot_coeff = coeff;
             }
         }
 
-        if entering_val.is_none() {
-            return Err(Error::Infeasible);
-        }
+        if let Some(c) = entering_c {
+            let var = self.non_basic_vars[c];
+            let leaving_new_val = if -self.cur_obj[c] / pivot_coeff < 0.0 {
+                self.orig_var_mins[var]
+            } else {
+                self.orig_var_maxs[var]
+            };
 
-        Ok((entering, entering_coeff))
+            if leaving_new_val.is_infinite() {
+                // TODO: is it possible?
+                Err(Error::Infeasible)
+            } else {
+                let entering_diff = (self.cur_bounds[leaving_r] - leaving_new_val) / pivot_coeff;
+                let entering_new_val = self.non_basic_vals[c] + entering_diff;
+                Ok(PivotInfo {
+                    entering_c: c,
+                    entering_var: var,
+                    entering_new_val,
+                    entering_diff,
+                    leaving_r: Some(PivotLeavingRow {
+                        r: leaving_r,
+                        var: self.basic_vars[leaving_r],
+                        new_val: leaving_new_val,
+                        coeff: pivot_coeff,
+                    }),
+                })
+            }
+        } else {
+            Err(Error::Infeasible)
+        }
     }
 
     fn remove_artificial_vars(&mut self) {
