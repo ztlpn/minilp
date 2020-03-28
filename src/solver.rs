@@ -678,26 +678,25 @@ impl Solver {
             let mut best_score = f64::NEG_INFINITY;
             for col in 0..self.cur_obj.len() {
                 let var = self.non_basic_vars[col];
-                let direction = if self.non_basic_vals[col] == self.orig_var_mins[var] {
-                    self.cur_obj[col]
-                } else {
-                    -self.cur_obj[col]
-                };
+                let is_positive_direction = self.non_basic_vals[col] == self.orig_var_mins[var];
+                let obj_coeff = self.cur_obj[col];
 
+                // Choose only among non-basic vars that can be changed with objective decreasing.
                 // set_vars.is_empty() check results in a small, but significant perf improvement.
-                if direction < 1e-8
+                if (is_positive_direction && obj_coeff < 1e-8)
+                    || (!is_positive_direction && obj_coeff > -1e-8)
                     || (!self.set_vars.is_empty() && self.set_vars.contains_key(&var))
                 {
                     continue;
                 }
 
                 let score = if self.num_artificial_vars == 0 && self.enable_steepest_edge {
-                    direction * direction / (self.non_basic_col_sq_norms[col] + 1.0)
+                    obj_coeff * obj_coeff / (self.non_basic_col_sq_norms[col] + 1.0)
                 } else {
                     // TODO: simple "biggest coeff" rule seems to perform much better than
                     // the steepest edge rule for minimizing artificial objective (phase 1).
                     // Why is that?
-                    direction
+                    obj_coeff.abs()
                 };
                 if score > best_score {
                     best_col = Some(col);
@@ -722,43 +721,49 @@ impl Solver {
                 (max, min)
             }
         };
-        let entering_diff_sign = (entering_other_val - entering_cur_val).signum();
+        let is_positive_direction = (entering_other_val - entering_cur_val) > 0.0;
 
         self.calc_col_coeffs(entering_c);
 
         let mut leaving_r = None;
-        let mut min_entering_diff = f64::abs(entering_cur_val - entering_other_val);
-        let mut leaving_coeff = 0.0f64;
+        let mut min_entering_diff_abs = f64::abs(entering_cur_val - entering_other_val);
+        let mut pivot_coeff = 0.0f64;
         let mut leaving_new_val = 0.0;
         for (r, &coeff) in self.col_coeffs.iter() {
             if coeff.abs() < 1e-8 {
                 continue;
             }
 
+            // leaving_diff = -entering_diff * coeff. From this we can determine
+            // in which direction this basic var will change if we choose it as leaving.
             let var = self.basic_vars[r];
-            let limit_val = if coeff * entering_diff_sign < 0.0 {
+            let limit_val = if (is_positive_direction && coeff < 0.0)
+                || (!is_positive_direction && coeff > 0.0)
+            {
                 self.orig_var_maxs[var]
             } else {
                 self.orig_var_mins[var]
             };
 
-            let cur_entering_diff = f64::abs((limit_val - self.cur_bounds[r]) / coeff);
+            // By which amount can we change the entering variable so that the limit on this
+            // basic var is not violated. The var with the minimum such amount becomes leaving.
+            let entering_diff_abs = f64::abs((limit_val - self.cur_bounds[r]) / coeff);
 
-            let should_choose = cur_entering_diff < min_entering_diff - 1e-8
-                || (cur_entering_diff < min_entering_diff + 1e-8
-                    // There is uncertainty in choosing the leaving variable row.
+            let should_choose = entering_diff_abs < min_entering_diff_abs - 1e-8
+                || (entering_diff_abs < min_entering_diff_abs + 1e-8
+                    // There is uncertainty in choosing the leaving variable.
                     // Choose the one with the biggest absolute coeff for the reasons of
                     // numerical stability.
-                    && (coeff.abs() > leaving_coeff.abs() + 1e-8
-                        || coeff.abs() > leaving_coeff.abs() - 1e-8
+                    && (coeff.abs() > pivot_coeff.abs() + 1e-8
+                        || coeff.abs() > pivot_coeff.abs() - 1e-8
                             // There is still uncertainty, choose based on the column index.
                             // NOTE: this still doesn't guarantee the absence of cycling.
                             && leaving_r.is_none() || r < leaving_r.unwrap()));
 
             if should_choose {
                 leaving_r = Some(r);
-                min_entering_diff = cur_entering_diff;
-                leaving_coeff = coeff;
+                min_entering_diff_abs = entering_diff_abs;
+                pivot_coeff = coeff;
                 leaving_new_val = limit_val;
             }
         }
@@ -766,7 +771,7 @@ impl Solver {
         if let Some(row) = leaving_r {
             self.calc_row_coeffs(row);
 
-            let entering_diff = (self.cur_bounds[row] - leaving_new_val) / leaving_coeff;
+            let entering_diff = (self.cur_bounds[row] - leaving_new_val) / pivot_coeff;
             let entering_new_val = entering_cur_val + entering_diff;
 
             Ok(Some(PivotInfo {
@@ -775,7 +780,7 @@ impl Solver {
                 entering_diff,
                 elem: Some(PivotElem {
                     row,
-                    coeff: leaving_coeff,
+                    coeff: pivot_coeff,
                     leaving_new_val,
                 }),
             }))
@@ -802,6 +807,16 @@ impl Solver {
             let val = self.cur_bounds[r];
             let min = self.orig_var_mins[var];
             let max = self.orig_var_maxs[var];
+            // If we choose this var as leaving, its new val will be at the boundary
+            // which is violated.
+            // Why is that? We must maintain primal optimality (a.k.a. dual feasibility)
+            // thus new_obj_coeff must be <= 0 if new_val is min, and >= 0 if new_val is max.
+            // sign(new_obj_coeff) = -sign(old_obj_coeff) * sign(pivot_coeff).
+            // Another constraint is that we must increase primal feasibility (and thus objective).
+            // As sign(obj_val_diff) = sign(old_obj_coeff) * sign(leaving_diff) * sign(pivot_coeff)
+            // must be >= 0, we conclude that sign(new_obj_coeff) = -sign(leaving_diff).
+            // From this we see that if old val was < min, dual feasibility is maintained if the
+            // new var is min (analogously for max).
             let (cur_infeasibility, new_val) = if val < min - 1e-8 {
                 (min - val, min)
             } else if val > max + 1e-8 {
@@ -809,6 +824,8 @@ impl Solver {
             } else {
                 continue;
             };
+
+            // Simple heuristic: choose the basic variable with max distance to violated bound.
             if cur_infeasibility > max_infeasibility {
                 leaving_r = Some(r);
                 max_infeasibility = cur_infeasibility;
@@ -831,7 +848,7 @@ impl Solver {
         let is_positive_direction = leaving_new_val > self.cur_bounds[row];
 
         let mut entering_c = None;
-        let mut min_diff = f64::INFINITY;
+        let mut min_obj_coeff_diff_abs = f64::INFINITY;
         let mut pivot_coeff_abs = f64::NEG_INFINITY;
         let mut pivot_coeff = 0.0;
         for (c, &coeff) in self.row_coeffs.iter() {
@@ -859,17 +876,20 @@ impl Solver {
                 continue;
             }
 
-            let cur_diff = f64::abs(obj_coeff / coeff);
+            // If we change obj. coeff of the leaving variable by this amount,
+            // obj. coeff if the current variable will reach the bound of dual infeasibility.
+            // Variable with the tightest such bound is the entering variable.
+            let cur_diff_abs = f64::abs(obj_coeff / coeff);
 
-            // See comments in `choose_pivot_row`.
-            let should_choose = cur_diff < min_diff - 1e-8
-                || (cur_diff < min_diff + 1e-8
+            // See comments in `choose_pivot_row` concerning numeric stability.
+            let should_choose = cur_diff_abs < min_obj_coeff_diff_abs - 1e-8
+                || (cur_diff_abs < min_obj_coeff_diff_abs + 1e-8
                     && (coeff_abs > pivot_coeff_abs + 1e-8
                         || coeff_abs > pivot_coeff_abs - 1e-8 && c < entering_c.unwrap()));
 
             if should_choose {
                 entering_c = Some(c);
-                min_diff = cur_diff;
+                min_obj_coeff_diff_abs = cur_diff_abs;
                 pivot_coeff_abs = coeff_abs;
                 pivot_coeff = coeff;
             }
@@ -1122,6 +1142,10 @@ struct PivotInfo {
     col: usize,
     entering_new_val: f64,
     entering_diff: f64,
+
+    /// Contains info about the intersection between pivot row and column.
+    /// If it is None, objective can be decreased without changing the basis
+    /// (simply by changing the value of non-basic variable chosen as entering)
     elem: Option<PivotElem>,
 }
 
