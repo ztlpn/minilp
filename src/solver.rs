@@ -656,18 +656,6 @@ impl Solver {
             .to_sparse_vec(&mut self.col_coeffs);
     }
 
-    fn calc_eta_matrix_coeffs(&mut self, r_leaving: usize, pivot_coeff: f64) {
-        self.eta_matrix_coeffs.clear();
-        for (r, &coeff) in self.col_coeffs.iter() {
-            let val = if r == r_leaving {
-                (coeff - 1.0) / pivot_coeff
-            } else {
-                coeff / pivot_coeff
-            };
-            self.eta_matrix_coeffs.push(r, val);
-        }
-    }
-
     /// Calculate current coeffs row for a single constraint (permuted according to non_basic_vars).
     fn calc_row_coeffs(&mut self, r_constr: usize) {
         let tmp = self
@@ -681,98 +669,6 @@ impl Solver {
                     *self.row_coeffs.get_mut(idx) += val * coeff;
                 }
             }
-        }
-    }
-
-    fn pivot(&mut self, pivot_info: &PivotInfo) {
-        // TODO: periodically (say, every 1000 pivots) recalc cur_bounds and cur_obj
-        // from scratch for numerical stability.
-
-        self.cur_obj_val -= self.cur_obj[pivot_info.col] * pivot_info.entering_diff;
-
-        if pivot_info.elem.is_none() {
-            // "entering" var is still non-basic, it just changes value from one limit
-            // to the other.
-            self.non_basic_vals[pivot_info.col] = pivot_info.entering_new_val;
-            for (r, coeff) in self.col_coeffs.iter() {
-                self.cur_bounds[r] -= pivot_info.entering_diff * coeff;
-            }
-            return;
-        }
-        let pivot_elem = pivot_info.elem.as_ref().unwrap();
-
-        for (r, coeff) in self.col_coeffs.iter() {
-            if r == pivot_elem.row {
-                self.cur_bounds[r] = pivot_info.entering_new_val;
-            } else {
-                self.cur_bounds[r] -= pivot_info.entering_diff * coeff;
-            }
-        }
-
-        self.non_basic_vals[pivot_info.col] = pivot_elem.leaving_new_val;
-
-        let pivot_obj = self.cur_obj[pivot_info.col] / pivot_elem.coeff;
-        for (c, &coeff) in self.row_coeffs.iter() {
-            if c == pivot_info.col {
-                self.cur_obj[c] = -pivot_obj;
-            } else {
-                self.cur_obj[c] -= pivot_obj * coeff;
-            }
-        }
-
-        self.calc_eta_matrix_coeffs(pivot_elem.row, pivot_elem.coeff);
-
-        if self.enable_steepest_edge {
-            // Computations for the steepest edge pivoting rule. See
-            // Vanderbei, Robert J. "Linear Programming: Foundations and Extensions." (2001).
-            // p. 149.
-
-            let tmp = self
-                .basis_solver
-                .solve_transp(self.eta_matrix_coeffs.iter());
-            // now tmp contains the (w - v)/x_i vector.
-
-            // Calculate transp(N) * (w - v) / x_1
-            self.sq_norms_update_helper.clear();
-            for (r, &coeff) in tmp.iter() {
-                for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
-                    let idx = self.non_basic_vars_inv[v];
-                    if idx != SENTINEL {
-                        *self.sq_norms_update_helper.get_mut(idx) += val * coeff;
-                    }
-                }
-            }
-
-            let eta_sq_norm = self.eta_matrix_coeffs.sq_norm();
-            for (c, &r_coeff) in self.row_coeffs.iter() {
-                if c == pivot_info.col {
-                    self.non_basic_col_sq_norms[c] = eta_sq_norm - 1.0 + 2.0 / pivot_elem.coeff;
-                } else {
-                    self.non_basic_col_sq_norms[c] +=
-                        -2.0 * r_coeff * self.sq_norms_update_helper.get(c)
-                            + eta_sq_norm * r_coeff * r_coeff;
-                }
-            }
-        }
-
-        let entering_var = self.non_basic_vars[pivot_info.col];
-        let leaving_var = self.basic_vars[pivot_elem.row];
-
-        self.basic_vars[pivot_elem.row] = entering_var;
-        self.basic_vars_inv[entering_var] = pivot_elem.row;
-        self.basic_vars_inv[leaving_var] = SENTINEL;
-
-        self.non_basic_vars[pivot_info.col] = leaving_var;
-        self.non_basic_vars_inv[entering_var] = SENTINEL;
-        self.non_basic_vars_inv[leaving_var] = pivot_info.col;
-
-        let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
-        if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() / 2 {
-            self.basis_solver
-                .push_eta_matrix(pivot_elem.row, &self.eta_matrix_coeffs);
-        } else {
-            self.basis_solver
-                .reset(&self.orig_constraints_csc, &self.basic_vars);
         }
     }
 
@@ -995,6 +891,110 @@ impl Solver {
             })
         } else {
             Err(Error::Infeasible)
+        }
+    }
+
+    fn pivot(&mut self, pivot_info: &PivotInfo) {
+        // TODO: periodically (say, every 1000 pivots) recalc cur_bounds and cur_obj
+        // from scratch for numerical stability.
+
+        self.cur_obj_val -= self.cur_obj[pivot_info.col] * pivot_info.entering_diff;
+
+        if pivot_info.elem.is_none() {
+            // "entering" var is still non-basic, it just changes value from one limit
+            // to the other.
+            self.non_basic_vals[pivot_info.col] = pivot_info.entering_new_val;
+            for (r, coeff) in self.col_coeffs.iter() {
+                self.cur_bounds[r] -= pivot_info.entering_diff * coeff;
+            }
+            return;
+        }
+        let pivot_elem = pivot_info.elem.as_ref().unwrap();
+
+        for (r, coeff) in self.col_coeffs.iter() {
+            if r == pivot_elem.row {
+                self.cur_bounds[r] = pivot_info.entering_new_val;
+            } else {
+                self.cur_bounds[r] -= pivot_info.entering_diff * coeff;
+            }
+        }
+
+        self.non_basic_vals[pivot_info.col] = pivot_elem.leaving_new_val;
+
+        let pivot_obj = self.cur_obj[pivot_info.col] / pivot_elem.coeff;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            if c == pivot_info.col {
+                self.cur_obj[c] = -pivot_obj;
+            } else {
+                self.cur_obj[c] -= pivot_obj * coeff;
+            }
+        }
+
+        self.calc_eta_matrix_coeffs(pivot_elem.row, pivot_elem.coeff);
+
+        if self.enable_steepest_edge {
+            // Computations for the steepest edge pivoting rule. See
+            // Vanderbei, Robert J. "Linear Programming: Foundations and Extensions." (2001).
+            // p. 149.
+
+            let tmp = self
+                .basis_solver
+                .solve_transp(self.eta_matrix_coeffs.iter());
+            // now tmp contains the (w - v)/x_i vector.
+
+            // Calculate transp(N) * (w - v) / x_1
+            self.sq_norms_update_helper.clear();
+            for (r, &coeff) in tmp.iter() {
+                for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
+                    let idx = self.non_basic_vars_inv[v];
+                    if idx != SENTINEL {
+                        *self.sq_norms_update_helper.get_mut(idx) += val * coeff;
+                    }
+                }
+            }
+
+            let eta_sq_norm = self.eta_matrix_coeffs.sq_norm();
+            for (c, &r_coeff) in self.row_coeffs.iter() {
+                if c == pivot_info.col {
+                    self.non_basic_col_sq_norms[c] = eta_sq_norm - 1.0 + 2.0 / pivot_elem.coeff;
+                } else {
+                    self.non_basic_col_sq_norms[c] +=
+                        -2.0 * r_coeff * self.sq_norms_update_helper.get(c)
+                            + eta_sq_norm * r_coeff * r_coeff;
+                }
+            }
+        }
+
+        let entering_var = self.non_basic_vars[pivot_info.col];
+        let leaving_var = self.basic_vars[pivot_elem.row];
+
+        self.basic_vars[pivot_elem.row] = entering_var;
+        self.basic_vars_inv[entering_var] = pivot_elem.row;
+        self.basic_vars_inv[leaving_var] = SENTINEL;
+
+        self.non_basic_vars[pivot_info.col] = leaving_var;
+        self.non_basic_vars_inv[entering_var] = SENTINEL;
+        self.non_basic_vars_inv[leaving_var] = pivot_info.col;
+
+        let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
+        if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() / 2 {
+            self.basis_solver
+                .push_eta_matrix(pivot_elem.row, &self.eta_matrix_coeffs);
+        } else {
+            self.basis_solver
+                .reset(&self.orig_constraints_csc, &self.basic_vars);
+        }
+    }
+
+    fn calc_eta_matrix_coeffs(&mut self, r_leaving: usize, pivot_coeff: f64) {
+        self.eta_matrix_coeffs.clear();
+        for (r, &coeff) in self.col_coeffs.iter() {
+            let val = if r == r_leaving {
+                (coeff - 1.0) / pivot_coeff
+            } else {
+                coeff / pivot_coeff
+            };
+            self.eta_matrix_coeffs.push(r, val);
         }
     }
 
