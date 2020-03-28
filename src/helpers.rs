@@ -35,7 +35,7 @@ where
 }
 
 #[cfg(test)]
-use sprs::{CsVec, CsMat};
+use sprs::{CsMat, CsVec};
 
 #[cfg(test)]
 pub(crate) fn to_sparse(slice: &[f64]) -> CsVec<f64> {

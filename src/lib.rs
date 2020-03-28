@@ -100,7 +100,7 @@ impl std::error::Error for Error {}
 
 #[derive(Clone)]
 pub struct Problem {
-    obj: Vec<f64>,
+    obj_coeffs: Vec<f64>,
     var_mins: Vec<f64>,
     var_maxs: Vec<f64>,
     constraints: Vec<(CsVec, RelOp, f64)>,
@@ -111,7 +111,7 @@ type CsVec = sprs::CsVecI<f64, usize>;
 impl Problem {
     pub fn new() -> Self {
         Problem {
-            obj: vec![],
+            obj_coeffs: vec![],
             var_mins: vec![],
             var_maxs: vec![],
             constraints: vec![],
@@ -119,32 +119,32 @@ impl Problem {
     }
 
     pub fn add_var(&mut self, min: Option<f64>, max: Option<f64>, obj_coeff: f64) -> Variable {
-        let var = Variable(self.obj.len());
-        self.obj.push(obj_coeff);
+        let var = Variable(self.obj_coeffs.len());
+        self.obj_coeffs.push(obj_coeff);
         self.var_mins.push(min.unwrap_or(f64::NEG_INFINITY));
         self.var_maxs.push(max.unwrap_or(f64::INFINITY));
         var
     }
 
-    pub fn add_constraint(&mut self, expr: impl Into<LinearExpr>, rel_op: RelOp, bound: f64) {
+    pub fn add_constraint(&mut self, expr: impl Into<LinearExpr>, rel_op: RelOp, rhs: f64) {
         let expr = expr.into();
         self.constraints.push((
-            CsVec::new(self.obj.len(), expr.vars, expr.coeffs),
+            CsVec::new(self.obj_coeffs.len(), expr.vars, expr.coeffs),
             rel_op,
-            bound,
+            rhs,
         ));
     }
 
     pub fn solve(&self) -> Result<Solution, Error> {
         let mut solver = Solver::try_new(
-            &self.obj,
+            &self.obj_coeffs,
             &self.var_mins,
             &self.var_maxs,
             &self.constraints,
         )?;
         solver.optimize()?;
         Ok(Solution {
-            num_vars: self.obj.len(),
+            num_vars: self.obj_coeffs.len(),
             solver,
         })
     }
@@ -190,13 +190,13 @@ impl Solution {
         mut self,
         expr: impl Into<LinearExpr>,
         rel_op: RelOp,
-        bound: f64,
+        rhs: f64,
     ) -> Result<Self, Error> {
         let expr = expr.into();
         self.solver.add_constraint(
             CsVec::new(self.num_vars, expr.vars, expr.coeffs),
             rel_op,
-            bound,
+            rhs,
         )?;
         Ok(self)
     }
