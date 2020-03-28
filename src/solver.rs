@@ -345,7 +345,7 @@ impl Solver {
             // if var was basic, remove it.
             self.calc_row_coeffs(basic_row);
             let pivot_info = self.choose_entering_col_dual(basic_row, val)?;
-            self.calc_col_coeffs(pivot_info.entering_c);
+            self.calc_col_coeffs(pivot_info.col);
             self.pivot(&pivot_info);
         } else if non_basic_col != SENTINEL {
             self.calc_col_coeffs(non_basic_col);
@@ -448,23 +448,19 @@ impl Solver {
                 break;
             }
 
-            if let Some(pivot_info) = self.choose_pivot() {
-                if pivot_info.entering_new_val.is_infinite() {
-                    return Err(Error::Unbounded);
-                }
-                self.pivot(&pivot_info);
-
-                if let Some(leaving) = pivot_info.leaving_r {
+            if let Some(pivot_info) = self.choose_pivot()? {
+                if let Some(pivot_elem) = &pivot_info.elem {
+                    let entering_var = self.non_basic_vars[pivot_info.col];
+                    let leaving_var = self.basic_vars[pivot_elem.row];
                     let art_vars_start = self.num_vars + self.num_slack_vars;
-                    match (
-                        pivot_info.entering_var < art_vars_start,
-                        leaving.var < art_vars_start,
-                    ) {
+                    match (entering_var < art_vars_start, leaving_var < art_vars_start) {
                         (true, false) => cur_artificial_vars -= 1,
                         (false, true) => cur_artificial_vars += 1,
                         _ => {}
                     }
                 }
+
+                self.pivot(&pivot_info);
             } else {
                 break;
             }
@@ -523,10 +519,7 @@ impl Solver {
                 );
             }
 
-            if let Some(pivot_info) = self.choose_pivot() {
-                if pivot_info.entering_new_val.is_infinite() {
-                    return Err(Error::Unbounded);
-                }
+            if let Some(pivot_info) = self.choose_pivot()? {
                 self.pivot(&pivot_info);
             } else {
                 debug!(
@@ -558,7 +551,7 @@ impl Solver {
             if let Some((row, leaving_new_val)) = self.choose_pivot_row_dual() {
                 self.calc_row_coeffs(row);
                 let pivot_info = self.choose_entering_col_dual(row, leaving_new_val)?;
-                self.calc_col_coeffs(pivot_info.entering_c);
+                self.calc_col_coeffs(pivot_info.col);
                 self.pivot(&pivot_info);
             } else {
                 debug!(
@@ -691,43 +684,43 @@ impl Solver {
         }
     }
 
-    fn pivot(&mut self, info: &PivotInfo) {
+    fn pivot(&mut self, pivot_info: &PivotInfo) {
         // TODO: periodically (say, every 1000 pivots) recalc cur_bounds and cur_obj
         // from scratch for numerical stability.
 
-        self.cur_obj_val -= self.cur_obj[info.entering_c] * info.entering_diff;
+        self.cur_obj_val -= self.cur_obj[pivot_info.col] * pivot_info.entering_diff;
 
-        if info.leaving_r.is_none() {
+        if pivot_info.elem.is_none() {
             // "entering" var is still non-basic, it just changes value from one limit
             // to the other.
-            self.non_basic_vals[info.entering_c] = info.entering_new_val;
+            self.non_basic_vals[pivot_info.col] = pivot_info.entering_new_val;
             for (r, coeff) in self.col_coeffs.iter() {
-                self.cur_bounds[r] -= info.entering_diff * coeff;
+                self.cur_bounds[r] -= pivot_info.entering_diff * coeff;
             }
             return;
         }
-        let leaving = info.leaving_r.as_ref().unwrap();
+        let pivot_elem = pivot_info.elem.as_ref().unwrap();
 
         for (r, coeff) in self.col_coeffs.iter() {
-            if r == leaving.r {
-                self.cur_bounds[r] = info.entering_new_val;
+            if r == pivot_elem.row {
+                self.cur_bounds[r] = pivot_info.entering_new_val;
             } else {
-                self.cur_bounds[r] -= info.entering_diff * coeff;
+                self.cur_bounds[r] -= pivot_info.entering_diff * coeff;
             }
         }
 
-        self.non_basic_vals[info.entering_c] = leaving.new_val;
+        self.non_basic_vals[pivot_info.col] = pivot_elem.leaving_new_val;
 
-        let pivot_obj = self.cur_obj[info.entering_c] / leaving.coeff;
+        let pivot_obj = self.cur_obj[pivot_info.col] / pivot_elem.coeff;
         for (c, &coeff) in self.row_coeffs.iter() {
-            if c == info.entering_c {
+            if c == pivot_info.col {
                 self.cur_obj[c] = -pivot_obj;
             } else {
                 self.cur_obj[c] -= pivot_obj * coeff;
             }
         }
 
-        self.calc_eta_matrix_coeffs(leaving.r, leaving.coeff);
+        self.calc_eta_matrix_coeffs(pivot_elem.row, pivot_elem.coeff);
 
         if self.enable_steepest_edge {
             // Computations for the steepest edge pivoting rule. See
@@ -752,8 +745,8 @@ impl Solver {
 
             let eta_sq_norm = self.eta_matrix_coeffs.sq_norm();
             for (c, &r_coeff) in self.row_coeffs.iter() {
-                if c == info.entering_c {
-                    self.non_basic_col_sq_norms[c] = eta_sq_norm - 1.0 + 2.0 / leaving.coeff;
+                if c == pivot_info.col {
+                    self.non_basic_col_sq_norms[c] = eta_sq_norm - 1.0 + 2.0 / pivot_elem.coeff;
                 } else {
                     self.non_basic_col_sq_norms[c] +=
                         -2.0 * r_coeff * self.sq_norms_update_helper.get(c)
@@ -762,29 +755,31 @@ impl Solver {
             }
         }
 
-        self.basic_vars[leaving.r] = info.entering_var;
-        self.basic_vars_inv[info.entering_var] = leaving.r;
-        self.basic_vars_inv[leaving.var] = SENTINEL;
+        let entering_var = self.non_basic_vars[pivot_info.col];
+        let leaving_var = self.basic_vars[pivot_elem.row];
 
-        self.non_basic_vars[info.entering_c] = leaving.var;
-        self.non_basic_vars_inv[info.entering_var] = SENTINEL;
-        self.non_basic_vars_inv[leaving.var] = info.entering_c;
+        self.basic_vars[pivot_elem.row] = entering_var;
+        self.basic_vars_inv[entering_var] = pivot_elem.row;
+        self.basic_vars_inv[leaving_var] = SENTINEL;
+
+        self.non_basic_vars[pivot_info.col] = leaving_var;
+        self.non_basic_vars_inv[entering_var] = SENTINEL;
+        self.non_basic_vars_inv[leaving_var] = pivot_info.col;
 
         let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
         if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() / 2 {
             self.basis_solver
-                .push_eta_matrix(leaving.r, &self.eta_matrix_coeffs);
+                .push_eta_matrix(pivot_elem.row, &self.eta_matrix_coeffs);
         } else {
             self.basis_solver
                 .reset(&self.orig_constraints_csc, &self.basic_vars);
         }
     }
 
-    fn choose_pivot(&mut self) -> Option<PivotInfo> {
-        let (entering_c, entering_var) = {
+    fn choose_pivot(&mut self) -> Result<Option<PivotInfo>, Error> {
+        let entering_c = {
             let mut best_col = None;
             let mut best_score = f64::NEG_INFINITY;
-            let mut best_var = 0;
             for col in 0..self.cur_obj.len() {
                 let var = self.non_basic_vars[col];
                 let direction = if self.non_basic_vals[col] == self.orig_var_mins[var] {
@@ -811,14 +806,13 @@ impl Solver {
                 if score > best_score {
                     best_col = Some(col);
                     best_score = score;
-                    best_var = var;
                 }
             }
 
             if let Some(col) = best_col {
-                (col, best_var)
+                col
             } else {
-                return None;
+                return Ok(None);
             }
         };
 
@@ -837,7 +831,6 @@ impl Solver {
         self.calc_col_coeffs(entering_c);
 
         let mut leaving_r = None;
-        let mut leaving_var = 0;
         let mut min_entering_diff = f64::abs(entering_cur_val - entering_other_val);
         let mut leaving_coeff = 0.0f64;
         let mut leaving_new_val = 0.0;
@@ -868,7 +861,6 @@ impl Solver {
 
             if should_choose {
                 leaving_r = Some(r);
-                leaving_var = var;
                 min_entering_diff = cur_entering_diff;
                 leaving_coeff = coeff;
                 leaving_new_val = limit_val;
@@ -881,26 +873,27 @@ impl Solver {
             let entering_diff = (self.cur_bounds[row] - leaving_new_val) / leaving_coeff;
             let entering_new_val = entering_cur_val + entering_diff;
 
-            Some(PivotInfo {
-                entering_c,
-                entering_var,
+            Ok(Some(PivotInfo {
+                col: entering_c,
                 entering_new_val,
                 entering_diff,
-                leaving_r: Some(PivotLeavingRow {
-                    r: row,
-                    var: leaving_var,
-                    new_val: leaving_new_val,
+                elem: Some(PivotElem {
+                    row,
                     coeff: leaving_coeff,
+                    leaving_new_val,
                 }),
-            })
+            }))
         } else {
-            Some(PivotInfo {
-                entering_c,
-                entering_var,
+            if entering_other_val.is_infinite() {
+                return Err(Error::Unbounded);
+            }
+
+            Ok(Some(PivotInfo {
+                col: entering_c,
                 entering_new_val: entering_other_val,
                 entering_diff: entering_other_val - entering_cur_val,
-                leaving_r: None,
-            })
+                elem: None,
+            }))
         }
     }
 
@@ -934,13 +927,12 @@ impl Solver {
         }
     }
 
-    /// returns index into non_basic_vars
     fn choose_entering_col_dual(
         &self,
-        leaving_r: usize,
+        row: usize,
         leaving_new_val: f64,
     ) -> Result<PivotInfo, Error> {
-        let is_positive_direction = leaving_new_val > self.cur_bounds[leaving_r];
+        let is_positive_direction = leaving_new_val > self.cur_bounds[row];
 
         let mut entering_c = None;
         let mut min_diff = f64::INFINITY;
@@ -987,20 +979,17 @@ impl Solver {
             }
         }
 
-        if let Some(c) = entering_c {
-            let var = self.non_basic_vars[c];
-            let entering_diff = (self.cur_bounds[leaving_r] - leaving_new_val) / pivot_coeff;
-            let entering_new_val = self.non_basic_vals[c] + entering_diff;
+        if let Some(col) = entering_c {
+            let entering_diff = (self.cur_bounds[row] - leaving_new_val) / pivot_coeff;
+            let entering_new_val = self.non_basic_vals[col] + entering_diff;
 
             Ok(PivotInfo {
-                entering_c: c,
-                entering_var: var,
+                col,
                 entering_new_val,
                 entering_diff,
-                leaving_r: Some(PivotLeavingRow {
-                    r: leaving_r,
-                    var: self.basic_vars[leaving_r],
-                    new_val: leaving_new_val,
+                elem: Some(PivotElem {
+                    row,
+                    leaving_new_val,
                     coeff: pivot_coeff,
                 }),
             })
@@ -1130,18 +1119,16 @@ impl Solver {
 }
 
 struct PivotInfo {
-    entering_c: usize,
-    entering_var: usize,
+    col: usize,
     entering_new_val: f64,
     entering_diff: f64,
-    leaving_r: Option<PivotLeavingRow>,
+    elem: Option<PivotElem>,
 }
 
-struct PivotLeavingRow {
-    r: usize,
-    var: usize,
-    new_val: f64,
+struct PivotElem {
+    row: usize,
     coeff: f64,
+    leaving_new_val: f64,
 }
 
 /// Stuff related to inversion of the basis matrix
