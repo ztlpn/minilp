@@ -282,10 +282,6 @@ impl TriangleMat {
         self.nondiag.cols()
     }
 
-    pub(crate) fn nnz(&self) -> usize {
-        self.nondiag.nnz() + self.nondiag.rows()
-    }
-
     pub(crate) fn transpose(&self) -> TriangleMat {
         TriangleMat {
             nondiag: self.nondiag.transpose(),

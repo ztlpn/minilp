@@ -363,7 +363,7 @@ impl Solver {
     pub(crate) fn unset_var(&mut self, var: usize) -> Result<bool, Error> {
         if let VarState::NonBasic(col) = self.var_states[var] {
             if !std::mem::replace(&mut self.non_basic_var_is_fixed[col], false) {
-                return Ok(false)
+                return Ok(false);
             }
 
             self.calc_col_coeffs(col);
@@ -637,7 +637,7 @@ impl Solver {
     }
 
     fn nnz(&self) -> usize {
-        self.basis_solver.lu_factors.nnz()
+        self.basis_solver.lu_factors.nnz() + self.basis_solver.eta_matrices.coeff_cols.nnz()
     }
 
     /// Calculate current coeffs column for a single non-basic variable.
@@ -984,8 +984,11 @@ impl Solver {
         self.non_basic_vars[pivot_info.col] = leaving_var;
         self.var_states[leaving_var] = VarState::NonBasic(pivot_info.col);
 
+        // A simple heuristic to choose when to recompute LU factorization.
+        // Note: a possible failure mode is that the LU factorization accidentally
+        // generates a lot of fill-in and doesn't get recomputed for a long time.
         let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
-        if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() / 2 {
+        if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() {
             self.basis_solver
                 .push_eta_matrix(pivot_elem.row, &self.eta_matrix_coeffs);
         } else {

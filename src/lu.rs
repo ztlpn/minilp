@@ -50,7 +50,7 @@ impl std::fmt::Debug for LUFactors {
 
 impl LUFactors {
     pub fn nnz(&self) -> usize {
-        self.lower.nnz() + self.upper.nnz()
+        self.lower.nondiag.nnz() + self.upper.nondiag.nnz() + self.lower.cols()
     }
 
     pub fn solve_dense(&self, rhs: &mut [f64], scratch: &mut ScratchSpace) {
