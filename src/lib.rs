@@ -9,6 +9,12 @@ mod sparse;
 
 use solver::Solver;
 
+#[derive(Clone, Copy, Debug)]
+pub enum OptimizationDirection {
+    Minimize,
+    Maximize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Variable(usize);
 
@@ -100,6 +106,7 @@ impl std::error::Error for Error {}
 
 #[derive(Clone)]
 pub struct Problem {
+    direction: OptimizationDirection,
     obj_coeffs: Vec<f64>,
     var_mins: Vec<f64>,
     var_maxs: Vec<f64>,
@@ -109,8 +116,9 @@ pub struct Problem {
 type CsVec = sprs::CsVecI<f64, usize>;
 
 impl Problem {
-    pub fn new() -> Self {
+    pub fn new(direction: OptimizationDirection) -> Self {
         Problem {
+            direction,
             obj_coeffs: vec![],
             var_mins: vec![],
             var_maxs: vec![],
@@ -120,6 +128,10 @@ impl Problem {
 
     pub fn add_var(&mut self, min: Option<f64>, max: Option<f64>, obj_coeff: f64) -> Variable {
         let var = Variable(self.obj_coeffs.len());
+        let obj_coeff = match self.direction {
+            OptimizationDirection::Minimize => obj_coeff,
+            OptimizationDirection::Maximize => -obj_coeff,
+        };
         self.obj_coeffs.push(obj_coeff);
         self.var_mins.push(min.unwrap_or(f64::NEG_INFINITY));
         self.var_maxs.push(max.unwrap_or(f64::INFINITY));
@@ -145,6 +157,7 @@ impl Problem {
         solver.optimize()?;
         Ok(Solution {
             num_vars: self.obj_coeffs.len(),
+            direction: self.direction,
             solver,
         })
     }
@@ -153,12 +166,16 @@ impl Problem {
 #[derive(Clone)]
 pub struct Solution {
     num_vars: usize,
+    direction: OptimizationDirection,
     solver: solver::Solver,
 }
 
 impl Solution {
     pub fn objective(&self) -> f64 {
-        self.solver.cur_obj_val
+        match self.direction {
+            OptimizationDirection::Minimize => self.solver.cur_obj_val,
+            OptimizationDirection::Maximize => -self.solver.cur_obj_val,
+        }
     }
 
     pub fn get(&self, var: Variable) -> &f64 {
@@ -252,16 +269,16 @@ mod tests {
 
     #[test]
     fn optimize() {
-        let mut problem = Problem::new();
-        let v1 = problem.add_var(Some(12.0), None, -3.0);
-        let v2 = problem.add_var(Some(5.0), None, -4.0);
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let v1 = problem.add_var(Some(12.0), None, 3.0);
+        let v2 = problem.add_var(Some(5.0), None, 4.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 20.0);
         problem.add_constraint(&[(v2, -4.0), (v1, 1.0)], RelOp::Ge, -20.0);
 
         let sol = problem.solve().unwrap();
         assert_eq!(sol[v1], 12.0);
         assert_eq!(sol[v2], 8.0);
-        assert_eq!(sol.objective(), -68.0);
+        assert_eq!(sol.objective(), 68.0);
     }
 
     #[test]
@@ -272,7 +289,7 @@ mod tests {
             (LinearExpr::empty(), RelOp::Le, 1.0),
         ];
 
-        let mut problem = Problem::new();
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
         let _ = problem.add_var(Some(0.0), None, 1.0);
         for (expr, op, b) in trivial.iter().cloned() {
             problem.add_constraint(expr, op, b);
@@ -310,9 +327,9 @@ mod tests {
 
     #[test]
     fn set_unset_var() {
-        let mut problem = Problem::new();
-        let v1 = problem.add_var(Some(0.0), Some(3.0), -1.0);
-        let v2 = problem.add_var(Some(0.0), Some(3.0), -2.0);
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let v1 = problem.add_var(Some(0.0), Some(3.0), 1.0);
+        let v2 = problem.add_var(Some(0.0), Some(3.0), 2.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 4.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Ge, 1.0);
 
@@ -322,30 +339,30 @@ mod tests {
             let mut sol = orig_sol.clone().set_var(v1, 0.5).unwrap();
             assert_eq!(sol[v1], 0.5);
             assert_eq!(sol[v2], 3.0);
-            assert_eq!(sol.objective(), -6.5);
+            assert_eq!(sol.objective(), 6.5);
 
             sol = sol.unset_var(v1).unwrap().0;
             assert_eq!(sol[v1], 1.0);
             assert_eq!(sol[v2], 3.0);
-            assert_eq!(sol.objective(), -7.0);
+            assert_eq!(sol.objective(), 7.0);
         }
 
         {
             let mut sol = orig_sol.clone().set_var(v2, 2.5).unwrap();
             assert_eq!(sol[v1], 1.5);
             assert_eq!(sol[v2], 2.5);
-            assert_eq!(sol.objective(), -6.5);
+            assert_eq!(sol.objective(), 6.5);
 
             sol = sol.unset_var(v2).unwrap().0;
             assert_eq!(sol[v1], 1.0);
             assert_eq!(sol[v2], 3.0);
-            assert_eq!(sol.objective(), -7.0);
+            assert_eq!(sol.objective(), 7.0);
         }
     }
 
     #[test]
     fn add_constraint() {
-        let mut problem = Problem::new();
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
         let v1 = problem.add_var(Some(0.0), None, 2.0);
         let v2 = problem.add_var(Some(0.0), None, 1.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 4.0);
@@ -390,7 +407,7 @@ mod tests {
 
     #[test]
     fn gomory_cut() {
-        let mut problem = Problem::new();
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
         let v1 = problem.add_var(Some(0.0), None, 0.0);
         let v2 = problem.add_var(Some(0.0), None, -1.0);
         problem.add_constraint(&[(v1, 3.0), (v2, 2.0)], RelOp::Le, 6.0);
