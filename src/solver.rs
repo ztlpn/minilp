@@ -6,11 +6,8 @@ use crate::{
 };
 
 use sprs::CompressedStorage;
-use std::collections::HashMap;
 
 type CsMat = sprs::CsMatI<f64, usize>;
-
-const SENTINEL: usize = 0usize.wrapping_sub(1);
 
 #[derive(Clone)]
 pub(crate) struct Solver {
@@ -25,8 +22,6 @@ pub(crate) struct Solver {
     orig_constraints_csc: CsMat,
     orig_bounds: Vec<f64>,
 
-    set_vars: HashMap<usize, f64>,
-
     enable_steepest_edge: bool,
 
     basis_solver: BasisSolver,
@@ -38,19 +33,20 @@ pub(crate) struct Solver {
     row_coeffs: ScatteredVec,
 
     // Updated on each pivot
-    /// for each constraint the corresponding basic var.
+
+    /// For each var: whether it is basic/non-basic and the corresponding index.
+    var_states: Vec<VarState>,
+
+    /// For each constraint the corresponding basic var.
     basic_vars: Vec<usize>,
-    /// (var -> idx if basic or sentinel) for all vars
-    basic_vars_inv: Vec<usize>,
     cur_bounds: Vec<f64>,
 
-    /// remaining variables. (idx -> var)
+    /// Remaining variables. (idx -> var)
     non_basic_vars: Vec<usize>,
-    /// (var -> idx if non-basic or sentinel) for all vars
-    non_basic_vars_inv: Vec<usize>,
     cur_obj: Vec<f64>,
     non_basic_vals: Vec<f64>,
     non_basic_col_sq_norms: Vec<f64>,
+    non_basic_var_is_fixed: Vec<bool>,
 
     pub(crate) cur_obj_val: f64,
 }
@@ -72,7 +68,6 @@ impl std::fmt::Debug for Solver {
         write!(f, "non_basic_vars:\n{:?}\n", self.non_basic_vars)?;
         write!(f, "cur_obj:\n{:?}\n", self.cur_obj)?;
         write!(f, "cur_obj_val: {:?}\n", self.cur_obj_val)?;
-        write!(f, "set_vars:\n{:?}\n", self.set_vars)?;
         Ok(())
     }
 }
@@ -95,8 +90,8 @@ impl Solver {
         let mut orig_var_mins = orig_var_mins.to_vec();
         let mut orig_var_maxs = orig_var_maxs.to_vec();
 
+        let mut var_states = vec![];
         let mut non_basic_vars = vec![];
-        let mut non_basic_vars_inv = vec![SENTINEL; num_vars];
 
         let mut obj_val = 0.0;
         let mut non_basic_vals = vec![];
@@ -111,7 +106,7 @@ impl Solver {
             }
 
             // initially all user-created variables are non-basic
-            non_basic_vars_inv[v] = non_basic_vars.len();
+            var_states.push(VarState::NonBasic(non_basic_vars.len()));
             non_basic_vars.push(v);
 
             let init_val = if min.is_finite() {
@@ -187,7 +182,7 @@ impl Solver {
         orig_var_mins.resize(num_total_vars, 0.0);
         orig_var_maxs.resize(num_total_vars, f64::INFINITY);
         // will be updated later
-        non_basic_vars_inv.resize(num_total_vars, SENTINEL);
+        var_states.resize(num_total_vars, VarState::NonBasic(0usize.wrapping_sub(1)));
 
         let mut cur_slack_var = num_vars;
         let mut cur_artificial_var = num_vars + num_slack_vars;
@@ -199,20 +194,19 @@ impl Solver {
         let mut orig_bounds = Vec::with_capacity(num_constraints);
         let mut cur_bounds = Vec::with_capacity(num_constraints);
         let mut basic_vars = vec![];
-        let mut basic_vars_inv = vec![SENTINEL; num_total_vars];
 
         for constr in constraints.into_iter() {
             if constr.need_art_var {
                 if constr.slack_var_coeff.is_some() {
-                    non_basic_vars_inv[cur_slack_var] = non_basic_vars.len();
+                    var_states[cur_slack_var] = VarState::NonBasic(non_basic_vars.len());
                     non_basic_vars.push(cur_slack_var);
                     non_basic_vals.push(0.0);
                 }
 
-                basic_vars_inv[cur_artificial_var] = basic_vars.len();
+                var_states[cur_artificial_var] = VarState::Basic(basic_vars.len());
                 basic_vars.push(cur_artificial_var);
             } else {
-                basic_vars_inv[cur_slack_var] = basic_vars.len();
+                var_states[cur_slack_var] = VarState::Basic(basic_vars.len());
                 basic_vars.push(cur_slack_var);
             }
 
@@ -273,6 +267,8 @@ impl Solver {
         .unwrap();
         let lu_factors_transp = lu_factors.transpose();
 
+        let non_basic_var_is_fixed = vec![false; non_basic_vars.len()];
+
         let res = Self {
             num_vars,
             num_slack_vars,
@@ -283,7 +279,6 @@ impl Solver {
             orig_constraints,
             orig_constraints_csc,
             orig_bounds,
-            set_vars: HashMap::new(),
             enable_steepest_edge,
             basis_solver: BasisSolver {
                 lu_factors,
@@ -296,14 +291,14 @@ impl Solver {
             eta_matrix_coeffs: SparseVec::new(),
             sq_norms_update_helper: ScatteredVec::empty(num_total_vars - num_constraints),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
+            var_states,
             basic_vars,
-            basic_vars_inv,
             cur_bounds,
             non_basic_vars,
-            non_basic_vars_inv,
             cur_obj,
             non_basic_vals,
             non_basic_col_sq_norms,
+            non_basic_var_is_fixed,
             cur_obj_val,
         };
 
@@ -320,12 +315,9 @@ impl Solver {
     }
 
     pub(crate) fn get_value(&self, var: usize) -> &f64 {
-        let basic_idx = self.basic_vars_inv[var];
-        if basic_idx == SENTINEL {
-            let nb_idx = self.non_basic_vars_inv[var];
-            &self.non_basic_vals[nb_idx]
-        } else {
-            &self.cur_bounds[basic_idx]
+        match self.var_states[var] {
+            VarState::Basic(idx) => &self.cur_bounds[idx],
+            VarState::NonBasic(idx) => &self.non_basic_vals[idx],
         }
     }
 
@@ -336,29 +328,31 @@ impl Solver {
             return Err(Error::Infeasible);
         }
 
-        assert!(self.set_vars.insert(var, val).is_none());
-
-        let basic_row = self.basic_vars_inv[var];
-        let non_basic_col = self.non_basic_vars_inv[var];
-
-        if basic_row != SENTINEL {
-            // if var was basic, remove it.
-            self.calc_row_coeffs(basic_row);
-            let pivot_info = self.choose_entering_col_dual(basic_row, val)?;
-            self.calc_col_coeffs(pivot_info.col);
-            self.pivot(&pivot_info);
-        } else if non_basic_col != SENTINEL {
-            self.calc_col_coeffs(non_basic_col);
-
-            let diff = val - self.non_basic_vals[non_basic_col];
-            for (r, coeff) in self.col_coeffs.iter() {
-                self.cur_bounds[r] -= diff * coeff;
+        let col = match self.var_states[var] {
+            VarState::Basic(row) => {
+                // if var was basic, remove it.
+                self.calc_row_coeffs(row);
+                let pivot_info = self.choose_entering_col_dual(row, val)?;
+                self.calc_col_coeffs(pivot_info.col);
+                self.pivot(&pivot_info);
+                pivot_info.col
             }
-            self.cur_obj_val -= diff * self.cur_obj[non_basic_col];
-            self.non_basic_vals[non_basic_col] = val;
-        } else {
-            unreachable!();
-        }
+
+            VarState::NonBasic(col) => {
+                self.calc_col_coeffs(col);
+
+                let diff = val - self.non_basic_vals[col];
+                for (r, coeff) in self.col_coeffs.iter() {
+                    self.cur_bounds[r] -= diff * coeff;
+                }
+                self.cur_obj_val -= diff * self.cur_obj[col];
+                self.non_basic_vals[col] = val;
+
+                col
+            }
+        };
+
+        self.non_basic_var_is_fixed[col] = true;
 
         self.restore_feasibility()?;
         self.optimize().unwrap();
@@ -367,9 +361,11 @@ impl Solver {
 
     /// Return true if the var was really unset.
     pub(crate) fn unset_var(&mut self, var: usize) -> Result<bool, Error> {
-        if let Some(val) = self.set_vars.remove(&var) {
-            let col = self.non_basic_vars_inv[var];
-            assert_ne!(col, SENTINEL);
+        if let VarState::NonBasic(col) = self.var_states[var] {
+            if !std::mem::replace(&mut self.non_basic_var_is_fixed[col], false) {
+                return Ok(false)
+            }
+
             self.calc_col_coeffs(col);
 
             let new_val = if self.cur_obj[col] > 0.0 {
@@ -382,7 +378,7 @@ impl Solver {
                 return Err(Error::Unbounded);
             }
 
-            let diff = new_val - val;
+            let diff = new_val - self.non_basic_vals[col];
             for (r, coeff) in self.col_coeffs.iter() {
                 self.cur_bounds[r] -= diff * coeff;
             }
@@ -398,22 +394,21 @@ impl Solver {
     }
 
     pub(crate) fn add_gomory_cut(&mut self, var: usize) -> Result<(), Error> {
-        let basic_row = self.basic_vars_inv[var];
-        if basic_row == SENTINEL {
+        if let VarState::Basic(row) = self.var_states[var] {
+            self.calc_row_coeffs(row);
+
+            let mut cut_coeffs = SparseVec::new();
+            for (col, &coeff) in self.row_coeffs.iter() {
+                let var = self.non_basic_vars[col];
+                cut_coeffs.push(var, coeff.floor() - coeff);
+            }
+
+            let cut_bound = self.cur_bounds[row].floor() - self.cur_bounds[row];
+            let num_total_vars = self.num_total_vars();
+            self.add_constraint(cut_coeffs.into_csvec(num_total_vars), RelOp::Le, cut_bound)
+        } else {
             panic!("var {:?} is not basic!", var);
         }
-
-        self.calc_row_coeffs(basic_row);
-
-        let mut cut_coeffs = SparseVec::new();
-        for (col, &coeff) in self.row_coeffs.iter() {
-            let var = self.non_basic_vars[col];
-            cut_coeffs.push(var, coeff.floor() - coeff);
-        }
-
-        let cut_bound = self.cur_bounds[basic_row].floor() - self.cur_bounds[basic_row];
-        let num_total_vars = self.num_total_vars();
-        self.add_constraint(cut_coeffs.into_csvec(num_total_vars), RelOp::Le, cut_bound)
     }
 
     fn num_constraints(&self) -> usize {
@@ -476,15 +471,14 @@ impl Solver {
 
         self.remove_artificial_vars();
 
-        self.basic_vars_inv.truncate(self.num_total_vars());
-        self.non_basic_vars_inv.truncate(self.num_total_vars());
+        self.var_states.truncate(self.num_total_vars());
 
         let mut new_non_basic_vars = vec![];
         let mut new_non_basic_vals = vec![];
         let mut new_sq_norms = vec![];
         for (i, &var) in self.non_basic_vars.iter().enumerate() {
             if var < self.num_total_vars() {
-                self.non_basic_vars_inv[var] = new_non_basic_vars.len();
+                self.var_states[var] = VarState::NonBasic(new_non_basic_vars.len());
                 new_non_basic_vars.push(var);
                 new_non_basic_vals.push(self.non_basic_vals[i]);
                 if self.enable_steepest_edge {
@@ -617,9 +611,8 @@ impl Solver {
 
         self.orig_bounds.push(bound);
 
-        self.basic_vars_inv.push(self.basic_vars.len());
+        self.var_states.push(VarState::Basic(self.basic_vars.len()));
         self.basic_vars.push(slack_var);
-        self.non_basic_vars_inv.push(SENTINEL);
 
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
@@ -664,8 +657,7 @@ impl Solver {
         self.row_coeffs.clear_and_resize(self.non_basic_vars.len());
         for (r, &coeff) in tmp.iter() {
             for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
-                let idx = self.non_basic_vars_inv[v];
-                if idx != SENTINEL {
+                if let VarState::NonBasic(idx) = self.var_states[v] {
                     *self.row_coeffs.get_mut(idx) += val * coeff;
                 }
             }
@@ -677,15 +669,17 @@ impl Solver {
             let mut best_col = None;
             let mut best_score = f64::NEG_INFINITY;
             for col in 0..self.cur_obj.len() {
+                if self.non_basic_var_is_fixed[col] {
+                    continue;
+                }
+
                 let var = self.non_basic_vars[col];
                 let is_positive_direction = self.non_basic_vals[col] == self.orig_var_mins[var];
                 let obj_coeff = self.cur_obj[col];
 
                 // Choose only among non-basic vars that can be changed with objective decreasing.
-                // set_vars.is_empty() check results in a small, but significant perf improvement.
                 if (is_positive_direction && obj_coeff < 1e-8)
                     || (!is_positive_direction && obj_coeff > -1e-8)
-                    || (!self.set_vars.is_empty() && self.set_vars.contains_key(&var))
                 {
                     continue;
                 }
@@ -852,6 +846,10 @@ impl Solver {
         let mut pivot_coeff_abs = f64::NEG_INFINITY;
         let mut pivot_coeff = 0.0;
         for (c, &coeff) in self.row_coeffs.iter() {
+            if self.non_basic_var_is_fixed[c] {
+                continue;
+            }
+
             let coeff_abs = coeff.abs();
             if coeff_abs < 1e-8 {
                 continue;
@@ -867,12 +865,6 @@ impl Solver {
                 // (less optimal BFS means more feasible BFS).
                 // Because obj_val_diff = -obj_coeff * entering_diff = obj_coeff * leaving_diff / coeff,
                 // sign(obj_val_diff) = sign(obj_coeff) * sign(leaving_diff) * sign(coeff).
-                continue;
-            }
-
-            let var = self.non_basic_vars[c];
-            // set_vars.is_empty() check results in a small, but significant perf improvement.
-            if !self.set_vars.is_empty() && self.set_vars.contains_key(&var) {
                 continue;
             }
 
@@ -966,8 +958,7 @@ impl Solver {
             self.sq_norms_update_helper.clear();
             for (r, &coeff) in tmp.iter() {
                 for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
-                    let idx = self.non_basic_vars_inv[v];
-                    if idx != SENTINEL {
+                    if let VarState::NonBasic(idx) = self.var_states[v] {
                         *self.sq_norms_update_helper.get_mut(idx) += val * coeff;
                     }
                 }
@@ -989,12 +980,9 @@ impl Solver {
         let leaving_var = self.basic_vars[pivot_elem.row];
 
         self.basic_vars[pivot_elem.row] = entering_var;
-        self.basic_vars_inv[entering_var] = pivot_elem.row;
-        self.basic_vars_inv[leaving_var] = SENTINEL;
-
+        self.var_states[entering_var] = VarState::Basic(pivot_elem.row);
         self.non_basic_vars[pivot_info.col] = leaving_var;
-        self.non_basic_vars_inv[entering_var] = SENTINEL;
-        self.non_basic_vars_inv[leaving_var] = pivot_info.col;
+        self.var_states[leaving_var] = VarState::NonBasic(pivot_info.col);
 
         let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
         if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() / 2 {
@@ -1095,6 +1083,7 @@ impl Solver {
         }
     }
 
+    #[allow(dead_code)]
     fn recalc_cur_sq_norms(&mut self) {
         self.non_basic_col_sq_norms.clear();
         for &var in &self.non_basic_vars {
@@ -1103,39 +1092,12 @@ impl Solver {
             self.non_basic_col_sq_norms.push(sq_norm);
         }
     }
+}
 
-    #[allow(dead_code)]
-    fn reset_basis(&mut self, basic_vars: Vec<usize>) {
-        assert_eq!(self.num_artificial_vars, 0);
-        assert_eq!(basic_vars.len(), self.num_constraints());
-
-        self.basic_vars = basic_vars;
-        self.basic_vars_inv.clear();
-        self.basic_vars_inv.resize(self.num_total_vars(), SENTINEL);
-        for (i, &v) in self.basic_vars.iter().enumerate() {
-            self.basic_vars_inv[v] = i;
-        }
-
-        self.non_basic_vars_inv.clear();
-        self.non_basic_vars_inv
-            .resize(self.num_total_vars(), SENTINEL);
-        self.non_basic_vars.clear();
-        for v in 0..self.num_total_vars() {
-            if self.basic_vars_inv[v] == SENTINEL {
-                self.non_basic_vars_inv[v] = self.non_basic_vars.len();
-                self.non_basic_vars.push(v);
-            }
-        }
-
-        self.basis_solver
-            .reset(&self.orig_constraints_csc, &self.basic_vars);
-
-        self.recalc_cur_bounds();
-        self.recalc_cur_obj();
-        if self.enable_steepest_edge {
-            self.recalc_cur_sq_norms();
-        }
-    }
+#[derive(Clone, Debug)]
+enum VarState {
+    Basic(usize),
+    NonBasic(usize),
 }
 
 struct PivotInfo {
