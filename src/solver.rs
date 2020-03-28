@@ -15,7 +15,7 @@ pub(crate) struct Solver {
     num_slack_vars: usize,
     num_artificial_vars: usize,
 
-    orig_obj_coeffs: Vec<f64>, // with negated coeffs
+    orig_obj_coeffs: Vec<f64>,
     orig_var_mins: Vec<f64>,
     orig_var_maxs: Vec<f64>,
     orig_constraints: CsMat, // excluding rhs
@@ -54,9 +54,12 @@ impl std::fmt::Debug for Solver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Solver({}, {}, {})\norig_obj_coeffs:\n{:?}\n",
-            self.num_vars, self.num_slack_vars, self.num_artificial_vars, self.orig_obj_coeffs,
+            "Solver({}, {}, {})\n",
+            self.num_vars, self.num_slack_vars, self.num_artificial_vars,
         )?;
+        write!(f, "orig_obj_coeffs:\n{:?}\n", self.orig_obj_coeffs)?;
+        write!(f, "orig_var_mins:\n{:?}\n", self.orig_var_mins)?;
+        write!(f, "orig_var_maxs:\n{:?}\n", self.orig_var_maxs)?;
         write!(f, "orig_constraints:\n")?;
         for row in self.orig_constraints.outer_iterator() {
             write!(f, "{:?}\n", to_dense(&row))?;
@@ -65,7 +68,8 @@ impl std::fmt::Debug for Solver {
         write!(f, "basic_vars:\n{:?}\n", self.basic_vars)?;
         write!(f, "basic_var_vals:\n{:?}\n", self.basic_var_vals)?;
         write!(f, "nb_vars:\n{:?}\n", self.nb_vars)?;
-        write!(f, "nb_var_vals:\n{:?}\n", self.nb_var_obj_coeffs)?;
+        write!(f, "nb_var_vals:\n{:?}\n", self.nb_var_vals)?;
+        write!(f, "nb_var_obj_coeffs:\n{:?}\n", self.nb_var_obj_coeffs)?;
         write!(f, "cur_obj_val: {:?}\n", self.cur_obj_val)?;
         Ok(())
     }
@@ -73,21 +77,19 @@ impl std::fmt::Debug for Solver {
 
 impl Solver {
     pub(crate) fn try_new(
-        orig_obj_coeffs: &[f64],
-        orig_var_mins: &[f64],
-        orig_var_maxs: &[f64],
-        orig_constraints: &[(CsVec, RelOp, f64)],
+        obj_coeffs: &[f64],
+        var_mins: &[f64],
+        var_maxs: &[f64],
+        constraints: &[(CsVec, RelOp, f64)],
     ) -> Result<Self, Error> {
         let enable_steepest_edge = true; // TODO: make user-settable.
 
-        let num_vars = orig_obj_coeffs.len();
+        let num_vars = obj_coeffs.len();
 
-        let mut obj_coeffs = orig_obj_coeffs.iter().map(|c| -c).collect::<Vec<_>>();
-
-        assert_eq!(num_vars, orig_var_mins.len());
-        assert_eq!(num_vars, orig_var_maxs.len());
-        let mut orig_var_mins = orig_var_mins.to_vec();
-        let mut orig_var_maxs = orig_var_maxs.to_vec();
+        assert_eq!(num_vars, var_mins.len());
+        assert_eq!(num_vars, var_maxs.len());
+        let mut orig_var_mins = var_mins.to_vec();
+        let mut orig_var_maxs = var_maxs.to_vec();
 
         let mut var_states = vec![];
 
@@ -117,7 +119,7 @@ impl Solver {
                 unimplemented!();
             };
             nb_var_vals.push(init_val);
-            obj_val -= init_val * obj_coeffs[v];
+            obj_val += init_val * obj_coeffs[v];
         }
 
         #[derive(Debug)]
@@ -129,8 +131,8 @@ impl Solver {
             need_art_var: bool,
         }
 
-        let mut constraints = vec![];
-        for (coeffs, rel_op, rhs) in orig_constraints {
+        let mut constraint_infos = vec![];
+        for (coeffs, rel_op, rhs) in constraints {
             let rhs = *rhs;
 
             if coeffs.indices().is_empty() {
@@ -158,7 +160,7 @@ impl Solver {
                 RelOp::Eq => (None, true),
             };
 
-            constraints.push(ConstraintInfo {
+            constraint_infos.push(ConstraintInfo {
                 coeffs: coeffs.clone(),
                 rhs,
                 lhs_val,
@@ -167,16 +169,17 @@ impl Solver {
             });
         }
 
-        let num_constraints = constraints.len();
+        let num_constraints = constraint_infos.len();
 
-        let num_slack_vars = constraints
+        let num_slack_vars = constraint_infos
             .iter()
             .filter(|c| c.slack_var_coeff.is_some())
             .count();
-        let num_artificial_vars = constraints.iter().filter(|c| c.need_art_var).count();
+        let num_artificial_vars = constraint_infos.iter().filter(|c| c.need_art_var).count();
         let num_total_vars = num_vars + num_slack_vars + num_artificial_vars;
 
-        obj_coeffs.resize(num_total_vars, 0.0);
+        let mut orig_obj_coeffs = obj_coeffs.to_vec();
+        orig_obj_coeffs.resize(num_total_vars, 0.0);
 
         // slack and artificial vars are always [0, inf)
         orig_var_mins.resize(num_total_vars, 0.0);
@@ -195,7 +198,7 @@ impl Solver {
         let mut basic_vars = vec![];
         let mut basic_var_vals = Vec::with_capacity(num_constraints);
 
-        for constr in constraints.into_iter() {
+        for constr in constraint_infos.into_iter() {
             if constr.need_art_var {
                 if constr.slack_var_coeff.is_some() {
                     var_states[cur_slack_var] = VarState::NonBasic(nb_vars.len());
@@ -236,9 +239,9 @@ impl Solver {
             let col = orig_constraints_csc.outer_view(var).unwrap();
 
             if num_artificial_vars > 0 {
-                nb_var_obj_coeffs.push(artificial_multipliers.dot(&col));
+                nb_var_obj_coeffs.push(-artificial_multipliers.dot(&col));
             } else {
-                nb_var_obj_coeffs.push(obj_coeffs[var]);
+                nb_var_obj_coeffs.push(orig_obj_coeffs[var]);
             }
 
             if enable_steepest_edge {
@@ -273,7 +276,7 @@ impl Solver {
             num_vars,
             num_slack_vars,
             num_artificial_vars,
-            orig_obj_coeffs: obj_coeffs,
+            orig_obj_coeffs,
             orig_var_mins,
             orig_var_maxs,
             orig_constraints,
@@ -345,7 +348,7 @@ impl Solver {
                 for (r, coeff) in self.col_coeffs.iter() {
                     self.basic_var_vals[r] -= diff * coeff;
                 }
-                self.cur_obj_val -= diff * self.nb_var_obj_coeffs[col];
+                self.cur_obj_val += diff * self.nb_var_obj_coeffs[col];
                 self.nb_var_vals[col] = val;
 
                 col
@@ -369,9 +372,9 @@ impl Solver {
             self.calc_col_coeffs(col);
 
             let new_val = if self.nb_var_obj_coeffs[col] > 0.0 {
-                self.orig_var_maxs[var]
-            } else {
                 self.orig_var_mins[var]
+            } else {
+                self.orig_var_maxs[var]
             };
 
             if new_val.is_infinite() {
@@ -382,7 +385,7 @@ impl Solver {
             for (r, coeff) in self.col_coeffs.iter() {
                 self.basic_var_vals[r] -= diff * coeff;
             }
-            self.cur_obj_val -= diff * self.nb_var_obj_coeffs[col];
+            self.cur_obj_val += diff * self.nb_var_obj_coeffs[col];
             self.nb_var_vals[col] = new_val;
 
             self.restore_feasibility()?;
@@ -678,8 +681,8 @@ impl Solver {
                 let obj_coeff = self.nb_var_obj_coeffs[col];
 
                 // Choose only among non-basic vars that can be changed with objective decreasing.
-                if (is_positive_direction && obj_coeff < 1e-8)
-                    || (!is_positive_direction && obj_coeff > -1e-8)
+                if (is_positive_direction && obj_coeff > -1e-8)
+                    || (!is_positive_direction && obj_coeff < 1e-8)
                 {
                     continue;
                 }
@@ -804,11 +807,11 @@ impl Solver {
             // If we choose this var as leaving, its new val will be at the boundary
             // which is violated.
             // Why is that? We must maintain primal optimality (a.k.a. dual feasibility)
-            // thus new_obj_coeff must be <= 0 if new_val is min, and >= 0 if new_val is max.
+            // thus new_obj_coeff must be >= 0 if new_val is min, and <= 0 if new_val is max.
             // sign(new_obj_coeff) = -sign(old_obj_coeff) * sign(pivot_coeff).
             // Another constraint is that we must increase primal feasibility (and thus objective).
-            // As sign(obj_val_diff) = sign(old_obj_coeff) * sign(leaving_diff) * sign(pivot_coeff)
-            // must be >= 0, we conclude that sign(new_obj_coeff) = -sign(leaving_diff).
+            // As sign(obj_val_diff) = -sign(old_obj_coeff) * sign(leaving_diff) * sign(pivot_coeff)
+            // must be >= 0, we conclude that sign(new_obj_coeff) = sign(leaving_diff).
             // From this we see that if old val was < min, dual feasibility is maintained if the
             // new var is min (analogously for max).
             let (cur_infeasibility, new_val) = if val < min - 1e-8 {
@@ -857,14 +860,14 @@ impl Solver {
 
             let obj_coeff = self.nb_var_obj_coeffs[c];
             if (is_positive_direction
-                && ((coeff > 0.0 && obj_coeff < 0.0) || (coeff < 0.0 && obj_coeff > 0.0)))
+                && ((coeff > 0.0 && obj_coeff > 0.0) || (coeff < 0.0 && obj_coeff < 0.0)))
                 || (!is_positive_direction
-                    && ((coeff < 0.0 && obj_coeff < 0.0) || (coeff > 0.0 && obj_coeff > 0.0)))
+                    && ((coeff < 0.0 && obj_coeff > 0.0) || (coeff > 0.0 && obj_coeff < 0.0)))
             {
                 // We want to find entering variable that will *increase* objective function.
                 // (less optimal BFS means more feasible BFS).
-                // Because obj_val_diff = -obj_coeff * entering_diff = obj_coeff * leaving_diff / coeff,
-                // sign(obj_val_diff) = sign(obj_coeff) * sign(leaving_diff) * sign(coeff).
+                // Because obj_val_diff = obj_coeff * entering_diff = -obj_coeff * leaving_diff / pivot_coeff,
+                // sign(obj_val_diff) = -sign(obj_coeff) * sign(leaving_diff) * sign(coeff).
                 continue;
             }
 
@@ -910,7 +913,7 @@ impl Solver {
         // TODO: periodically (say, every 1000 pivots) recalc basic vars and object coeffs
         // from scratch for numerical stability.
 
-        self.cur_obj_val -= self.nb_var_obj_coeffs[pivot_info.col] * pivot_info.entering_diff;
+        self.cur_obj_val += self.nb_var_obj_coeffs[pivot_info.col] * pivot_info.entering_diff;
 
         if pivot_info.elem.is_none() {
             // "entering" var is still non-basic, it just changes value from one limit
@@ -1058,7 +1061,7 @@ impl Solver {
         let multipliers = {
             let mut obj_coeffs = vec![0.0; self.num_constraints()];
             for (c, &var) in self.basic_vars.iter().enumerate() {
-                obj_coeffs[c] = -self.orig_obj_coeffs[var];
+                obj_coeffs[c] = self.orig_obj_coeffs[var];
             }
             self.basis_solver
                 .lu_factors_transp
@@ -1069,7 +1072,7 @@ impl Solver {
         self.nb_var_obj_coeffs.clear();
         for &var in &self.nb_vars {
             let col = self.orig_constraints_csc.outer_view(var).unwrap();
-            let mut val = self.orig_obj_coeffs[var] + col.dot(&multipliers);
+            let mut val = self.orig_obj_coeffs[var] - col.dot(&multipliers);
             if f64::abs(val) < 1e-8 {
                 val = 0.0;
             }
@@ -1078,10 +1081,10 @@ impl Solver {
 
         self.cur_obj_val = 0.0;
         for (r, &var) in self.basic_vars.iter().enumerate() {
-            self.cur_obj_val -= self.orig_obj_coeffs[var] * self.basic_var_vals[r];
+            self.cur_obj_val += self.orig_obj_coeffs[var] * self.basic_var_vals[r];
         }
         for (c, &var) in self.nb_vars.iter().enumerate() {
-            self.cur_obj_val -= self.orig_obj_coeffs[var] * self.nb_var_vals[c];
+            self.cur_obj_val += self.orig_obj_coeffs[var] * self.nb_var_vals[c];
         }
     }
 
@@ -1258,7 +1261,7 @@ mod tests {
         assert_eq!(sol.num_slack_vars, 3);
         assert_eq!(sol.num_artificial_vars, 2);
 
-        assert_eq!(&sol.orig_obj_coeffs, &[-2.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&sol.orig_obj_coeffs, &[2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
 
         assert_eq!(
             &sol.orig_var_mins,
@@ -1291,7 +1294,7 @@ mod tests {
         assert_eq!(&sol.basic_var_vals, &[1.0, 2.0, 3.0, 2.0]);
 
         assert_eq!(&sol.nb_vars, &[0, 1, 3]);
-        assert_eq!(&sol.nb_var_obj_coeffs, &[-1.0, -3.0, -1.0]);
+        assert_eq!(&sol.nb_var_obj_coeffs, &[1.0, 3.0, 1.0]);
         assert_eq!(&sol.nb_var_vals, &[0.0, 5.0, 0.0]);
         assert_eq!(&sol.nb_col_sq_norms, &[3.0, 7.0, 1.0]);
 
@@ -1320,7 +1323,7 @@ mod tests {
         assert_eq!(&sol.basic_var_vals, &[15.0, 15.0]);
         assert_eq!(&sol.nb_vars, &[1, 2]);
         assert_eq!(&sol.nb_var_vals, &[5.0, 0.0]);
-        assert_eq!(&sol.nb_var_obj_coeffs, &[1.0, -3.0]);
+        assert_eq!(&sol.nb_var_obj_coeffs, &[-1.0, 3.0]);
         assert_eq!(sol.cur_obj_val, -65.0);
 
         let infeasible = Solver::try_new(
