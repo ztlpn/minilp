@@ -14,3 +14,4 @@ log = "0.4.8"
 [dev-dependencies]
 rand = "0.7"
 rand_pcg = "0.2.1"
+env_logger = "0.7.1"
