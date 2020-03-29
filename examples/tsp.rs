@@ -53,25 +53,21 @@ impl Problem {
 
         let mut edge_vars = vec![vec![]; num_points];
         for i in 0..num_points {
-            for j in 0..i {
-                edge_vars[i].push(lp_problem.add_var(Some(0.0), Some(1.0), self.dist(i, j)));
+            for j in 0..num_points {
+                let var = if j < i {
+                    edge_vars[j][i]
+                } else {
+                    lp_problem.add_var(Some(0.0), Some(1.0), self.dist(i, j))
+                };
+                edge_vars[i].push(var);
             }
         }
-
-        let get_edge_var = |i: usize, j: usize| -> Variable {
-            assert_ne!(i, j);
-            if i > j {
-                edge_vars[i][j]
-            } else {
-                edge_vars[j][i]
-            }
-        };
 
         for i in 0..num_points {
             let mut edges_sum = LinearExpr::empty();
             for j in 0..num_points {
                 if i != j {
-                    edges_sum.add(get_edge_var(i, j), 1.0);
+                    edges_sum.add(edge_vars[i][j], 1.0);
                 }
             }
             lp_problem.add_constraint(edges_sum, RelOp::Eq, 2.0);
@@ -105,15 +101,9 @@ fn add_subtour_constraints(
         edge_weights.resize(num_points * num_points, 0.0);
         for i in 0..num_points {
             for j in 0..num_points {
-                let edge_var = if i > j {
-                    edge_vars[i][j]
-                } else if i < j {
-                    edge_vars[j][i]
-                } else {
-                    continue;
-                };
-
-                edge_weights[i * num_points + j] = cur_solution[edge_var];
+                if i != j {
+                    edge_weights[i * num_points + j] = cur_solution[edge_vars[i][j]];
+                }
             }
         }
 
