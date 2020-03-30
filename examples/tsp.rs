@@ -216,9 +216,10 @@ impl Tour {
         let min_y = problem.points.iter().map(|p| p.y).min_by(cmp_f64).unwrap();
         let max_y = problem.points.iter().map(|p| p.y).max_by(cmp_f64).unwrap();
 
-        let width = 500;
-        let scale = (width as f64) / (max_x - min_x);
-        let height = f64::round((max_y - min_y) * scale) as usize;
+        let width = 600;
+        let margin = 50;
+        let scale = ((width - 2 * margin) as f64) / (max_x - min_x);
+        let height = f64::round((max_y - min_y) * scale) as usize + 2 * margin;
 
         let mut svg = String::new();
         svg += "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n";
@@ -231,8 +232,8 @@ impl Tour {
         svg += "    <path fill=\"none\" stroke=\"black\" stroke-width=\"4px\" d=\"\n";
         for &i in &self.0 {
             let p = problem.points[i];
-            let px = f64::round((p.x - min_x) * scale) as usize;
-            let py = f64::round((p.y - min_y) * scale) as usize;
+            let px = f64::round((p.x - min_x) * scale) as usize + margin;
+            let py = f64::round((p.y - min_y) * scale) as usize + margin;
             if i == 0 {
                 writeln!(&mut svg, "        M {} {}", px, py).unwrap();
             } else {
