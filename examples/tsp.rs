@@ -74,16 +74,118 @@ impl Problem {
         }
 
         let mut cur_solution = lp_problem.solve().unwrap();
-        info!(
-            "solved initial LP problem, objective: {}",
-            cur_solution.objective()
-        );
         cur_solution = add_subtour_constraints(cur_solution, &edge_vars);
+
+        // A step in the branch&bound depth-first search. We choose a variable and try to fix
+        // its value to either 0 or 1. After we explore a branch where one value is chosen,
+        // we return and try another value. Initial value is heuristically chosen to be
+        // the closest integer to the current solution value.
+        struct Step {
+            start_solution: minilp::Solution, // LP solution right before the step.
+            var: Variable,
+            start_val: u8,
+            cur_val: Option<u8>,
+        }
+
+        let new_step = |start_solution: minilp::Solution, var: Variable| -> Step {
+            let start_val = if start_solution[var] < 0.5 { 0 } else { 1 };
+            Step {
+                start_solution,
+                var,
+                start_val,
+                cur_val: None,
+            }
+        };
+
+        let mut best_cost = f64::INFINITY;
+
+        let start_obj_val = cur_solution.objective();
+        let mut dfs_stack = if let Some(var) = choose_branch_var(&cur_solution) {
+            vec![new_step(cur_solution, var)]
+        } else {
+            info!(
+                "found optimal solution with initial relaxation! cost: {:.2}",
+                start_obj_val
+            );
+            return;
+        };
+
         info!(
-            "objective after adding initial subtour constraints: {}",
-            cur_solution.objective()
+            "starting branch&bound, current obj. value: {:.2}",
+            start_obj_val
         );
+
+        for iter in 0.. {
+            let cur_step = dfs_stack.last_mut().unwrap();
+
+            if let Some(ref mut val) = cur_step.cur_val {
+                if *val == cur_step.start_val {
+                    *val = 1 - *val;
+                } else {
+                    dfs_stack.pop();
+                    if dfs_stack.is_empty() {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+            } else {
+                cur_step.cur_val = Some(cur_step.start_val);
+            };
+
+            let mut cur_solution = cur_step.start_solution.clone();
+            if let Ok(new_solution) =
+                cur_solution.set_var(cur_step.var, cur_step.cur_val.unwrap() as f64)
+            {
+                cur_solution = new_solution;
+            } else {
+                // There is no feasible solution with the current variable constraints.
+                continue;
+            }
+
+            cur_solution = add_subtour_constraints(cur_solution, &edge_vars);
+
+            let obj_val = cur_solution.objective();
+            if obj_val > best_cost {
+                // As the cost of any solution is bound from below by obj_val, it is pointless
+                // to explore this branch: we won't find better solution there.
+                continue;
+            }
+
+            if let Some(var) = choose_branch_var(&cur_solution) {
+                dfs_stack.push(new_step(cur_solution, var));
+            } else {
+                if obj_val < best_cost {
+                    info!(
+                        "iter {} (search depth {}): found new best solution, cost: {:.2}",
+                        iter,
+                        dfs_stack.len(),
+                        obj_val
+                    );
+                    best_cost = obj_val;
+                }
+            };
+        }
+
+        info!("found optimal solution, cost: {:.2}", best_cost);
     }
+}
+
+/// Choose the next variable to branch on during branch&bound.
+/// Returns None if solution is integral.
+fn choose_branch_var(cur_solution: &minilp::Solution) -> Option<Variable> {
+    // It is a heuristic choice and the simplest heuristic is to choose variable with
+    // max divergence from an integer value.
+    let mut max_divergence = 0.0;
+    let mut max_var = None;
+    for (var, &val) in cur_solution {
+        let divergence = f64::abs(val - val.round());
+        if divergence > 1e-5 && divergence > max_divergence {
+            max_divergence = divergence;
+            max_var = Some(var);
+        }
+    }
+    max_var
 }
 
 /// Add all subtour constraints violated by the current solution.
