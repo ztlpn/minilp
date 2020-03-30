@@ -98,6 +98,7 @@ impl Problem {
         };
 
         let mut best_cost = f64::INFINITY;
+        let mut best_tour = None;
 
         let start_obj_val = cur_solution.objective();
         let mut dfs_stack = if let Some(var) = choose_branch_var(&cur_solution) {
@@ -107,6 +108,8 @@ impl Problem {
                 "found optimal solution with initial relaxation! cost: {:.2}",
                 start_obj_val
             );
+            let best_tour = Tour::from_lp_solution(&cur_solution, &edge_vars);
+            println!("{}", best_tour.to_string());
             return;
         };
 
@@ -163,11 +166,47 @@ impl Problem {
                         obj_val
                     );
                     best_cost = obj_val;
+                    best_tour = Some(Tour::from_lp_solution(&cur_solution, &edge_vars));
                 }
             };
         }
 
         info!("found optimal solution, cost: {:.2}", best_cost);
+        println!("{}", best_tour.unwrap().to_string());
+    }
+}
+
+struct Tour(Vec<usize>);
+
+impl Tour {
+    fn from_lp_solution(lp_solution: &minilp::Solution, edge_vars: &[Vec<Variable>]) -> Self {
+        let num_points = edge_vars.len();
+        let mut tour = vec![];
+        let mut is_visited = vec![false; num_points];
+        let mut cur_point = 0;
+        for _ in 0..num_points {
+            assert!(!is_visited[cur_point]);
+            is_visited[cur_point] = true;
+            tour.push(cur_point);
+            for neighbor in 0..num_points {
+                if !is_visited[neighbor]
+                    && lp_solution[edge_vars[cur_point][neighbor]].round() == 1.0
+                {
+                    cur_point = neighbor;
+                    break;
+                }
+            }
+        }
+        assert_eq!(tour.len(), num_points);
+        Self(tour)
+    }
+
+    fn to_string(&self) -> String {
+        self.0
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
