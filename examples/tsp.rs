@@ -109,7 +109,7 @@ impl Problem {
                 start_obj_val
             );
             let best_tour = Tour::from_lp_solution(&cur_solution, &edge_vars);
-            println!("{}", best_tour.to_string());
+            print!("{}", best_tour.to_svg(self));
             return;
         };
 
@@ -172,7 +172,7 @@ impl Problem {
         }
 
         info!("found optimal solution, cost: {:.2}", best_cost);
-        println!("{}", best_tour.unwrap().to_string());
+        print!("{}", best_tour.unwrap().to_svg(self));
     }
 }
 
@@ -207,6 +207,43 @@ impl Tour {
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn to_svg(&self, problem: &Problem) -> String {
+        let cmp_f64 = |x: &f64, y: &f64| x.partial_cmp(y).unwrap();
+        let min_x = problem.points.iter().map(|p| p.x).min_by(cmp_f64).unwrap();
+        let max_x = problem.points.iter().map(|p| p.x).max_by(cmp_f64).unwrap();
+        let min_y = problem.points.iter().map(|p| p.y).min_by(cmp_f64).unwrap();
+        let max_y = problem.points.iter().map(|p| p.y).max_by(cmp_f64).unwrap();
+
+        let width = 500;
+        let scale = (width as f64) / (max_x - min_x);
+        let height = f64::round((max_y - min_y) * scale) as usize;
+
+        let mut svg = String::new();
+        svg += "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n";
+        svg += "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n";
+        svg += "  \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n";
+        svg += &format!("<svg width=\"{}px\" height=\"{}px\" version=\"1.1\"", width, height);
+        svg += "     xmlns=\"http://www.w3.org/2000/svg\">\n";
+
+        use std::fmt::Write;
+        svg += "    <path fill=\"none\" stroke=\"black\" stroke-width=\"4px\" d=\"\n";
+        for &i in &self.0 {
+            let p = problem.points[i];
+            let px = f64::round((p.x - min_x) * scale) as usize;
+            let py = f64::round((p.y - min_y) * scale) as usize;
+            if i == 0 {
+                writeln!(&mut svg, "        M {} {}", px, py).unwrap();
+            } else {
+                writeln!(&mut svg, "        L {} {}", px, py).unwrap();
+            }
+        }
+        svg += "        Z\n";
+        svg += "    \"/>\n";
+
+        svg += "</svg>\n";
+        svg
     }
 }
 
