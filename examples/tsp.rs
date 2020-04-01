@@ -24,6 +24,7 @@ impl Point {
 }
 
 struct Problem {
+    name: String,
     points: Vec<Point>,
 }
 
@@ -48,6 +49,7 @@ impl Problem {
     /// Parse a problem in TSPLIB format.
     /// Format description: http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/tsp95.pdf
     fn parse<R: io::BufRead>(input: &mut R) -> io::Result<Problem> {
+        let mut name = String::new();
         let mut dimension = None;
         let mut line_num = 0;
         loop {
@@ -64,7 +66,9 @@ impl Problem {
                 keyword.pop();
             }
 
-            if keyword == "TYPE" {
+            if keyword == "NAME" {
+                name = line.last().unwrap().clone();
+            } else if keyword == "TYPE" {
                 if line.last().unwrap() != "TSP" {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -142,7 +146,7 @@ impl Problem {
             }
         }
 
-        Ok(Problem { points })
+        Ok(Problem { name, points })
     }
 }
 
@@ -200,6 +204,8 @@ impl Tour {
 }
 
 fn solve(problem: &Problem) -> Tour {
+    info!("starting, problem name: {}", problem.name);
+
     let num_points = problem.points.len();
 
     // First, we construct a linear programming model for the TSP problem.
