@@ -12,7 +12,7 @@ distance between cities). Included is a sample problem [`bn130.tsp`](./bn130.tsp
 [blue noise](https://crates.io/crates/poisson) points) or you can try solving standard benchmark
 problems from the [TSPLIB](http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/).
 
-If you run
+A quick demo: if you run
 ```
 cargo run --release --example tsp -- --svg-output bn130.tsp > bn130.tsp.svg
 ```
