@@ -1,3 +1,6 @@
+//! Solves euclidean travelling salesman problems using the integer linear programming approach.
+//! See comments in the solve() function for detailed description of the algorithm.
+
 #[macro_use]
 extern crate log;
 
@@ -198,8 +201,16 @@ impl Tour {
 
 fn solve(problem: &Problem) -> Tour {
     let num_points = problem.points.len();
+
+    // First, we construct a linear programming model for the TSP problem.
     let mut lp_problem = minilp::Problem::new(OptimizationDirection::Minimize);
 
+    // Variables in our model correspond to edges between nodes (cities). If the tour includes
+    // the edge between nodes i and j, then the edge_vars[i][j] variable will be equal to 1.0 in
+    // the solution. As we will solve the continuous version of the problem first, we constrain
+    // each variable to the interval between 0.0 and 1.0 and deal with the fact that we want an
+    // integer solution later. Each edge will contribute the distance between its endpoints to
+    // the objective function which we want to minimize.
     let mut edge_vars = vec![vec![]; num_points];
     for i in 0..num_points {
         for j in 0..num_points {
@@ -212,6 +223,10 @@ fn solve(problem: &Problem) -> Tour {
         }
     }
 
+    // Next, we add constraints that will ensure that each node is part of a tour.
+    // To do this we specify that for each node exactly two edges incident on that node
+    // are present in the solution. Or, equivalently: for every node the sum of all edge
+    // variables incident on that node is equal to 2.0.
     for i in 0..num_points {
         let mut edges_sum = LinearExpr::empty();
         for j in 0..num_points {
@@ -223,12 +238,27 @@ fn solve(problem: &Problem) -> Tour {
     }
 
     let mut cur_solution = lp_problem.solve().unwrap();
+
+    // Even if an integer solution to the above problem is found, it is not enough. The problem
+    // is that nothing in the model prohibits *subtours* - that is, tours that pass only
+    // through a subset of all nodes. Unfortunately, to prohibit all subtours we must add
+    // exponentially many constraints which is clearly infeasible to do beforehand. Instead,
+    // we add these constraints *dynamically* - given the solution, add enough constraints
+    // so that there are no subtours in that solution.
     cur_solution = add_subtour_constraints(cur_solution, &edge_vars);
 
-    // A step in the branch&bound depth-first search. We choose a variable and try to fix
-    // its value to either 0 or 1. After we explore a branch where one value is chosen,
-    // we return and try another value. Initial value is heuristically chosen to be
-    // the closest integer to the current solution value.
+    // Now we've got a solution to the continuous problem. This problem is called a *relaxation* -
+    // integrality constraints are relaxed, but the integer solution that we want to find is still
+    // somewhere in the feasible region of this problem (and its objective value is necessarily
+    // higher). If the optimal solution is by chance integer, then we are done! Else we will try
+    // to fix some variables in the solution to specific integer values and see if we can get an
+    // integral solution this way. If we are able to find an integer solution and prove that no
+    // better integer solution exists, we are done. This process is called *branch&bound*.
+
+    // We explore the space of possible variable values using the depth-first search.
+    // Struct Step represents an item in the DFS stack. We will choose a variable and
+    // try to fix its value to either 0 or 1. After we explore a branch where one value
+    // is chosen, we return and try another value.
     struct Step {
         start_solution: minilp::Solution, // LP solution right before the step.
         var: Variable,
@@ -236,7 +266,26 @@ fn solve(problem: &Problem) -> Tour {
         cur_val: Option<u8>,
     }
 
-    let new_step = |start_solution: minilp::Solution, var: Variable| -> Step {
+    // As we want to get to high-quality solutions as quickly as possible, choice of the next
+    // variable to fix and its initial value is important. This is necessarily a heuristic choice
+    // and we use a simple heuristic: the next variable is the "most fractional" one and its
+    // initial value is the closest integer to the current solution value.
+
+    // Returns None if the solution is integral.
+    fn choose_branch_var(cur_solution: &minilp::Solution) -> Option<Variable> {
+        let mut max_divergence = 0.0;
+        let mut max_var = None;
+        for (var, &val) in cur_solution {
+            let divergence = f64::abs(val - val.round());
+            if divergence > 1e-5 && divergence > max_divergence {
+                max_divergence = divergence;
+                max_var = Some(var);
+            }
+        }
+        max_var
+    }
+
+    fn new_step(start_solution: minilp::Solution, var: Variable) -> Step {
         let start_val = if start_solution[var] < 0.5 { 0 } else { 1 };
         Step {
             start_solution,
@@ -244,34 +293,39 @@ fn solve(problem: &Problem) -> Tour {
             start_val,
             cur_val: None,
         }
-    };
+    }
 
+    // We will save the best solution that we encountered in the search so far and its cost.
+    // After we finish the search this will be the optimal tour.
     let mut best_cost = f64::INFINITY;
     let mut best_tour = None;
 
-    let start_obj_val = cur_solution.objective();
     let mut dfs_stack = if let Some(var) = choose_branch_var(&cur_solution) {
+        info!(
+            "starting branch&bound, current obj. value: {:.2}",
+            cur_solution.objective(),
+        );
+
         vec![new_step(cur_solution, var)]
     } else {
         info!(
             "found optimal solution with initial relaxation! cost: {:.2}",
-            start_obj_val
+            cur_solution.objective(),
         );
+
         return tour_from_lp_solution(&cur_solution, &edge_vars);
     };
-
-    info!(
-        "starting branch&bound, current obj. value: {:.2}",
-        start_obj_val
-    );
 
     for iter in 0.. {
         let cur_step = dfs_stack.last_mut().unwrap();
 
+        // Choose the next value for the current variable.
         if let Some(ref mut val) = cur_step.cur_val {
             if *val == cur_step.start_val {
                 *val = 1 - *val;
             } else {
+                // We've expored all values for the currrent variable so we must backtrack to
+                // the previous step. If the stack becomes empty then our search is done.
                 dfs_stack.pop();
                 if dfs_stack.is_empty() {
                     break;
@@ -290,6 +344,7 @@ fn solve(problem: &Problem) -> Tour {
             cur_solution = new_solution;
         } else {
             // There is no feasible solution with the current variable constraints.
+            // We must backtrack.
             continue;
         }
 
@@ -297,14 +352,17 @@ fn solve(problem: &Problem) -> Tour {
 
         let obj_val = cur_solution.objective();
         if obj_val > best_cost {
-            // As the cost of any solution is bound from below by obj_val, it is pointless
-            // to explore this branch: we won't find better solution there.
+            // As the cost of any solution that we can find in the current branch is bound
+            // from below by obj_val, it is pointless to explore this branch: we won't find
+            // better solutions there.
             continue;
         }
 
         if let Some(var) = choose_branch_var(&cur_solution) {
+            // Search deeper.
             dfs_stack.push(new_step(cur_solution, var));
         } else {
+            // We've found an integral solution!
             if obj_val < best_cost {
                 info!(
                     "iter {} (search depth {}): found new best solution, cost: {:.2}",
@@ -325,7 +383,7 @@ fn solve(problem: &Problem) -> Tour {
 /// Add all subtour constraints violated by the current solution.
 /// A subtour constraint states that the sum of edge values for all edges going out
 /// of some proper subset of nodes must be >= 2. This prevents the formation of closed subtours
-/// that do not go through all the vertices.
+/// that do not pass through all the vertices.
 fn add_subtour_constraints(
     mut cur_solution: minilp::Solution,
     edge_vars: &[Vec<Variable>],
@@ -495,6 +553,8 @@ mod tests {
     }
 }
 
+/// Convert a solution to the LP problem to the corresponding tour (a sequence of nodes).
+/// Precondition: the solution must be integral and contain a unique tour.
 fn tour_from_lp_solution(lp_solution: &minilp::Solution, edge_vars: &[Vec<Variable>]) -> Tour {
     let num_points = edge_vars.len();
     let mut tour = vec![];
@@ -513,23 +573,6 @@ fn tour_from_lp_solution(lp_solution: &minilp::Solution, edge_vars: &[Vec<Variab
     }
     assert_eq!(tour.len(), num_points);
     Tour(tour)
-}
-
-/// Choose the next variable to branch on during branch&bound.
-/// Returns None if solution is integral.
-fn choose_branch_var(cur_solution: &minilp::Solution) -> Option<Variable> {
-    // It is a heuristic choice and the simplest heuristic is to choose variable with
-    // max divergence from an integer value.
-    let mut max_divergence = 0.0;
-    let mut max_var = None;
-    for (var, &val) in cur_solution {
-        let divergence = f64::abs(val - val.round());
-        if divergence > 1e-5 && divergence > max_divergence {
-            max_divergence = divergence;
-            max_var = Some(var);
-        }
-    }
-    max_var
 }
 
 const USAGE: &str = "\
