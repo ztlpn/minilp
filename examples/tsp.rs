@@ -2,6 +2,7 @@
 extern crate log;
 
 use minilp::{LinearExpr, OptimizationDirection, RelOp, Variable};
+use std::io;
 
 #[derive(Clone, Copy, Debug)]
 struct Point {
@@ -23,24 +24,125 @@ struct Problem {
     points: Vec<Point>,
 }
 
-fn read_line() -> Vec<String> {
+fn read_line() -> io::Result<Vec<String>> {
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line).unwrap();
-    line.split_whitespace().map(|tok| tok.to_owned()).collect()
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.split_whitespace().map(|tok| tok.to_owned()).collect())
+}
+
+fn parse_num<T: std::str::FromStr>(input: &str, line_num: usize) -> io::Result<T> {
+    input.parse::<T>().or(Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("line {}: couldn't parse number", line_num),
+    )))
 }
 
 impl Problem {
-    fn read() -> Problem {
-        let num_points = read_line()[0].parse::<usize>().unwrap();
-        let mut points = vec![];
-        for _ in 0..num_points {
-            let line = read_line();
-            points.push(Point {
-                x: line[0].parse::<f64>().unwrap(),
-                y: line[1].parse::<f64>().unwrap(),
-            });
+    /// Parse the problem in TSPLIB format from stdin.
+    fn parse() -> io::Result<Problem> {
+        // Format description: http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/tsp95.pdf
+
+        let mut dimension = None;
+        let mut line_num = 0;
+        loop {
+            let line = read_line()?;
+            if line.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "premature end of header".to_string(),
+                ));
+            }
+
+            let mut keyword = line[0].clone();
+            if keyword.ends_with(":") {
+                keyword.pop();
+            }
+
+            if keyword == "TYPE" {
+                if line.last().unwrap() != "TSP" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "only problems with TYPE: TSP supported".to_string(),
+                    ));
+                }
+            } else if keyword == "EDGE_WEIGHT_TYPE" {
+                if line.last().unwrap() != "EUC_2D" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "only problems with EDGE_WEIGHT_TYPE: EUC_2D supported".to_string(),
+                    ));
+                }
+            } else if keyword == "DIMENSION" {
+                let dim: usize = parse_num(line.last().as_ref().unwrap(), line_num)?;
+                dimension = Some(dim);
+            } else if keyword == "NODE_COORD_SECTION" {
+                break;
+            }
+
+            line_num += 1;
         }
-        Problem { points }
+
+        let num_points = dimension.ok_or(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no DIMENSION specified".to_string(),
+        ))?;
+        if num_points > 100_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("problem dimension: {} is suspiciously large", num_points),
+            ));
+        }
+
+        let mut point_opts = vec![None; num_points];
+        for _ in 0..num_points {
+            let line = read_line()?;
+            let node_num: usize = parse_num(&line[0], line_num)?;
+            let x: f64 = parse_num(&line[1], line_num)?;
+            let y: f64 = parse_num(&line[2], line_num)?;
+            if node_num == 0 || node_num > num_points {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("line {}: bad node number: {}", line_num, node_num),
+                ));
+            }
+            if point_opts[node_num - 1].is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("line {}: node {} specified twice", line_num, node_num),
+                ));
+            }
+            point_opts[node_num - 1] = Some(Point { x, y });
+
+            line_num += 1;
+        }
+
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        if line == "EOF\n" {
+            line_num += 1;
+            line.clear();
+            std::io::stdin().read_line(&mut line).unwrap();
+        }
+        if !line.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("line {}: unexpected content after EOF", line_num),
+            ));
+        }
+
+        let mut points = vec![];
+        for (i, po) in point_opts.into_iter().enumerate() {
+            if let Some(p) = po {
+                points.push(p);
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("node {} is not specified", i),
+                ));
+            }
+        }
+
+        Ok(Problem { points })
     }
 
     fn dist(&self, n1: usize, n2: usize) -> f64 {
@@ -225,7 +327,10 @@ impl Tour {
         svg += "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n";
         svg += "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n";
         svg += "  \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n";
-        svg += &format!("<svg width=\"{}px\" height=\"{}px\" version=\"1.1\"", width, height);
+        svg += &format!(
+            "<svg width=\"{}px\" height=\"{}px\" version=\"1.1\"",
+            width, height
+        );
         svg += "     xmlns=\"http://www.w3.org/2000/svg\">\n";
 
         use std::fmt::Write;
@@ -441,6 +546,6 @@ mod tests {
 fn main() {
     env_logger::init();
 
-    let problem = Problem::read();
+    let problem = Problem::parse().unwrap();
     problem.solve();
 }
