@@ -24,9 +24,9 @@ struct Problem {
     points: Vec<Point>,
 }
 
-fn read_line() -> io::Result<Vec<String>> {
+fn read_line<R: io::BufRead>(input: &mut R) -> io::Result<Vec<String>> {
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
+    input.read_line(&mut line)?;
     Ok(line.split_whitespace().map(|tok| tok.to_owned()).collect())
 }
 
@@ -38,14 +38,17 @@ fn parse_num<T: std::str::FromStr>(input: &str, line_num: usize) -> io::Result<T
 }
 
 impl Problem {
-    /// Parse the problem in TSPLIB format from stdin.
-    fn parse() -> io::Result<Problem> {
-        // Format description: http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/tsp95.pdf
+    fn dist(&self, n1: usize, n2: usize) -> f64 {
+        self.points[n1].dist(self.points[n2])
+    }
 
+    /// Parse a problem in TSPLIB format.
+    /// Format description: http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/tsp95.pdf
+    fn parse<R: io::BufRead>(input: &mut R) -> io::Result<Problem> {
         let mut dimension = None;
         let mut line_num = 0;
         loop {
-            let line = read_line()?;
+            let line = read_line(input)?;
             if line.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -95,7 +98,7 @@ impl Problem {
 
         let mut point_opts = vec![None; num_points];
         for _ in 0..num_points {
-            let line = read_line()?;
+            let line = read_line(input)?;
             let node_num: usize = parse_num(&line[0], line_num)?;
             let x: f64 = parse_num(&line[1], line_num)?;
             let y: f64 = parse_num(&line[2], line_num)?;
@@ -116,17 +119,11 @@ impl Problem {
             line_num += 1;
         }
 
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).unwrap();
-        if line == "EOF\n" {
-            line_num += 1;
-            line.clear();
-            std::io::stdin().read_line(&mut line).unwrap();
-        }
-        if !line.is_empty() {
+        let line = read_line(input)?;
+        if line.len() > 1 || (line.len() == 1 && line[0] != "EOF") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("line {}: unexpected content after EOF", line_num),
+                format!("line {}: expected EOF", line_num),
             ));
         }
 
@@ -144,169 +141,15 @@ impl Problem {
 
         Ok(Problem { points })
     }
-
-    fn dist(&self, n1: usize, n2: usize) -> f64 {
-        self.points[n1].dist(self.points[n2])
-    }
-
-    fn solve(&self) {
-        let num_points = self.points.len();
-        let mut lp_problem = minilp::Problem::new(OptimizationDirection::Minimize);
-
-        let mut edge_vars = vec![vec![]; num_points];
-        for i in 0..num_points {
-            for j in 0..num_points {
-                let var = if j < i {
-                    edge_vars[j][i]
-                } else {
-                    lp_problem.add_var(Some(0.0), Some(1.0), self.dist(i, j))
-                };
-                edge_vars[i].push(var);
-            }
-        }
-
-        for i in 0..num_points {
-            let mut edges_sum = LinearExpr::empty();
-            for j in 0..num_points {
-                if i != j {
-                    edges_sum.add(edge_vars[i][j], 1.0);
-                }
-            }
-            lp_problem.add_constraint(edges_sum, RelOp::Eq, 2.0);
-        }
-
-        let mut cur_solution = lp_problem.solve().unwrap();
-        cur_solution = add_subtour_constraints(cur_solution, &edge_vars);
-
-        // A step in the branch&bound depth-first search. We choose a variable and try to fix
-        // its value to either 0 or 1. After we explore a branch where one value is chosen,
-        // we return and try another value. Initial value is heuristically chosen to be
-        // the closest integer to the current solution value.
-        struct Step {
-            start_solution: minilp::Solution, // LP solution right before the step.
-            var: Variable,
-            start_val: u8,
-            cur_val: Option<u8>,
-        }
-
-        let new_step = |start_solution: minilp::Solution, var: Variable| -> Step {
-            let start_val = if start_solution[var] < 0.5 { 0 } else { 1 };
-            Step {
-                start_solution,
-                var,
-                start_val,
-                cur_val: None,
-            }
-        };
-
-        let mut best_cost = f64::INFINITY;
-        let mut best_tour = None;
-
-        let start_obj_val = cur_solution.objective();
-        let mut dfs_stack = if let Some(var) = choose_branch_var(&cur_solution) {
-            vec![new_step(cur_solution, var)]
-        } else {
-            info!(
-                "found optimal solution with initial relaxation! cost: {:.2}",
-                start_obj_val
-            );
-            let best_tour = Tour::from_lp_solution(&cur_solution, &edge_vars);
-            print!("{}", best_tour.to_svg(self));
-            return;
-        };
-
-        info!(
-            "starting branch&bound, current obj. value: {:.2}",
-            start_obj_val
-        );
-
-        for iter in 0.. {
-            let cur_step = dfs_stack.last_mut().unwrap();
-
-            if let Some(ref mut val) = cur_step.cur_val {
-                if *val == cur_step.start_val {
-                    *val = 1 - *val;
-                } else {
-                    dfs_stack.pop();
-                    if dfs_stack.is_empty() {
-                        break;
-                    } else {
-                        continue;
-                    }
-                }
-            } else {
-                cur_step.cur_val = Some(cur_step.start_val);
-            };
-
-            let mut cur_solution = cur_step.start_solution.clone();
-            if let Ok(new_solution) =
-                cur_solution.set_var(cur_step.var, cur_step.cur_val.unwrap() as f64)
-            {
-                cur_solution = new_solution;
-            } else {
-                // There is no feasible solution with the current variable constraints.
-                continue;
-            }
-
-            cur_solution = add_subtour_constraints(cur_solution, &edge_vars);
-
-            let obj_val = cur_solution.objective();
-            if obj_val > best_cost {
-                // As the cost of any solution is bound from below by obj_val, it is pointless
-                // to explore this branch: we won't find better solution there.
-                continue;
-            }
-
-            if let Some(var) = choose_branch_var(&cur_solution) {
-                dfs_stack.push(new_step(cur_solution, var));
-            } else {
-                if obj_val < best_cost {
-                    info!(
-                        "iter {} (search depth {}): found new best solution, cost: {:.2}",
-                        iter,
-                        dfs_stack.len(),
-                        obj_val
-                    );
-                    best_cost = obj_val;
-                    best_tour = Some(Tour::from_lp_solution(&cur_solution, &edge_vars));
-                }
-            };
-        }
-
-        info!("found optimal solution, cost: {:.2}", best_cost);
-        print!("{}", best_tour.unwrap().to_svg(self));
-    }
 }
 
 struct Tour(Vec<usize>);
 
 impl Tour {
-    fn from_lp_solution(lp_solution: &minilp::Solution, edge_vars: &[Vec<Variable>]) -> Self {
-        let num_points = edge_vars.len();
-        let mut tour = vec![];
-        let mut is_visited = vec![false; num_points];
-        let mut cur_point = 0;
-        for _ in 0..num_points {
-            assert!(!is_visited[cur_point]);
-            is_visited[cur_point] = true;
-            tour.push(cur_point);
-            for neighbor in 0..num_points {
-                if !is_visited[neighbor]
-                    && lp_solution[edge_vars[cur_point][neighbor]].round() == 1.0
-                {
-                    cur_point = neighbor;
-                    break;
-                }
-            }
-        }
-        assert_eq!(tour.len(), num_points);
-        Self(tour)
-    }
-
     fn to_string(&self) -> String {
         self.0
             .iter()
-            .map(|n| n.to_string())
+            .map(|n| (n + 1).to_string())
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -353,21 +196,130 @@ impl Tour {
     }
 }
 
-/// Choose the next variable to branch on during branch&bound.
-/// Returns None if solution is integral.
-fn choose_branch_var(cur_solution: &minilp::Solution) -> Option<Variable> {
-    // It is a heuristic choice and the simplest heuristic is to choose variable with
-    // max divergence from an integer value.
-    let mut max_divergence = 0.0;
-    let mut max_var = None;
-    for (var, &val) in cur_solution {
-        let divergence = f64::abs(val - val.round());
-        if divergence > 1e-5 && divergence > max_divergence {
-            max_divergence = divergence;
-            max_var = Some(var);
+fn solve(problem: &Problem) -> Tour {
+    let num_points = problem.points.len();
+    let mut lp_problem = minilp::Problem::new(OptimizationDirection::Minimize);
+
+    let mut edge_vars = vec![vec![]; num_points];
+    for i in 0..num_points {
+        for j in 0..num_points {
+            let var = if j < i {
+                edge_vars[j][i]
+            } else {
+                lp_problem.add_var(Some(0.0), Some(1.0), problem.dist(i, j))
+            };
+            edge_vars[i].push(var);
         }
     }
-    max_var
+
+    for i in 0..num_points {
+        let mut edges_sum = LinearExpr::empty();
+        for j in 0..num_points {
+            if i != j {
+                edges_sum.add(edge_vars[i][j], 1.0);
+            }
+        }
+        lp_problem.add_constraint(edges_sum, RelOp::Eq, 2.0);
+    }
+
+    let mut cur_solution = lp_problem.solve().unwrap();
+    cur_solution = add_subtour_constraints(cur_solution, &edge_vars);
+
+    // A step in the branch&bound depth-first search. We choose a variable and try to fix
+    // its value to either 0 or 1. After we explore a branch where one value is chosen,
+    // we return and try another value. Initial value is heuristically chosen to be
+    // the closest integer to the current solution value.
+    struct Step {
+        start_solution: minilp::Solution, // LP solution right before the step.
+        var: Variable,
+        start_val: u8,
+        cur_val: Option<u8>,
+    }
+
+    let new_step = |start_solution: minilp::Solution, var: Variable| -> Step {
+        let start_val = if start_solution[var] < 0.5 { 0 } else { 1 };
+        Step {
+            start_solution,
+            var,
+            start_val,
+            cur_val: None,
+        }
+    };
+
+    let mut best_cost = f64::INFINITY;
+    let mut best_tour = None;
+
+    let start_obj_val = cur_solution.objective();
+    let mut dfs_stack = if let Some(var) = choose_branch_var(&cur_solution) {
+        vec![new_step(cur_solution, var)]
+    } else {
+        info!(
+            "found optimal solution with initial relaxation! cost: {:.2}",
+            start_obj_val
+        );
+        return tour_from_lp_solution(&cur_solution, &edge_vars);
+    };
+
+    info!(
+        "starting branch&bound, current obj. value: {:.2}",
+        start_obj_val
+    );
+
+    for iter in 0.. {
+        let cur_step = dfs_stack.last_mut().unwrap();
+
+        if let Some(ref mut val) = cur_step.cur_val {
+            if *val == cur_step.start_val {
+                *val = 1 - *val;
+            } else {
+                dfs_stack.pop();
+                if dfs_stack.is_empty() {
+                    break;
+                } else {
+                    continue;
+                }
+            }
+        } else {
+            cur_step.cur_val = Some(cur_step.start_val);
+        };
+
+        let mut cur_solution = cur_step.start_solution.clone();
+        if let Ok(new_solution) =
+            cur_solution.set_var(cur_step.var, cur_step.cur_val.unwrap() as f64)
+        {
+            cur_solution = new_solution;
+        } else {
+            // There is no feasible solution with the current variable constraints.
+            continue;
+        }
+
+        cur_solution = add_subtour_constraints(cur_solution, &edge_vars);
+
+        let obj_val = cur_solution.objective();
+        if obj_val > best_cost {
+            // As the cost of any solution is bound from below by obj_val, it is pointless
+            // to explore this branch: we won't find better solution there.
+            continue;
+        }
+
+        if let Some(var) = choose_branch_var(&cur_solution) {
+            dfs_stack.push(new_step(cur_solution, var));
+        } else {
+            if obj_val < best_cost {
+                info!(
+                    "iter {} (search depth {}): found new best solution, cost: {:.2}",
+                    iter,
+                    dfs_stack.len(),
+                    obj_val
+                );
+                best_cost = obj_val;
+                best_tour = Some(tour_from_lp_solution(&cur_solution, &edge_vars));
+            }
+        };
+    }
+
+    info!("found optimal solution, cost: {:.2}", best_cost);
+    best_tour.unwrap()
 }
 
 /// Add all subtour constraints violated by the current solution.
@@ -543,9 +495,96 @@ mod tests {
     }
 }
 
+fn tour_from_lp_solution(lp_solution: &minilp::Solution, edge_vars: &[Vec<Variable>]) -> Tour {
+    let num_points = edge_vars.len();
+    let mut tour = vec![];
+    let mut is_visited = vec![false; num_points];
+    let mut cur_point = 0;
+    for _ in 0..num_points {
+        assert!(!is_visited[cur_point]);
+        is_visited[cur_point] = true;
+        tour.push(cur_point);
+        for neighbor in 0..num_points {
+            if !is_visited[neighbor] && lp_solution[edge_vars[cur_point][neighbor]].round() == 1.0 {
+                cur_point = neighbor;
+                break;
+            }
+        }
+    }
+    assert_eq!(tour.len(), num_points);
+    Tour(tour)
+}
+
+/// Choose the next variable to branch on during branch&bound.
+/// Returns None if solution is integral.
+fn choose_branch_var(cur_solution: &minilp::Solution) -> Option<Variable> {
+    // It is a heuristic choice and the simplest heuristic is to choose variable with
+    // max divergence from an integer value.
+    let mut max_divergence = 0.0;
+    let mut max_var = None;
+    for (var, &val) in cur_solution {
+        let divergence = f64::abs(val - val.round());
+        if divergence > 1e-5 && divergence > max_divergence {
+            max_divergence = divergence;
+            max_var = Some(var);
+        }
+    }
+    max_var
+}
+
+const USAGE: &str = "\
+USAGE:
+    tsp --help
+    tsp [--svg-output] INPUT_FILE
+
+INPUT_FILE is a problem description in TSPLIB format. You can download some
+problems from http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/.
+Use - for stdin.
+
+By default, prints a single line containing 1-based node indices in the
+optimal tour order to stdout. If --svg-output option is enabled, prints an
+SVG document containing the optimal tour.
+
+Set RUST_LOG environment variable (e.g. to info) to enable logging to stderr.
+";
+
 fn main() {
     env_logger::init();
 
-    let problem = Problem::parse().unwrap();
-    problem.solve();
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.len() <= 1 {
+        eprint!("{}", USAGE);
+        std::process::exit(1);
+    }
+
+    if args[1] == "--help" {
+        eprintln!("Finds the optimal solution for a traveling salesman problem.\n");
+        eprint!("{}", USAGE);
+        return;
+    }
+
+    let (enable_svg_output, filename) = if args.len() == 2 {
+        (false, &args[1])
+    } else if args.len() == 3 && args[1] == "--svg-output" {
+        (true, &args[2])
+    } else {
+        eprintln!("Failed to parse arguments.\n");
+        eprint!("{}", USAGE);
+        std::process::exit(1);
+    };
+
+    let problem = if filename == "-" {
+        Problem::parse(&mut std::io::stdin().lock()).unwrap()
+    } else {
+        let file = std::fs::File::open(filename).unwrap();
+        let mut input = io::BufReader::new(file);
+        Problem::parse(&mut input).unwrap()
+    };
+
+    let tour = solve(&problem);
+    if enable_svg_output {
+        print!("{}", tour.to_svg(&problem));
+    } else {
+        println!("{}", tour.to_string());
+    }
 }
