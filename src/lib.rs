@@ -80,9 +80,12 @@ impl std::iter::FromIterator<(Variable, f64)> for LinearExpr {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum RelOp {
+pub enum ComparisonOp {
+    /// The == operator (equal to)
     Eq,
+    /// The <= operator (less than or equal to)
     Le,
+    /// The >= operator (greater than or equal to)
     Ge,
 }
 
@@ -110,7 +113,7 @@ pub struct Problem {
     obj_coeffs: Vec<f64>,
     var_mins: Vec<f64>,
     var_maxs: Vec<f64>,
-    constraints: Vec<(CsVec, RelOp, f64)>,
+    constraints: Vec<(CsVec, ComparisonOp, f64)>,
 }
 
 type CsVec = sprs::CsVecI<f64, usize>;
@@ -138,11 +141,11 @@ impl Problem {
         var
     }
 
-    pub fn add_constraint(&mut self, expr: impl Into<LinearExpr>, rel_op: RelOp, rhs: f64) {
+    pub fn add_constraint(&mut self, expr: impl Into<LinearExpr>, cmp_op: ComparisonOp, rhs: f64) {
         let expr = expr.into();
         self.constraints.push((
             CsVec::new(self.obj_coeffs.len(), expr.vars, expr.coeffs),
-            rel_op,
+            cmp_op,
             rhs,
         ));
     }
@@ -206,13 +209,13 @@ impl Solution {
     pub fn add_constraint(
         mut self,
         expr: impl Into<LinearExpr>,
-        rel_op: RelOp,
+        cmp_op: ComparisonOp,
         rhs: f64,
     ) -> Result<Self, Error> {
         let expr = expr.into();
         self.solver.add_constraint(
             CsVec::new(self.num_vars, expr.vars, expr.coeffs),
-            rel_op,
+            cmp_op,
             rhs,
         )?;
         Ok(self)
@@ -272,8 +275,8 @@ mod tests {
         let mut problem = Problem::new(OptimizationDirection::Maximize);
         let v1 = problem.add_var((12.0, f64::INFINITY), 3.0);
         let v2 = problem.add_var((5.0, f64::INFINITY), 4.0);
-        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 20.0);
-        problem.add_constraint(&[(v2, -4.0), (v1, 1.0)], RelOp::Ge, -20.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 20.0);
+        problem.add_constraint(&[(v2, -4.0), (v1, 1.0)], ComparisonOp::Ge, -20.0);
 
         let sol = problem.solve().unwrap();
         assert_eq!(sol[v1], 12.0);
@@ -284,9 +287,9 @@ mod tests {
     #[test]
     fn empty_expr_constraints() {
         let trivial = [
-            (LinearExpr::empty(), RelOp::Eq, 0.0),
-            (LinearExpr::empty(), RelOp::Ge, -1.0),
-            (LinearExpr::empty(), RelOp::Le, 1.0),
+            (LinearExpr::empty(), ComparisonOp::Eq, 0.0),
+            (LinearExpr::empty(), ComparisonOp::Ge, -1.0),
+            (LinearExpr::empty(), ComparisonOp::Le, 1.0),
         ];
 
         let mut problem = Problem::new(OptimizationDirection::Minimize);
@@ -305,9 +308,9 @@ mod tests {
         }
 
         let infeasible = [
-            (LinearExpr::empty(), RelOp::Eq, 12.0),
-            (LinearExpr::empty(), RelOp::Ge, 34.0),
-            (LinearExpr::empty(), RelOp::Le, -56.0),
+            (LinearExpr::empty(), ComparisonOp::Eq, 12.0),
+            (LinearExpr::empty(), ComparisonOp::Ge, 34.0),
+            (LinearExpr::empty(), ComparisonOp::Le, -56.0),
         ];
 
         for (expr, op, b) in infeasible.iter().cloned() {
@@ -330,8 +333,8 @@ mod tests {
         let mut problem = Problem::new(OptimizationDirection::Maximize);
         let v1 = problem.add_var((0.0, 3.0), 1.0);
         let v2 = problem.add_var((0.0, 3.0), 2.0);
-        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 4.0);
-        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Ge, 1.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 4.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Ge, 1.0);
 
         let orig_sol = problem.solve().unwrap();
 
@@ -365,15 +368,15 @@ mod tests {
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let v1 = problem.add_var((0.0, f64::INFINITY), 2.0);
         let v2 = problem.add_var((0.0, f64::INFINITY), 1.0);
-        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Le, 4.0);
-        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], RelOp::Ge, 2.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 4.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Ge, 2.0);
 
         let orig_sol = problem.solve().unwrap();
 
         {
             let sol = orig_sol
                 .clone()
-                .add_constraint(&[(v1, -1.0), (v2, 1.0)], RelOp::Le, 0.0)
+                .add_constraint(&[(v1, -1.0), (v2, 1.0)], ComparisonOp::Le, 0.0)
                 .unwrap();
 
             assert_eq!(sol[v1], 1.0);
@@ -386,7 +389,7 @@ mod tests {
                 .clone()
                 .set_var(v2, 1.5)
                 .unwrap()
-                .add_constraint(&[(v1, -1.0), (v2, 1.0)], RelOp::Le, 0.0)
+                .add_constraint(&[(v1, -1.0), (v2, 1.0)], ComparisonOp::Le, 0.0)
                 .unwrap();
             assert_eq!(sol[v1], 1.5);
             assert_eq!(sol[v2], 1.5);
@@ -396,7 +399,7 @@ mod tests {
         {
             let sol = orig_sol
                 .clone()
-                .add_constraint(&[(v1, -1.0), (v2, 1.0)], RelOp::Ge, 3.0)
+                .add_constraint(&[(v1, -1.0), (v2, 1.0)], ComparisonOp::Ge, 3.0)
                 .unwrap();
 
             assert_eq!(sol[v1], 0.0);
@@ -410,8 +413,8 @@ mod tests {
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let v1 = problem.add_var((0.0, f64::INFINITY), 0.0);
         let v2 = problem.add_var((0.0, f64::INFINITY), -1.0);
-        problem.add_constraint(&[(v1, 3.0), (v2, 2.0)], RelOp::Le, 6.0);
-        problem.add_constraint(&[(v1, -3.0), (v2, 2.0)], RelOp::Le, 0.0);
+        problem.add_constraint(&[(v1, 3.0), (v2, 2.0)], ComparisonOp::Le, 6.0);
+        problem.add_constraint(&[(v1, -3.0), (v2, 2.0)], ComparisonOp::Le, 0.0);
 
         let mut sol = problem.solve().unwrap();
         assert_eq!(sol[v1], 1.0);

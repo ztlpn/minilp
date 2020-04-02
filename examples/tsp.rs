@@ -4,7 +4,7 @@
 #[macro_use]
 extern crate log;
 
-use minilp::{LinearExpr, OptimizationDirection, RelOp, Variable};
+use minilp::{ComparisonOp, LinearExpr, OptimizationDirection, Variable};
 use std::io;
 
 #[derive(Clone, Copy, Debug)]
@@ -242,7 +242,7 @@ fn solve(problem: &Problem) -> Tour {
                 edges_sum.add(edge_vars[i][j], 1.0);
             }
         }
-        lp_problem.add_constraint(edges_sum, RelOp::Eq, 2.0);
+        lp_problem.add_constraint(edges_sum, ComparisonOp::Eq, 2.0);
     }
 
     let mut cur_solution = lp_problem.solve().unwrap();
@@ -425,7 +425,7 @@ fn add_subtour_constraints(
         }
 
         cur_solution = cur_solution
-            .add_constraint(cut_edges_sum, RelOp::Ge, 2.0)
+            .add_constraint(cut_edges_sum, ComparisonOp::Ge, 2.0)
             .unwrap();
     }
 }

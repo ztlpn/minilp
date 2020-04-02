@@ -2,7 +2,7 @@ use crate::{
     helpers::{resized_view, to_dense},
     lu::{lu_factorize, LUFactors, ScratchSpace},
     sparse::{ScatteredVec, SparseMat, SparseVec},
-    CsVec, Error, RelOp,
+    CsVec, Error, ComparisonOp,
 };
 
 use sprs::CompressedStorage;
@@ -80,7 +80,7 @@ impl Solver {
         obj_coeffs: &[f64],
         var_mins: &[f64],
         var_maxs: &[f64],
-        constraints: &[(CsVec, RelOp, f64)],
+        constraints: &[(CsVec, ComparisonOp, f64)],
     ) -> Result<Self, Error> {
         let enable_steepest_edge = true; // TODO: make user-settable.
 
@@ -132,14 +132,14 @@ impl Solver {
         }
 
         let mut constraint_infos = vec![];
-        for (coeffs, rel_op, rhs) in constraints {
+        for (coeffs, cmp_op, rhs) in constraints {
             let rhs = *rhs;
 
             if coeffs.indices().is_empty() {
-                let is_tautological = match rel_op {
-                    RelOp::Eq => 0.0 == rhs,
-                    RelOp::Le => 0.0 <= rhs,
-                    RelOp::Ge => 0.0 >= rhs,
+                let is_tautological = match cmp_op {
+                    ComparisonOp::Eq => 0.0 == rhs,
+                    ComparisonOp::Le => 0.0 <= rhs,
+                    ComparisonOp::Ge => 0.0 >= rhs,
                 };
 
                 if is_tautological {
@@ -154,10 +154,10 @@ impl Solver {
                 lhs_val += coeff * nb_var_vals[var];
             }
 
-            let (slack_var_coeff, need_art_var) = match rel_op {
-                RelOp::Le => (Some(1), lhs_val > rhs),
-                RelOp::Ge => (Some(-1), lhs_val < rhs),
-                RelOp::Eq => (None, true),
+            let (slack_var_coeff, need_art_var) = match cmp_op {
+                ComparisonOp::Le => (Some(1), lhs_val > rhs),
+                ComparisonOp::Ge => (Some(-1), lhs_val < rhs),
+                ComparisonOp::Eq => (None, true),
             };
 
             constraint_infos.push(ConstraintInfo {
@@ -408,7 +408,7 @@ impl Solver {
 
             let cut_bound = self.basic_var_vals[row].floor() - self.basic_var_vals[row];
             let num_total_vars = self.num_total_vars();
-            self.add_constraint(cut_coeffs.into_csvec(num_total_vars), RelOp::Le, cut_bound)
+            self.add_constraint(cut_coeffs.into_csvec(num_total_vars), ComparisonOp::Le, cut_bound)
         } else {
             panic!("var {:?} is not basic!", var);
         }
@@ -566,14 +566,14 @@ impl Solver {
     pub(crate) fn add_constraint(
         &mut self,
         mut coeffs: CsVec,
-        rel_op: RelOp,
+        cmp_op: ComparisonOp,
         bound: f64,
     ) -> Result<(), Error> {
         if coeffs.indices().is_empty() {
-            let is_tautological = match rel_op {
-                RelOp::Eq => 0.0 == bound,
-                RelOp::Le => 0.0 <= bound,
-                RelOp::Ge => 0.0 >= bound,
+            let is_tautological = match cmp_op {
+                ComparisonOp::Eq => 0.0 == bound,
+                ComparisonOp::Le => 0.0 <= bound,
+                ComparisonOp::Ge => 0.0 >= bound,
             };
 
             if is_tautological {
@@ -586,10 +586,10 @@ impl Solver {
         // each >=/<= constraint adds a slack var
         let new_num_total_vars = self.num_total_vars() + 1;
 
-        let slack_var_coeff = match rel_op {
-            RelOp::Le => 1,
-            RelOp::Ge => -1,
-            RelOp::Eq => unimplemented!(),
+        let slack_var_coeff = match cmp_op {
+            ComparisonOp::Le => 1,
+            ComparisonOp::Ge => -1,
+            ComparisonOp::Eq => unimplemented!(),
         };
 
         assert_eq!(self.num_artificial_vars, 0);
@@ -1249,10 +1249,10 @@ mod tests {
             &[f64::NEG_INFINITY, 5.0],
             &[0.0, f64::INFINITY],
             &[
-                (to_sparse(&[1.0, 1.0]), RelOp::Le, 6.0),
-                (to_sparse(&[1.0, 2.0]), RelOp::Le, 8.0),
-                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 2.0),
-                (to_sparse(&[0.0, 1.0]), RelOp::Eq, 3.0),
+                (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 6.0),
+                (to_sparse(&[1.0, 2.0]), ComparisonOp::Le, 8.0),
+                (to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0),
+                (to_sparse(&[0.0, 1.0]), ComparisonOp::Eq, 3.0),
             ],
         )
         .unwrap();
@@ -1308,8 +1308,8 @@ mod tests {
             &[f64::NEG_INFINITY, 5.0],
             &[20.0, f64::INFINITY],
             &[
-                (to_sparse(&[1.0, 1.0]), RelOp::Le, 20.0),
-                (to_sparse(&[-1.0, 4.0]), RelOp::Le, 20.0),
+                (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 20.0),
+                (to_sparse(&[-1.0, 4.0]), ComparisonOp::Le, 20.0),
             ],
         )
         .unwrap();
@@ -1331,8 +1331,8 @@ mod tests {
             &[0.0, 0.0],
             &[f64::INFINITY, f64::INFINITY],
             &[
-                (to_sparse(&[1.0, 1.0]), RelOp::Ge, 10.0),
-                (to_sparse(&[1.0, 1.0]), RelOp::Le, 5.0),
+                (to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 10.0),
+                (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 5.0),
             ],
         )
         .unwrap()
