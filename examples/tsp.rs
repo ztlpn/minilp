@@ -150,6 +150,8 @@ impl Problem {
     }
 }
 
+/// A solution to the TSP problem: a sequence of node indices in the tour order.
+/// Each node must be present in the tour exactly once.
 struct Tour(Vec<usize>);
 
 impl Tour {
