@@ -1,8 +1,8 @@
 # `tsp`
 
 [Traveling salesman problem](https://en.wikipedia.org/wiki/Travelling_salesman_problem) or TSP
-is perhaps the most famous combinatorial optimization problem. Amazingly enough, even if linear
-programming is a continuous optimization technique, with some ingenuity it can be used to solve
+is perhaps the most famous combinatorial optimization problem. Amazingly enough, despite linear
+programming being a continuous optimization technique, with some ingenuity it can be used to solve
 discrete problems such as TSP which makes it a great showcase for the `minilp` crate.
 
 [`tsp.rs`](./tsp.rs) is a pretty basic solver, but it can still quickly produce *optimal* solutions
