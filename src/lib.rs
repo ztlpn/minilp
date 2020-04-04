@@ -2,6 +2,7 @@
 extern crate log;
 
 mod helpers;
+pub mod io;
 mod lu;
 mod ordering;
 mod solver;
@@ -16,7 +17,7 @@ pub enum OptimizationDirection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Variable(usize);
+pub struct Variable(pub(crate) usize);
 
 impl Variable {
     pub fn idx(&self) -> usize {

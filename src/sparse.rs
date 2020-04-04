@@ -1,7 +1,7 @@
 use crate::helpers::to_dense;
 use sprs::{CsMat, CsVec};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct SparseVec {
     indices: Vec<usize>,
     values: Vec<f64>,
