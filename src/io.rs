@@ -237,7 +237,8 @@ pub fn parse_mps_file<R: io::BufRead>(
         let (min, max) = match (var_def.min, var_def.max) {
             (Some(min), Some(max)) => (min, max),
             (Some(min), None) => (min, f64::INFINITY),
-            (None, Some(max)) => (f64::NEG_INFINITY, max),
+            (None, Some(max)) if max < 0.0 => (f64::NEG_INFINITY, max),
+            (None, Some(max)) => (0.0, max),
             (None, None) => (0.0, f64::INFINITY),
         };
         problem.add_var((min, max), var_def.obj_coeff.unwrap_or(0.0));
