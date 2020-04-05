@@ -18,35 +18,6 @@ pub fn parse_mps_file<R: io::BufRead>(
     // Introduction: http://lpsolve.sourceforge.net/5.5/mps-format.htm
     // More in-depth: http://cgm.cs.mcgill.ca/~avis/courses/567/cplex/reffileformatscplex.pdf
 
-    struct Lines<R: io::BufRead> {
-        input: R,
-        cur: String,
-        idx: usize,
-    }
-
-    impl<R: io::BufRead> Lines<R> {
-        fn to_next(&mut self) -> io::Result<()> {
-            loop {
-                self.idx += 1;
-                self.cur.clear();
-                self.input.read_line(&mut self.cur)?;
-                if self.cur.is_empty() {
-                    return Ok(());
-                }
-
-                if self.cur.starts_with("*") {
-                    continue;
-                }
-
-                let len = self.cur.trim_end().len();
-                if len != 0 {
-                    self.cur.truncate(len);
-                    return Ok(());
-                }
-            }
-        }
-    }
-
     let mut lines = Lines {
         input,
         cur: String::new(),
@@ -55,9 +26,11 @@ pub fn parse_mps_file<R: io::BufRead>(
 
     let problem_name = {
         lines.to_next()?;
-        let mut tokens = lines.cur.split_whitespace();
-        assert_eq!(tokens.next().unwrap(), "NAME");
-        tokens.next().unwrap_or("").to_owned()
+        let mut tokens = Tokens::new(&lines);
+        if tokens.next()? != "NAME" {
+            return Err(lines.err("expected NAME section"));
+        }
+        tokens.iter.next().unwrap_or("").to_owned()
     };
 
     struct ConstraintDef {
@@ -67,13 +40,15 @@ pub fn parse_mps_file<R: io::BufRead>(
         range: f64,
     }
 
-    let mut cost_name = None;
+    let mut obj_func_name = None;
     let mut free_rows = HashSet::new();
     let mut constraints = vec![];
     let mut constr_name2idx = HashMap::new();
     {
         lines.to_next()?;
-        assert_eq!(lines.cur, "ROWS");
+        if lines.cur != "ROWS" {
+            return Err(lines.err("expected ROWS section"));
+        }
 
         loop {
             lines.to_next()?;
@@ -81,13 +56,13 @@ pub fn parse_mps_file<R: io::BufRead>(
                 break;
             }
 
-            let mut tokens = lines.cur.split_whitespace();
-            let row_type = tokens.next().unwrap();
-            let name = tokens.next().unwrap();
+            let mut tokens = Tokens::new(&lines);
+            let row_type = tokens.next()?;
+            let name = tokens.next()?;
             let cmp_op = match row_type {
                 "N" => {
-                    if cost_name.is_none() {
-                        cost_name = Some(name.to_owned());
+                    if obj_func_name.is_none() {
+                        obj_func_name = Some(name.to_owned());
                     } else {
                         free_rows.insert(name.to_owned());
                     }
@@ -96,11 +71,16 @@ pub fn parse_mps_file<R: io::BufRead>(
                 "L" => ComparisonOp::Le,
                 "G" => ComparisonOp::Ge,
                 "E" => ComparisonOp::Eq,
-                _ => panic!(),
+                _ => return Err(lines.err(&format!("unexpected row type {}", row_type))),
             };
-            assert!(constr_name2idx
+
+            if constr_name2idx
                 .insert(name.to_owned(), constraints.len())
-                .is_none());
+                .is_some()
+            {
+                return Err(lines.err(&format!("row {} already declared", name)));
+            }
+
             constraints.push(ConstraintDef {
                 lhs: LinearExpr::empty(),
                 cmp_op,
@@ -110,19 +90,25 @@ pub fn parse_mps_file<R: io::BufRead>(
         }
     }
 
-    let cost_name = cost_name.unwrap();
+    let obj_func_name = if let Some(name) = obj_func_name {
+        name
+    } else {
+        return Err(lines.err("objective function name not declared"));
+    };
 
     #[derive(Default)]
     struct VariableDef {
         min: Option<f64>,
         max: Option<f64>,
-        obj_coeff: Option<f64>,
+        obj_coeff: f64,
     }
 
     let mut var_defs = vec![];
     let mut var_name2idx = HashMap::new();
     {
-        assert_eq!(lines.cur, "COLUMNS");
+        if lines.cur != "COLUMNS" {
+            return Err(lines.err("expected COLUMNS section"));
+        }
 
         let mut cur_var = Variable(0);
         let mut cur_name = String::new();
@@ -133,42 +119,43 @@ pub fn parse_mps_file<R: io::BufRead>(
                 break;
             }
 
-            let mut tokens = lines.cur.split_whitespace();
-            let name = tokens.next().unwrap();
+            let mut tokens = Tokens::new(&lines);
+            let name = tokens.next()?;
 
             if name != cur_name {
+                if var_name2idx.get(name).is_some() {
+                    return Err(lines.err(&format!("variable {} already declared", name)));
+                }
+
                 if !cur_name.is_empty() {
-                    assert!(var_name2idx
-                        .insert(std::mem::take(&mut cur_name), cur_var)
-                        .is_none());
+                    var_name2idx.insert(std::mem::take(&mut cur_name), cur_var);
                     var_defs.push(std::mem::take(&mut cur_def));
                     cur_var.0 += 1;
                 }
                 cur_name = name.to_owned();
             }
 
-            let coeff_tokens = tokens.collect::<Vec<_>>();
-            for chunk in coeff_tokens.chunks(2) {
-                assert_eq!(chunk.len(), 2);
-                let coeff = chunk[1].parse::<f64>().unwrap();
-                if chunk[0] == cost_name {
-                    assert!(cur_def.obj_coeff.replace(coeff).is_none());
-                } else if let Some(idx) = constr_name2idx.get(chunk[0]) {
-                    constraints[*idx].lhs.add(cur_var, coeff);
-                } else if free_rows.get(chunk[0]).is_none() {
-                    panic!("unknown constraint: {}", chunk[0]);
+            for (key, val) in KVPairs::parse(&mut tokens)?.iter() {
+                if key == obj_func_name {
+                    cur_def.obj_coeff = val;
+                } else if let Some(idx) = constr_name2idx.get(key) {
+                    constraints[*idx].lhs.add(cur_var, val);
+                } else if free_rows.get(key).is_none() {
+                    return Err(lines.err(&format!("unknown constraint: {}", key)));
                 }
             }
         }
 
         if !cur_name.is_empty() {
-            assert!(var_name2idx.insert(cur_name, cur_var).is_none());
+            var_name2idx.insert(std::mem::take(&mut cur_name), cur_var);
             var_defs.push(std::mem::take(&mut cur_def));
         }
     }
 
     {
-        assert_eq!(lines.cur, "RHS");
+        if lines.cur != "RHS" {
+            return Err(lines.err("expected RHS section"));
+        }
 
         let mut cur_vec_name = None;
         loop {
@@ -177,8 +164,8 @@ pub fn parse_mps_file<R: io::BufRead>(
                 break;
             }
 
-            let mut tokens = lines.cur.split_whitespace();
-            let vec_name = tokens.next().unwrap();
+            let mut tokens = Tokens::new(&lines);
+            let vec_name = tokens.next()?;
 
             if cur_vec_name.is_none() {
                 cur_vec_name = Some(vec_name.to_owned());
@@ -187,16 +174,13 @@ pub fn parse_mps_file<R: io::BufRead>(
                 continue;
             }
 
-            let rhs_tokens = tokens.collect::<Vec<_>>();
-            for chunk in rhs_tokens.chunks(2) {
-                assert_eq!(chunk.len(), 2);
-                let rhs = chunk[1].parse::<f64>().unwrap();
-                if chunk[0] == cost_name {
-                    unimplemented!();
-                } else if let Some(idx) = constr_name2idx.get(chunk[0]) {
-                    constraints[*idx].rhs = rhs;
+            for (key, val) in KVPairs::parse(&mut tokens)?.iter() {
+                if key == obj_func_name {
+                    return Err(lines.err("setting objective in RHS section is not supported"));
+                } else if let Some(idx) = constr_name2idx.get(key) {
+                    constraints[*idx].rhs = val;
                 } else {
-                    panic!("unknown constraint: {}", chunk[0]);
+                    return Err(lines.err(&format!("unknown constraint: {}", key)));
                 }
             }
         }
@@ -210,9 +194,9 @@ pub fn parse_mps_file<R: io::BufRead>(
                 break;
             }
 
-            let mut tokens = lines.cur.split_whitespace();
+            let mut tokens = Tokens::new(&lines);
 
-            let vec_name = tokens.next().unwrap();
+            let vec_name = tokens.next()?;
             if cur_vec_name.is_none() {
                 cur_vec_name = Some(vec_name.to_owned());
             } else if cur_vec_name.as_deref() != Some(vec_name) {
@@ -220,14 +204,11 @@ pub fn parse_mps_file<R: io::BufRead>(
                 continue;
             }
 
-            let rhs_tokens = tokens.collect::<Vec<_>>();
-            for chunk in rhs_tokens.chunks(2) {
-                assert_eq!(chunk.len(), 2);
-                let range = chunk[1].parse::<f64>().unwrap();
-                if let Some(idx) = constr_name2idx.get(chunk[0]) {
-                    constraints[*idx].range = range;
+            for (key, val) in KVPairs::parse(&mut tokens)?.iter() {
+                if let Some(idx) = constr_name2idx.get(key) {
+                    constraints[*idx].range = val;
                 } else {
-                    panic!("unknown constraint: {}", chunk[0]);
+                    return Err(lines.err(&format!("unknown constraint: {}", key)));
                 }
             }
         }
@@ -241,18 +222,14 @@ pub fn parse_mps_file<R: io::BufRead>(
                 break;
             }
 
-            let mut tokens = lines.cur.split_whitespace();
+            let mut tokens = Tokens::new(&lines);
 
-            let bound_type = tokens.next().unwrap();
+            let bound_type = tokens.next()?;
             if bound_type != "LO" && bound_type != "UP" && bound_type != "FX" {
-                unimplemented!(
-                    "line {}: bound type {} not supported",
-                    lines.idx,
-                    bound_type
-                );
+                return Err(lines.err(&format!("bound type {} is not supported", bound_type)));
             }
 
-            let vec_name = tokens.next().unwrap();
+            let vec_name = tokens.next()?;
             if cur_vec_name.is_none() {
                 cur_vec_name = Some(vec_name.to_owned());
             } else if cur_vec_name.as_deref() != Some(vec_name) {
@@ -260,25 +237,32 @@ pub fn parse_mps_file<R: io::BufRead>(
                 continue;
             }
 
-            let var_name = tokens.next().unwrap();
-            let var_idx = var_name2idx.get(var_name).unwrap();
+            let var_name = tokens.next()?;
+            let var_idx = if let Some(idx) = var_name2idx.get(var_name) {
+                idx
+            } else {
+                return Err(lines.err(&format!("unknown variable: {}", var_name)));
+            };
             let var_def = &mut var_defs[var_idx.0];
-            let val = tokens.next().unwrap().parse::<f64>().unwrap();
+            let val = parse_f64(tokens.next()?, lines.idx)?;
             match bound_type {
-                "LO" => assert!(var_def.min.replace(val).is_none()),
-                "UP" => assert!(var_def.max.replace(val).is_none()),
+                "LO" => var_def.min = Some(val),
+                "UP" => var_def.max = Some(val),
                 "FX" => {
-                    assert!(var_def.min.replace(val).is_none());
-                    assert!(var_def.max.replace(val).is_none());
+                    var_def.min = Some(val);
+                    var_def.max = Some(val);
                 }
                 _ => unreachable!(),
             }
         }
     }
 
-    assert_eq!(lines.cur, "ENDATA");
+    if lines.cur != "ENDATA" {
+        return Err(lines.err("expected ENDATA section"));
+    }
 
     let mut problem = Problem::new(direction);
+
     for var_def in &var_defs {
         let (min, max) = match (var_def.min, var_def.max) {
             (Some(min), Some(max)) => (min, max),
@@ -287,8 +271,9 @@ pub fn parse_mps_file<R: io::BufRead>(
             (None, Some(max)) => (0.0, max),
             (None, None) => (0.0, f64::INFINITY),
         };
-        problem.add_var((min, max), var_def.obj_coeff.unwrap_or(0.0));
+        problem.add_var((min, max), var_def.obj_coeff);
     }
+
     for constr in constraints {
         if constr.range == 0.0 {
             problem.add_constraint(constr.lhs, constr.cmp_op, constr.rhs);
@@ -309,6 +294,108 @@ pub fn parse_mps_file<R: io::BufRead>(
         variables: var_name2idx,
         problem,
     })
+}
+
+struct Lines<R: io::BufRead> {
+    input: R,
+    cur: String,
+    idx: usize,
+}
+
+impl<R: io::BufRead> Lines<R> {
+    fn to_next(&mut self) -> io::Result<()> {
+        loop {
+            self.idx += 1;
+            self.cur.clear();
+            self.input.read_line(&mut self.cur)?;
+            if self.cur.is_empty() {
+                return Ok(());
+            }
+
+            if self.cur.starts_with("*") {
+                continue;
+            }
+
+            let len = self.cur.trim_end().len();
+            if len != 0 {
+                self.cur.truncate(len);
+                return Ok(());
+            }
+        }
+    }
+
+    fn err(&self, msg: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("line {}: {}", self.idx, msg),
+        )
+    }
+}
+
+struct Tokens<'a> {
+    line_idx: usize,
+    iter: std::str::SplitWhitespace<'a>,
+}
+
+impl<'a> Tokens<'a> {
+    fn new<R: io::BufRead>(lines: &'a Lines<R>) -> Self {
+        Self {
+            line_idx: lines.idx,
+            iter: lines.cur.split_whitespace(),
+        }
+    }
+
+    fn next(&mut self) -> io::Result<&'a str> {
+        self.iter.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("line {}: unexpected end of line", self.line_idx),
+            )
+        })
+    }
+}
+
+fn parse_f64(input: &str, line_idx: usize) -> io::Result<f64> {
+    input.parse().or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "line {}: couldn't parse float from string: `{}`",
+                line_idx, input
+            ),
+        ))
+    })
+}
+
+struct KVPairs<'a> {
+    // MPS allows one or two key-value pairs per line.
+    first: (&'a str, f64),
+    second: Option<(&'a str, f64)>,
+}
+
+impl<'a> KVPairs<'a> {
+    fn parse(tokens: &mut Tokens<'a>) -> io::Result<Self> {
+        let first_key = tokens.next()?;
+        let first_val = parse_f64(tokens.next()?, tokens.line_idx)?;
+
+        let second_key = if let Some(key) = tokens.iter.next() {
+            key
+        } else {
+            return Ok(KVPairs {
+                first: (first_key, first_val),
+                second: None,
+            });
+        };
+        let second_val = parse_f64(tokens.next()?, tokens.line_idx)?;
+        Ok(KVPairs {
+            first: (first_key, first_val),
+            second: Some((second_key, second_val)),
+        })
+    }
+
+    fn iter(self) -> impl Iterator<Item = (&'a str, f64)> {
+        std::iter::once(self.first).chain(self.second)
+    }
 }
 
 #[cfg(test)]
