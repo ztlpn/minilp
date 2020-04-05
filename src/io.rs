@@ -1,5 +1,8 @@
 use crate::{ComparisonOp, LinearExpr, OptimizationDirection, Problem, Variable};
-use std::{collections::{HashMap, HashSet}, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 
 pub struct MpsFile {
     pub problem_name: String,
@@ -28,7 +31,7 @@ pub fn parse_mps_file<R: io::BufRead>(
                 self.cur.clear();
                 self.input.read_line(&mut self.cur)?;
                 if self.cur.is_empty() {
-                    return Ok(())
+                    return Ok(());
                 }
 
                 if self.cur.starts_with("*") {
@@ -61,6 +64,7 @@ pub fn parse_mps_file<R: io::BufRead>(
         lhs: LinearExpr,
         cmp_op: ComparisonOp,
         rhs: f64,
+        range: f64,
     }
 
     let mut cost_name = None;
@@ -101,6 +105,7 @@ pub fn parse_mps_file<R: io::BufRead>(
                 lhs: LinearExpr::empty(),
                 cmp_op,
                 rhs: 0.0,
+                range: 0.0,
             });
         }
     }
@@ -197,6 +202,37 @@ pub fn parse_mps_file<R: io::BufRead>(
         }
     }
 
+    if lines.cur == "RANGES" {
+        let mut cur_vec_name = None;
+        loop {
+            lines.to_next()?;
+            if !lines.cur.starts_with(" ") {
+                break;
+            }
+
+            let mut tokens = lines.cur.split_whitespace();
+
+            let vec_name = tokens.next().unwrap();
+            if cur_vec_name.is_none() {
+                cur_vec_name = Some(vec_name.to_owned());
+            } else if cur_vec_name.as_deref() != Some(vec_name) {
+                // use only the first RANGES vector
+                continue;
+            }
+
+            let rhs_tokens = tokens.collect::<Vec<_>>();
+            for chunk in rhs_tokens.chunks(2) {
+                assert_eq!(chunk.len(), 2);
+                let range = chunk[1].parse::<f64>().unwrap();
+                if let Some(idx) = constr_name2idx.get(chunk[0]) {
+                    constraints[*idx].range = range;
+                } else {
+                    panic!("unknown constraint: {}", chunk[0]);
+                }
+            }
+        }
+    }
+
     if lines.cur == "BOUNDS" {
         let mut cur_vec_name = None;
         loop {
@@ -209,7 +245,11 @@ pub fn parse_mps_file<R: io::BufRead>(
 
             let bound_type = tokens.next().unwrap();
             if bound_type != "LO" && bound_type != "UP" && bound_type != "FX" {
-                unimplemented!("line {}: bound type {} not supported", lines.idx, bound_type);
+                unimplemented!(
+                    "line {}: bound type {} not supported",
+                    lines.idx,
+                    bound_type
+                );
             }
 
             let vec_name = tokens.next().unwrap();
@@ -250,7 +290,18 @@ pub fn parse_mps_file<R: io::BufRead>(
         problem.add_var((min, max), var_def.obj_coeff.unwrap_or(0.0));
     }
     for constr in constraints {
-        problem.add_constraint(constr.lhs, constr.cmp_op, constr.rhs);
+        if constr.range == 0.0 {
+            problem.add_constraint(constr.lhs, constr.cmp_op, constr.rhs);
+        } else {
+            let (min, max) = match constr.cmp_op {
+                ComparisonOp::Ge => (constr.rhs, constr.rhs + constr.range.abs()),
+                ComparisonOp::Le => (constr.rhs - constr.range.abs(), constr.rhs),
+                ComparisonOp::Eq if constr.range > 0.0 => (constr.rhs, constr.rhs + constr.range),
+                ComparisonOp::Eq => (constr.rhs + constr.range, constr.rhs),
+            };
+            problem.add_constraint(constr.lhs.clone(), ComparisonOp::Ge, min);
+            problem.add_constraint(constr.lhs, ComparisonOp::Le, max);
+        }
     }
 
     Ok(MpsFile {
