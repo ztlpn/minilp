@@ -9,6 +9,8 @@ use sprs::CompressedStorage;
 
 type CsMat = sprs::CsMatI<f64, usize>;
 
+const EPS: f64 = 1e-8;
+
 #[derive(Clone)]
 pub(crate) struct Solver {
     pub(crate) num_vars: usize,
@@ -464,7 +466,7 @@ impl Solver {
             }
         }
 
-        if self.cur_obj_val > 1e-8 {
+        if self.cur_obj_val > EPS {
             return Err(Error::Infeasible);
         }
 
@@ -681,8 +683,8 @@ impl Solver {
                 let obj_coeff = self.nb_var_obj_coeffs[col];
 
                 // Choose only among non-basic vars that can be changed with objective decreasing.
-                if (is_positive_direction && obj_coeff > -1e-8)
-                    || (!is_positive_direction && obj_coeff < 1e-8)
+                if (is_positive_direction && obj_coeff > -EPS)
+                    || (!is_positive_direction && obj_coeff < EPS)
                 {
                     continue;
                 }
@@ -727,7 +729,7 @@ impl Solver {
         let mut pivot_coeff = 0.0f64;
         let mut leaving_new_val = 0.0;
         for (r, &coeff) in self.col_coeffs.iter() {
-            if coeff.abs() < 1e-8 {
+            if coeff.abs() < EPS {
                 continue;
             }
 
@@ -746,13 +748,13 @@ impl Solver {
             // basic var is not violated. The var with the minimum such amount becomes leaving.
             let entering_diff_abs = f64::abs((limit_val - self.basic_var_vals[r]) / coeff);
 
-            let should_choose = entering_diff_abs < min_entering_diff_abs - 1e-8
-                || (entering_diff_abs < min_entering_diff_abs + 1e-8
+            let should_choose = entering_diff_abs < min_entering_diff_abs - EPS
+                || (entering_diff_abs < min_entering_diff_abs + EPS
                     // There is uncertainty in choosing the leaving variable.
                     // Choose the one with the biggest absolute coeff for the reasons of
                     // numerical stability.
-                    && (coeff.abs() > pivot_coeff.abs() + 1e-8
-                        || coeff.abs() > pivot_coeff.abs() - 1e-8
+                    && (coeff.abs() > pivot_coeff.abs() + EPS
+                        || coeff.abs() > pivot_coeff.abs() - EPS
                             // There is still uncertainty, choose based on the column index.
                             // NOTE: this still doesn't guarantee the absence of cycling.
                             && leaving_r.is_none() || r < leaving_r.unwrap()));
@@ -814,9 +816,9 @@ impl Solver {
             // must be >= 0, we conclude that sign(new_obj_coeff) = sign(leaving_diff).
             // From this we see that if old val was < min, dual feasibility is maintained if the
             // new var is min (analogously for max).
-            let (cur_infeasibility, new_val) = if val < min - 1e-8 {
+            let (cur_infeasibility, new_val) = if val < min - EPS {
                 (min - val, min)
-            } else if val > max + 1e-8 {
+            } else if val > max + EPS {
                 (val - max, max)
             } else {
                 continue;
@@ -854,7 +856,7 @@ impl Solver {
             }
 
             let coeff_abs = coeff.abs();
-            if coeff_abs < 1e-8 {
+            if coeff_abs < EPS {
                 continue;
             }
 
@@ -877,10 +879,10 @@ impl Solver {
             let cur_diff_abs = f64::abs(obj_coeff / coeff);
 
             // See comments in `choose_pivot_row` concerning numeric stability.
-            let should_choose = cur_diff_abs < min_obj_coeff_diff_abs - 1e-8
-                || (cur_diff_abs < min_obj_coeff_diff_abs + 1e-8
-                    && (coeff_abs > pivot_coeff_abs + 1e-8
-                        || coeff_abs > pivot_coeff_abs - 1e-8 && c < entering_c.unwrap()));
+            let should_choose = cur_diff_abs < min_obj_coeff_diff_abs - EPS
+                || (cur_diff_abs < min_obj_coeff_diff_abs + EPS
+                    && (coeff_abs > pivot_coeff_abs + EPS
+                        || coeff_abs > pivot_coeff_abs - EPS && c < entering_c.unwrap()));
 
             if should_choose {
                 entering_c = Some(c);
@@ -1044,7 +1046,7 @@ impl Solver {
             .solve_dense(&mut cur_vals, &mut self.basis_solver.scratch);
         self.basic_var_vals = cur_vals;
         for b in &mut self.basic_var_vals {
-            if f64::abs(*b) < 1e-8 {
+            if f64::abs(*b) < EPS {
                 *b = 0.0;
             }
         }
@@ -1073,7 +1075,7 @@ impl Solver {
         for &var in &self.nb_vars {
             let col = self.orig_constraints_csc.outer_view(var).unwrap();
             let mut val = self.orig_obj_coeffs[var] - col.dot(&multipliers);
-            if f64::abs(val) < 1e-8 {
+            if f64::abs(val) < EPS {
                 val = 0.0;
             }
             self.nb_var_obj_coeffs.push(val);
