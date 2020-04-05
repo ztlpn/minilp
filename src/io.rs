@@ -1,5 +1,5 @@
 use crate::{ComparisonOp, LinearExpr, OptimizationDirection, Problem, Variable};
-use std::{collections::HashMap, io};
+use std::{collections::{HashMap, HashSet}, io};
 
 pub struct MpsFile {
     pub problem_name: String,
@@ -52,8 +52,9 @@ pub fn parse_mps_file<R: io::BufRead>(
 
     let problem_name = {
         lines.to_next()?;
-        assert!(lines.cur.starts_with("NAME "));
-        lines.cur.split_whitespace().nth(1).unwrap().to_string()
+        let mut tokens = lines.cur.split_whitespace();
+        assert_eq!(tokens.next().unwrap(), "NAME");
+        tokens.next().unwrap_or("").to_owned()
     };
 
     struct ConstraintDef {
@@ -63,6 +64,7 @@ pub fn parse_mps_file<R: io::BufRead>(
     }
 
     let mut cost_name = None;
+    let mut free_rows = HashSet::new();
     let mut constraints = vec![];
     let mut constr_name2idx = HashMap::new();
     {
@@ -80,7 +82,11 @@ pub fn parse_mps_file<R: io::BufRead>(
             let name = tokens.next().unwrap();
             let cmp_op = match row_type {
                 "N" => {
-                    assert!(cost_name.replace(name.to_owned()).is_none());
+                    if cost_name.is_none() {
+                        cost_name = Some(name.to_owned());
+                    } else {
+                        free_rows.insert(name.to_owned());
+                    }
                     continue;
                 }
                 "L" => ComparisonOp::Le,
@@ -144,7 +150,7 @@ pub fn parse_mps_file<R: io::BufRead>(
                     assert!(cur_def.obj_coeff.replace(coeff).is_none());
                 } else if let Some(idx) = constr_name2idx.get(chunk[0]) {
                     constraints[*idx].lhs.add(cur_var, coeff);
-                } else {
+                } else if free_rows.get(chunk[0]).is_none() {
                     panic!("unknown constraint: {}", chunk[0]);
                 }
             }
@@ -269,8 +275,10 @@ ROWS
 COLUMNS
     XONE      COST                 1   LIM1                 1
     XONE      LIM2                 1
+
     YTWO      COST                 4   LIM1                 1
     YTWO      MYEQN               -1
+
     ZTHREE    COST                 9   LIM2                 1
     ZTHREE    MYEQN                1
 RHS
