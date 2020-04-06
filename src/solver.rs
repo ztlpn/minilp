@@ -2,7 +2,7 @@ use crate::{
     helpers::{resized_view, to_dense},
     lu::{lu_factorize, LUFactors, ScratchSpace},
     sparse::{ScatteredVec, SparseMat, SparseVec},
-    CsVec, Error, ComparisonOp,
+    ComparisonOp, CsVec, Error,
 };
 
 use sprs::CompressedStorage;
@@ -410,7 +410,11 @@ impl Solver {
 
             let cut_bound = self.basic_var_vals[row].floor() - self.basic_var_vals[row];
             let num_total_vars = self.num_total_vars();
-            self.add_constraint(cut_coeffs.into_csvec(num_total_vars), ComparisonOp::Le, cut_bound)
+            self.add_constraint(
+                cut_coeffs.into_csvec(num_total_vars),
+                ComparisonOp::Le,
+                cut_bound,
+            )
         } else {
             panic!("var {:?} is not basic!", var);
         }

@@ -5,7 +5,6 @@ authors = ["Alexey Zatelepin <alex.zatelepin@gmail.com>"]
 edition = "2018"
 license = "Apache-2.0"
 description = "A library for solving linear programming problems."
-homepage = "https://github.com/ztlpn/minilp/"
 repository = "https://github.com/ztlpn/minilp/"
 readme = "README.md"
 keywords = ["linear-programming", "optimization"]

@@ -11,10 +11,7 @@ pub struct MpsFile {
 }
 
 impl MpsFile {
-    pub fn parse<R: io::BufRead>(
-        input: &mut R,
-        direction: OptimizationDirection,
-    ) -> io::Result<Self> {
+    pub fn parse<R: io::BufRead>(input: R, direction: OptimizationDirection) -> io::Result<Self> {
         // Format descriptions:
         // Introduction: http://lpsolve.sourceforge.net/5.5/mps-format.htm
         // More in-depth: http://cgm.cs.mcgill.ca/~avis/courses/567/cplex/reffileformatscplex.pdf

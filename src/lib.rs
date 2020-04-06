@@ -126,6 +126,14 @@ impl std::iter::FromIterator<(Variable, f64)> for LinearExpr {
     }
 }
 
+impl std::iter::Extend<(Variable, f64)> for LinearExpr {
+    fn extend<I: IntoIterator<Item = (Variable, f64)>>(&mut self, iter: I) {
+        for term in iter {
+            self.add(term.0, term.1)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ComparisonOp {
     /// The == operator (equal to)
@@ -228,29 +236,16 @@ impl Solution {
         }
     }
 
-    pub fn get(&self, var: Variable) -> &f64 {
+    pub fn var_value(&self, var: Variable) -> &f64 {
         assert!(var.idx() < self.num_vars);
         self.solver.get_value(var.idx())
     }
 
-    pub fn iter(&self) -> SolutionIterator {
-        SolutionIterator {
+    pub fn iter(&self) -> SolutionIter {
+        SolutionIter {
             solution: self,
             var_idx: 0,
         }
-    }
-
-    pub fn set_var(mut self, var: Variable, val: f64) -> Result<Self, Error> {
-        assert!(var.idx() < self.num_vars);
-        self.solver.set_var(var.idx(), val)?;
-        Ok(self)
-    }
-
-    /// Return true if the var was really unset.
-    pub fn unset_var(mut self, var: Variable) -> Result<(Self, bool), Error> {
-        assert!(var.idx() < self.num_vars);
-        let res = self.solver.unset_var(var.idx())?;
-        Ok((self, res))
     }
 
     pub fn add_constraint(
@@ -268,6 +263,19 @@ impl Solution {
         Ok(self)
     }
 
+    pub fn set_var(mut self, var: Variable, val: f64) -> Result<Self, Error> {
+        assert!(var.idx() < self.num_vars);
+        self.solver.set_var(var.idx(), val)?;
+        Ok(self)
+    }
+
+    /// Return true if the var was really unset.
+    pub fn unset_var(mut self, var: Variable) -> Result<(Self, bool), Error> {
+        assert!(var.idx() < self.num_vars);
+        let res = self.solver.unset_var(var.idx())?;
+        Ok((self, res))
+    }
+
     // TODO: remove_constraint
 
     pub fn add_gomory_cut(mut self, var: Variable) -> Result<Self, Error> {
@@ -281,16 +289,16 @@ impl std::ops::Index<Variable> for Solution {
     type Output = f64;
 
     fn index(&self, var: Variable) -> &Self::Output {
-        self.get(var)
+        self.var_value(var)
     }
 }
 
-pub struct SolutionIterator<'a> {
+pub struct SolutionIter<'a> {
     solution: &'a Solution,
     var_idx: usize,
 }
 
-impl<'a> Iterator for SolutionIterator<'a> {
+impl<'a> Iterator for SolutionIter<'a> {
     type Item = (Variable, &'a f64);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -306,7 +314,7 @@ impl<'a> Iterator for SolutionIterator<'a> {
 
 impl<'a> IntoIterator for &'a Solution {
     type Item = (Variable, &'a f64);
-    type IntoIter = SolutionIterator<'a>;
+    type IntoIter = SolutionIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()

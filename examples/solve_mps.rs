@@ -31,11 +31,11 @@ fn main() {
     let filename = &args[1];
     let direction = minilp::OptimizationDirection::Minimize;
     let file = if filename == "-" {
-        MpsFile::parse(&mut std::io::stdin().lock(), direction).unwrap()
+        MpsFile::parse(std::io::stdin().lock(), direction).unwrap()
     } else {
         let file = std::fs::File::open(filename).unwrap();
-        let mut input = io::BufReader::new(file);
-        MpsFile::parse(&mut input, direction).unwrap()
+        let input = io::BufReader::new(file);
+        MpsFile::parse(input, direction).unwrap()
     };
 
     let solution = file.problem.solve().unwrap();

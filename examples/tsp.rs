@@ -30,7 +30,7 @@ struct Problem {
     points: Vec<Point>,
 }
 
-fn read_line<R: io::BufRead>(input: &mut R) -> io::Result<Vec<String>> {
+fn read_line<R: io::BufRead>(mut input: R) -> io::Result<Vec<String>> {
     let mut line = String::new();
     input.read_line(&mut line)?;
     Ok(line.split_whitespace().map(|tok| tok.to_owned()).collect())
@@ -51,12 +51,12 @@ impl Problem {
     /// Parse a problem in the TSPLIB format.
     ///
     /// Format description: http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/tsp95.pdf
-    fn parse<R: io::BufRead>(input: &mut R) -> io::Result<Problem> {
+    fn parse<R: io::BufRead>(mut input: R) -> io::Result<Problem> {
         let mut name = String::new();
         let mut dimension = None;
         let mut line_num = 0;
         loop {
-            let line = read_line(input)?;
+            let line = read_line(&mut input)?;
             if line.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -108,7 +108,7 @@ impl Problem {
 
         let mut point_opts = vec![None; num_points];
         for _ in 0..num_points {
-            let line = read_line(input)?;
+            let line = read_line(&mut input)?;
             let node_num: usize = parse_num(&line[0], line_num)?;
             let x: f64 = parse_num(&line[1], line_num)?;
             let y: f64 = parse_num(&line[2], line_num)?;
@@ -628,11 +628,11 @@ fn main() {
     };
 
     let problem = if filename == "-" {
-        Problem::parse(&mut std::io::stdin().lock()).unwrap()
+        Problem::parse(std::io::stdin().lock()).unwrap()
     } else {
         let file = std::fs::File::open(filename).unwrap();
-        let mut input = io::BufReader::new(file);
-        Problem::parse(&mut input).unwrap()
+        let input = io::BufReader::new(file);
+        Problem::parse(input).unwrap()
     };
 
     let tour = solve(&problem);
