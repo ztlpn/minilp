@@ -16,11 +16,11 @@ subject to linear equality and inequality constraints.
 # Entry points
 
 Begin by creating a [`Problem`](struct.Problem.html) instance, declaring variables and adding
-constraints. Solving it will produce [`Solution`](struct.Solution.html) that can be used to
+constraints. Solving it will produce a [`Solution`](struct.Solution.html) that can be used to
 get the optimal objective value, corresponding variable values and also to add more
 constraints.
 
-Alternatively, use the [`mps`](io/index.html) parser to read the problem from an MPS file.
+Alternatively, create an [`MpsFile`](mps/struct.MpsFile.html) by parsing a file in the MPS format.
 
 # Example
 
@@ -48,8 +48,8 @@ assert_eq!(solution[y], 3.0);
 extern crate log;
 
 mod helpers;
-pub mod io;
 mod lu;
+mod mps;
 mod ordering;
 mod solver;
 mod sparse;
@@ -312,6 +312,8 @@ impl<'a> IntoIterator for &'a Solution {
         self.iter()
     }
 }
+
+pub use mps::MpsFile;
 
 #[cfg(test)]
 mod tests {
