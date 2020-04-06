@@ -1,5 +1,7 @@
-//! Solves euclidean travelling salesman problems using the integer linear programming approach.
-//! See comments in the solve() function for detailed description of the algorithm.
+//! A solver for the travelling salesman problem.
+//!
+//! Solves euclidean TPS problems using the integer linear programming approach.
+//! See comments in the solve() function for the detailed description of the algorithm.
 
 #[macro_use]
 extern crate log;
@@ -46,7 +48,8 @@ impl Problem {
         self.points[n1].dist(self.points[n2])
     }
 
-    /// Parse a problem in TSPLIB format.
+    /// Parse a problem in the TSPLIB format.
+    ///
     /// Format description: http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/tsp95.pdf
     fn parse<R: io::BufRead>(input: &mut R) -> io::Result<Problem> {
         let mut name = String::new();
