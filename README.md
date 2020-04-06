@@ -37,7 +37,8 @@ assert_eq!(solution[x], 1.0);
 assert_eq!(solution[y], 3.0);
 ```
 
-For a more involved example, see [tsp](examples#tsp), a solver for the travelling salesman problem.
+For a more involved example, see [examples/tsp](examples#tsp), a solver for the travelling
+salesman problem.
 
 ## License
 
