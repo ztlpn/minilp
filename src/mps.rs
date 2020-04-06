@@ -4,10 +4,20 @@ use std::{
     io,
 };
 
+#[derive(Clone)]
 pub struct MpsFile {
     pub problem_name: String,
     pub variables: HashMap<String, Variable>,
     pub problem: Problem,
+}
+
+impl std::fmt::Debug for MpsFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MpsFile")
+            .field("problem_name", &self.problem_name)
+            .field("problem", &self.problem)
+            .finish()
+    }
 }
 
 impl MpsFile {

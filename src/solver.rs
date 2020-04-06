@@ -420,7 +420,7 @@ impl Solver {
         }
     }
 
-    fn num_constraints(&self) -> usize {
+    pub(crate) fn num_constraints(&self) -> usize {
         self.orig_constraints.rows()
     }
 

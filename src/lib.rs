@@ -44,6 +44,8 @@ assert_eq!(solution[y], 3.0);
 ```
 */
 
+#![deny(missing_debug_implementations)]
+
 #[macro_use]
 extern crate log;
 
@@ -71,7 +73,7 @@ impl Variable {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LinearExpr {
     vars: Vec<usize>,
     coeffs: Vec<f64>,
@@ -91,6 +93,7 @@ impl LinearExpr {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct LinearTerm(Variable, f64);
 
 impl From<(Variable, f64)> for LinearTerm {
@@ -171,6 +174,17 @@ pub struct Problem {
     constraints: Vec<(CsVec, ComparisonOp, f64)>,
 }
 
+impl std::fmt::Debug for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only printing lengths here because actual data is probably huge.
+        f.debug_struct("Problem")
+            .field("direction", &self.direction)
+            .field("num_vars", &self.obj_coeffs.len())
+            .field("num_constraints", &self.constraints.len())
+            .finish()
+    }
+}
+
 type CsVec = sprs::CsVecI<f64, usize>;
 
 impl Problem {
@@ -223,9 +237,20 @@ impl Problem {
 
 #[derive(Clone)]
 pub struct Solution {
-    num_vars: usize,
     direction: OptimizationDirection,
+    num_vars: usize,
     solver: solver::Solver,
+}
+
+impl std::fmt::Debug for Solution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only printing lengths here because actual data is probably huge.
+        f.debug_struct("Solution")
+            .field("direction", &self.direction)
+            .field("num_vars", &self.num_vars)
+            .field("num_constraints", &self.solver.num_constraints())
+            .finish()
+    }
 }
 
 impl Solution {
@@ -293,6 +318,7 @@ impl std::ops::Index<Variable> for Solution {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SolutionIter<'a> {
     solution: &'a Solution,
     var_idx: usize,
