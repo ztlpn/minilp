@@ -271,7 +271,7 @@ pub fn parse_mps_file<R: io::BufRead>(
             (None, Some(max)) => (0.0, max),
             (None, None) => (0.0, f64::INFINITY),
         };
-        problem.add_var((min, max), var_def.obj_coeff);
+        problem.add_var(var_def.obj_coeff, (min, max));
     }
 
     for constr in constraints {

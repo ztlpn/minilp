@@ -29,8 +29,8 @@ use minilp::{Problem, OptimizationDirection, ComparisonOp};
 
 // Maximize an objective function x + 2 * y of two variables x >= 0 and 0 <= y <= 3
 let mut problem = Problem::new(OptimizationDirection::Maximize);
-let x = problem.add_var((0.0, f64::INFINITY), 1.0);
-let y = problem.add_var((0.0, 3.0), 2.0);
+let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+let y = problem.add_var(2.0, (0.0, 3.0));
 
 // subject to constraints: x + y <= 4 and 2 * x + y >= 2.0.
 problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
@@ -176,7 +176,7 @@ impl Problem {
         }
     }
 
-    pub fn add_var(&mut self, (min, max): (f64, f64), obj_coeff: f64) -> Variable {
+    pub fn add_var(&mut self, obj_coeff: f64, (min, max): (f64, f64)) -> Variable {
         let var = Variable(self.obj_coeffs.len());
         let obj_coeff = match self.direction {
             OptimizationDirection::Minimize => obj_coeff,
@@ -320,8 +320,8 @@ mod tests {
     #[test]
     fn optimize() {
         let mut problem = Problem::new(OptimizationDirection::Maximize);
-        let v1 = problem.add_var((12.0, f64::INFINITY), 3.0);
-        let v2 = problem.add_var((5.0, f64::INFINITY), 4.0);
+        let v1 = problem.add_var(3.0, (12.0, f64::INFINITY));
+        let v2 = problem.add_var(4.0, (5.0, f64::INFINITY));
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 20.0);
         problem.add_constraint(&[(v2, -4.0), (v1, 1.0)], ComparisonOp::Ge, -20.0);
 
@@ -340,7 +340,7 @@ mod tests {
         ];
 
         let mut problem = Problem::new(OptimizationDirection::Minimize);
-        let _ = problem.add_var((0.0, f64::INFINITY), 1.0);
+        let _ = problem.add_var(1.0, (0.0, f64::INFINITY));
         for (expr, op, b) in trivial.iter().cloned() {
             problem.add_constraint(expr, op, b);
         }
@@ -371,15 +371,15 @@ mod tests {
             assert_eq!(sol.map(|_| "solved"), Err(Error::Infeasible));
         }
 
-        let _ = problem.add_var((0.0, f64::INFINITY), -1.0);
+        let _ = problem.add_var(-1.0, (0.0, f64::INFINITY));
         assert_eq!(problem.solve().map(|_| "solved"), Err(Error::Unbounded));
     }
 
     #[test]
     fn set_unset_var() {
         let mut problem = Problem::new(OptimizationDirection::Maximize);
-        let v1 = problem.add_var((0.0, 3.0), 1.0);
-        let v2 = problem.add_var((0.0, 3.0), 2.0);
+        let v1 = problem.add_var(1.0, (0.0, 3.0));
+        let v2 = problem.add_var(2.0, (0.0, 3.0));
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 4.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Ge, 1.0);
 
@@ -413,8 +413,8 @@ mod tests {
     #[test]
     fn add_constraint() {
         let mut problem = Problem::new(OptimizationDirection::Minimize);
-        let v1 = problem.add_var((0.0, f64::INFINITY), 2.0);
-        let v2 = problem.add_var((0.0, f64::INFINITY), 1.0);
+        let v1 = problem.add_var(2.0, (0.0, f64::INFINITY));
+        let v2 = problem.add_var(1.0, (0.0, f64::INFINITY));
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 4.0);
         problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Ge, 2.0);
 
@@ -458,8 +458,8 @@ mod tests {
     #[test]
     fn gomory_cut() {
         let mut problem = Problem::new(OptimizationDirection::Minimize);
-        let v1 = problem.add_var((0.0, f64::INFINITY), 0.0);
-        let v2 = problem.add_var((0.0, f64::INFINITY), -1.0);
+        let v1 = problem.add_var(0.0, (0.0, f64::INFINITY));
+        let v2 = problem.add_var(-1.0, (0.0, f64::INFINITY));
         problem.add_constraint(&[(v1, 3.0), (v2, 2.0)], ComparisonOp::Le, 6.0);
         problem.add_constraint(&[(v1, -3.0), (v2, 2.0)], ComparisonOp::Le, 0.0);
 

@@ -23,8 +23,8 @@ use minilp::{Problem, OptimizationDirection, ComparisonOp};
 
 // Maximize an objective function x + 2 * y of two variables x >= 0 and 0 <= y <= 3
 let mut problem = Problem::new(OptimizationDirection::Maximize);
-let x = problem.add_var((0.0, f64::INFINITY), 1.0);
-let y = problem.add_var((0.0, 3.0), 2.0);
+let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+let y = problem.add_var(2.0, (0.0, 3.0));
 
 // subject to constraints: x + y <= 4 and 2 * x + y >= 2.0.
 problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);

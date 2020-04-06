@@ -225,7 +225,7 @@ fn solve(problem: &Problem) -> Tour {
             let var = if j < i {
                 edge_vars[j][i]
             } else {
-                lp_problem.add_var((0.0, 1.0), problem.dist(i, j))
+                lp_problem.add_var(problem.dist(i, j), (0.0, 1.0))
             };
             edge_vars[i].push(var);
         }
