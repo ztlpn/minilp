@@ -233,8 +233,8 @@ impl Solution {
         self.solver.get_value(var.idx())
     }
 
-    pub fn iter(&self) -> IterSolution {
-        IterSolution {
+    pub fn iter(&self) -> SolutionIterator {
+        SolutionIterator {
             solution: self,
             var_idx: 0,
         }
@@ -285,12 +285,12 @@ impl std::ops::Index<Variable> for Solution {
     }
 }
 
-pub struct IterSolution<'a> {
+pub struct SolutionIterator<'a> {
     solution: &'a Solution,
     var_idx: usize,
 }
 
-impl<'a> Iterator for IterSolution<'a> {
+impl<'a> Iterator for SolutionIterator<'a> {
     type Item = (Variable, &'a f64);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -306,7 +306,7 @@ impl<'a> Iterator for IterSolution<'a> {
 
 impl<'a> IntoIterator for &'a Solution {
     type Item = (Variable, &'a f64);
-    type IntoIter = IterSolution<'a>;
+    type IntoIter = SolutionIterator<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
