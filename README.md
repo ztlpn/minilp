@@ -13,6 +13,10 @@ subject to linear equality and inequality constraints.
 * Incremental: add constraints to an existing solution without solving it from scratch.
 * Problems can be defined via an API or parsed from an
   [MPS](https://en.wikipedia.org/wiki/MPS_(format)) file.
+  
+Warning: this is an early-stage project. Although the library is already quite powerful,
+it will probably cycle, lose precision or panic on some harder problems. Please report
+bugs and contribute code!
 
 ## Examples
 
