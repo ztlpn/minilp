@@ -1061,23 +1061,22 @@ impl Solver {
                 .reset(&self.orig_constraints_csc, &self.basic_vars);
         }
 
-        type ArrayVec = ndarray::Array1<f64>;
-
         let multipliers = {
-            let mut obj_coeffs = vec![0.0; self.num_constraints()];
+            let mut rhs = vec![0.0; self.num_constraints()];
             for (c, &var) in self.basic_vars.iter().enumerate() {
-                obj_coeffs[c] = self.orig_obj_coeffs[var];
+                rhs[c] = self.orig_obj_coeffs[var];
             }
             self.basis_solver
                 .lu_factors_transp
-                .solve_dense(&mut obj_coeffs, &mut self.basis_solver.scratch);
-            ArrayVec::from(obj_coeffs)
+                .solve_dense(&mut rhs, &mut self.basis_solver.scratch);
+            rhs
         };
 
         self.nb_var_obj_coeffs.clear();
         for &var in &self.nb_vars {
             let col = self.orig_constraints_csc.outer_view(var).unwrap();
-            let mut val = self.orig_obj_coeffs[var] - col.dot(&multipliers);
+            let dot_prod: f64 = col.iter().map(|(r, val)| val * multipliers[r]).sum();
+            let mut val = self.orig_obj_coeffs[var] - dot_prod;
             if f64::abs(val) < EPS {
                 val = 0.0;
             }

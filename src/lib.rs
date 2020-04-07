@@ -260,11 +260,10 @@ impl Problem {
     ///
     /// Left-hand side of the constraint can be specified in several ways:
     /// ```
-    /// use minilp::*;
+    /// # use minilp::*;
     /// let mut problem = Problem::new(OptimizationDirection::Minimize);
     /// let x = problem.add_var(1.0, (0.0, f64::INFINITY));
     /// let y = problem.add_var(1.0, (0.0, f64::INFINITY));
-    /// let vars = [x, y];
     ///
     /// // Add an x + y >= 2 constraint, specifying the left-hand side expression:
     ///
@@ -272,6 +271,7 @@ impl Problem {
     /// problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
     ///
     /// // * by passing an iterator of variable-coefficient pairs.
+    /// let vars = [x, y];
     /// problem.add_constraint(vars.iter().map(|&v| (v, 1.0)), ComparisonOp::Ge, 2.0);
     ///
     /// // * by manually constructing a LinearExpr.
