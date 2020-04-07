@@ -4,10 +4,14 @@ use std::{
     io,
 };
 
+/// A linear programming problem parsed from an MPS file.
 #[derive(Clone)]
 pub struct MpsFile {
+    /// Value of the NAME field.
     pub problem_name: String,
+    /// A mapping of a variable name to the corresponding [`Variable`].
     pub variables: HashMap<String, Variable>,
+    /// A parsed problem.
     pub problem: Problem,
 }
 
@@ -21,6 +25,17 @@ impl std::fmt::Debug for MpsFile {
 }
 
 impl MpsFile {
+    /// Parses a linear programming problem from an MPS file.
+    ///
+    /// This function supports the "free" MPS format, meaning that lines are tokenized based on
+    /// whitespace, not based on position. Also, because MPS lacks any way to indicate
+    /// the optimization direction, you have to supply it manually.
+    ///
+    /// # Errors
+    ///
+    /// Apart from I/O errors coming from `input`, this function will signal any syntax error
+    /// as [`std::io::Error`] with the kind set to [`InvalidData`](std::io::ErrorKind::InvalidData).
+    /// Unsupported features such as integer or free variables are reported similarly.
     pub fn parse<R: io::BufRead>(input: R, direction: OptimizationDirection) -> io::Result<Self> {
         // Format descriptions:
         // Introduction: http://lpsolve.sourceforge.net/5.5/mps-format.htm

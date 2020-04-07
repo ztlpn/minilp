@@ -21,6 +21,8 @@ where
         data = &data[..(data.len() - 1)];
     }
 
+    // Safety: new indices and data are the same size,indices are still sorted and all indices
+    // are less than the new length. Thus, all CsVecView invariants are satisfied.
     unsafe { CsVecView::new_view_raw(len, data.len(), indices.as_ptr(), data.as_ptr()) }
 }
 

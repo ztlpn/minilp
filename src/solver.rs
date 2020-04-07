@@ -326,7 +326,7 @@ impl Solver {
         }
     }
 
-    pub(crate) fn set_var(&mut self, var: usize, val: f64) -> Result<(), Error> {
+    pub(crate) fn fix_var(&mut self, var: usize, val: f64) -> Result<(), Error> {
         assert_eq!(self.num_artificial_vars, 0);
 
         if val < self.orig_var_mins[var] || val > self.orig_var_maxs[var] {
@@ -365,10 +365,10 @@ impl Solver {
     }
 
     /// Return true if the var was really unset.
-    pub(crate) fn unset_var(&mut self, var: usize) -> Result<bool, Error> {
+    pub(crate) fn unfix_var(&mut self, var: usize) -> bool {
         if let VarState::NonBasic(col) = self.var_states[var] {
             if !std::mem::replace(&mut self.nb_var_is_fixed[col], false) {
-                return Ok(false);
+                return false;
             }
 
             self.calc_col_coeffs(col);
@@ -379,9 +379,7 @@ impl Solver {
                 self.orig_var_maxs[var]
             };
 
-            if new_val.is_infinite() {
-                return Err(Error::Unbounded);
-            }
+            assert!(new_val.is_finite());
 
             let diff = new_val - self.nb_var_vals[col];
             for (r, coeff) in self.col_coeffs.iter() {
@@ -390,11 +388,12 @@ impl Solver {
             self.cur_obj_val += diff * self.nb_var_obj_coeffs[col];
             self.nb_var_vals[col] = new_val;
 
-            self.restore_feasibility()?;
+            // Shouldn't result in infeasibility, we are removing a constraint after all.
+            self.restore_feasibility().unwrap();
             self.optimize().unwrap();
-            Ok(true)
+            true
         } else {
-            Ok(false)
+            false
         }
     }
 

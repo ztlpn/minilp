@@ -2,7 +2,7 @@
 
 A library for solving linear programming problems.
 
-[Linear programming](https://en.wikipedia.org/wiki/Linear_programming) is technique for
+[Linear programming](https://en.wikipedia.org/wiki/Linear_programming) is a technique for
 finding the minimum (or maximum) of a linear function of a set of continuous variables
 subject to linear equality and inequality constraints.
 
@@ -26,7 +26,7 @@ let mut problem = Problem::new(OptimizationDirection::Maximize);
 let x = problem.add_var(1.0, (0.0, f64::INFINITY));
 let y = problem.add_var(2.0, (0.0, 3.0));
 
-// subject to constraints: x + y <= 4 and 2 * x + y >= 2.0.
+// subject to constraints: x + y <= 4 and 2 * x + y >= 2.
 problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
 problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
 

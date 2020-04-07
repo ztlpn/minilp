@@ -350,7 +350,7 @@ fn solve(problem: &Problem) -> Tour {
 
         let mut cur_solution = cur_step.start_solution.clone();
         if let Ok(new_solution) =
-            cur_solution.set_var(cur_step.var, cur_step.cur_val.unwrap() as f64)
+            cur_solution.fix_var(cur_step.var, cur_step.cur_val.unwrap() as f64)
         {
             cur_solution = new_solution;
         } else {
