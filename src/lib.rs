@@ -230,15 +230,7 @@ impl Problem {
     /// variable, `min` and `max` are the minimum and maximum (inclusive) bounds of this
     /// variable. If one of the bounds is absent, use `f64::NEG_INFINITY` for minimum and
     /// `f64::INFINITY` for maximum.
-    ///
-    /// # Panics
-    ///
-    /// Will panic if both bounds are infinite: free variables are not yet supported.
     pub fn add_var(&mut self, obj_coeff: f64, (min, max): (f64, f64)) -> Variable {
-        if min.is_infinite() && max.is_infinite() {
-            unimplemented!("free variables are not supported");
-        }
-
         let var = Variable(self.obj_coeffs.len());
         let obj_coeff = match self.direction {
             OptimizationDirection::Minimize => obj_coeff,
@@ -534,7 +526,22 @@ mod tests {
     }
 
     #[test]
-    fn set_unset_var() {
+    fn free_variables() {
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let v1 = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let v2 = problem.add_var(2.0, (f64::NEG_INFINITY, f64::INFINITY));
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 4.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, 1.0)], ComparisonOp::Ge, 2.0);
+        problem.add_constraint(&[(v1, 1.0), (v2, -1.0)], ComparisonOp::Ge, 0.0);
+
+        let sol = problem.solve().unwrap();
+        assert_eq!(sol[v1], 2.0);
+        assert_eq!(sol[v2], 2.0);
+        assert_eq!(sol.objective(), 6.0);
+    }
+
+    #[test]
+    fn fix_unfix_var() {
         let mut problem = Problem::new(OptimizationDirection::Maximize);
         let v1 = problem.add_var(1.0, (0.0, 3.0));
         let v2 = problem.add_var(2.0, (0.0, 3.0));

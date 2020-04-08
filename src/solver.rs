@@ -118,7 +118,7 @@ impl Solver {
             } else if max.is_finite() {
                 max
             } else {
-                unimplemented!();
+                0.0
             };
             nb_var_vals.push(init_val);
             obj_val += init_val * obj_coeffs[v];
@@ -371,25 +371,8 @@ impl Solver {
                 return false;
             }
 
-            self.calc_col_coeffs(col);
-
-            let new_val = if self.nb_var_obj_coeffs[col] > 0.0 {
-                self.orig_var_mins[var]
-            } else {
-                self.orig_var_maxs[var]
-            };
-
-            assert!(new_val.is_finite());
-
-            let diff = new_val - self.nb_var_vals[col];
-            for (r, coeff) in self.col_coeffs.iter() {
-                self.basic_var_vals[r] -= diff * coeff;
-            }
-            self.cur_obj_val += diff * self.nb_var_obj_coeffs[col];
-            self.nb_var_vals[col] = new_val;
-
-            // Shouldn't result in infeasibility, we are removing a constraint after all.
-            self.restore_feasibility().unwrap();
+            // Shouldn't result in error, presumably problem was solvable before this variable
+            // was fixed.
             self.optimize().unwrap();
             true
         } else {
@@ -682,12 +665,11 @@ impl Solver {
                 }
 
                 let var = self.nb_vars[col];
-                let is_positive_direction = self.nb_var_vals[col] == self.orig_var_mins[var];
                 let obj_coeff = self.nb_var_obj_coeffs[col];
 
                 // Choose only among non-basic vars that can be changed with objective decreasing.
-                if (is_positive_direction && obj_coeff > -EPS)
-                    || (!is_positive_direction && obj_coeff < EPS)
+                if (obj_coeff > -EPS && self.nb_var_vals[col] == self.orig_var_mins[var])
+                    || (obj_coeff < EPS && self.nb_var_vals[col] == self.orig_var_maxs[var])
                 {
                     continue;
                 }
@@ -713,17 +695,14 @@ impl Solver {
             }
         };
 
-        let (entering_cur_val, entering_other_val) = {
-            let var = self.nb_vars[entering_c];
-            let min = self.orig_var_mins[var];
-            let max = self.orig_var_maxs[var];
-            if self.nb_var_vals[entering_c] == min {
-                (min, max)
-            } else {
-                (max, min)
-            }
+        let entering_cur_val = self.nb_var_vals[entering_c];
+        // If true, variable will increase and the objective function will decrease.
+        let is_positive_direction = self.nb_var_obj_coeffs[entering_c] < 0.0;
+        let entering_other_val = if is_positive_direction {
+            self.orig_var_maxs[self.nb_vars[entering_c]]
+        } else {
+            self.orig_var_mins[self.nb_vars[entering_c]]
         };
-        let is_positive_direction = (entering_other_val - entering_cur_val) > 0.0;
 
         self.calc_col_coeffs(entering_c);
 

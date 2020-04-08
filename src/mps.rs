@@ -35,7 +35,7 @@ impl MpsFile {
     ///
     /// Apart from I/O errors coming from `input`, this function will signal any syntax error
     /// as [`std::io::Error`] with the kind set to [`InvalidData`](std::io::ErrorKind::InvalidData).
-    /// Unsupported features such as integer or free variables are reported similarly.
+    /// Unsupported features such as integer variables are reported similarly.
     pub fn parse<R: io::BufRead>(input: R, direction: OptimizationDirection) -> io::Result<Self> {
         // Format descriptions:
         // Introduction: http://lpsolve.sourceforge.net/5.5/mps-format.htm
@@ -248,9 +248,6 @@ impl MpsFile {
                 let mut tokens = Tokens::new(&lines);
 
                 let bound_type = tokens.next()?;
-                if bound_type != "LO" && bound_type != "UP" && bound_type != "FX" {
-                    return Err(lines.err(&format!("bound type {} is not supported", bound_type)));
-                }
 
                 let vec_name = tokens.next()?;
                 if cur_vec_name.is_none() {
@@ -267,15 +264,24 @@ impl MpsFile {
                     return Err(lines.err(&format!("unknown variable: {}", var_name)));
                 };
                 let var_def = &mut var_defs[var_idx.0];
-                let val = parse_f64(tokens.next()?, lines.idx)?;
-                match bound_type {
-                    "LO" => var_def.min = Some(val),
-                    "UP" => var_def.max = Some(val),
-                    "FX" => {
-                        var_def.min = Some(val);
-                        var_def.max = Some(val);
+
+                if bound_type == "FR" {
+                    var_def.min = Some(f64::NEG_INFINITY);
+                    var_def.max = Some(f64::INFINITY);
+                    continue;
+                } else {
+                    let val = parse_f64(tokens.next()?, lines.idx)?;
+                    match bound_type {
+                        "LO" => var_def.min = Some(val),
+                        "UP" => var_def.max = Some(val),
+                        "FX" => {
+                            var_def.min = Some(val);
+                            var_def.max = Some(val);
+                        }
+                        _ => {
+                            return Err(lines.err(&format!("bound type {} is not supported", bound_type)));
+                        }
                     }
-                    _ => unreachable!(),
                 }
             }
         }
