@@ -14,8 +14,9 @@ const EPS: f64 = 1e-8;
 #[derive(Clone)]
 pub(crate) struct Solver {
     pub(crate) num_vars: usize,
-    num_slack_vars: usize,
-    num_artificial_vars: usize,
+
+    is_primal_feasible: bool,
+    is_dual_feasible: bool,
 
     orig_obj_coeffs: Vec<f64>,
     orig_var_mins: Vec<f64>,
@@ -54,10 +55,14 @@ pub(crate) struct Solver {
 
 impl std::fmt::Debug for Solver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Solver\n")?;
         write!(
             f,
-            "Solver({}, {}, {})\n",
-            self.num_vars, self.num_slack_vars, self.num_artificial_vars,
+            "num_vars: {}, num_constraints: {}, is_primal_feasible: {}, is_dual_feasible: {}\n",
+            self.num_vars,
+            self.num_constraints(),
+            self.is_primal_feasible,
+            self.is_dual_feasible,
         )?;
         write!(f, "orig_obj_coeffs:\n{:?}\n", self.orig_obj_coeffs)?;
         write!(f, "orig_var_mins:\n{:?}\n", self.orig_var_mins)?;
@@ -100,6 +105,8 @@ impl Solver {
 
         let mut obj_val = 0.0;
 
+        let mut is_dual_feasible = true;
+
         for v in 0..num_vars {
             // choose initial variable values
 
@@ -113,27 +120,43 @@ impl Solver {
             var_states.push(VarState::NonBasic(nb_vars.len()));
             nb_vars.push(v);
 
-            let init_val = if min.is_finite() {
-                min
-            } else if max.is_finite() {
-                max
+            // try to choose dual-feasible values.
+            // XXX: what to do in case of free variables?
+            let init_val = if obj_coeffs[v] >= 0.0 {
+                if min.is_finite() {
+                    min
+                } else {
+                    is_dual_feasible = false;
+                    if max.is_finite() {
+                        max
+                    } else {
+                        0.0
+                    }
+                }
             } else {
-                0.0
+                if max.is_finite() {
+                    max
+                } else {
+                    is_dual_feasible = false;
+                    if min.is_finite() {
+                        min
+                    } else {
+                        0.0
+                    }
+                }
             };
+
             nb_var_vals.push(init_val);
             obj_val += init_val * obj_coeffs[v];
         }
 
-        #[derive(Debug)]
-        struct ConstraintInfo {
-            coeffs: CsVec,
-            rhs: f64,
-            lhs_val: f64,
-            slack_var_coeff: Option<i8>,
-            need_art_var: bool,
-        }
+        let mut constraint_coeffs = vec![];
+        let mut orig_rhs = vec![];
 
-        let mut constraint_infos = vec![];
+        // Initially, all slack vars are basic.
+        let mut basic_vars = vec![];
+        let mut basic_var_vals = vec![];
+
         for (coeffs, cmp_op, rhs) in constraints {
             let rhs = *rhs;
 
@@ -151,97 +174,58 @@ impl Solver {
                 }
             }
 
+            constraint_coeffs.push(coeffs.clone());
+            orig_rhs.push(rhs);
+
+            let (slack_var_min, slack_var_max) = match cmp_op {
+                ComparisonOp::Le => (0.0, f64::INFINITY),
+                ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
+                ComparisonOp::Eq => (0.0, 0.0),
+            };
+
+            orig_var_mins.push(slack_var_min);
+            orig_var_maxs.push(slack_var_max);
+
+            let cur_slack_var = var_states.len();
+            var_states.push(VarState::Basic(basic_vars.len()));
+            basic_vars.push(cur_slack_var);
+
             let mut lhs_val = 0.0;
             for (var, &coeff) in coeffs.iter() {
                 lhs_val += coeff * nb_var_vals[var];
             }
-
-            let (slack_var_coeff, need_art_var) = match cmp_op {
-                ComparisonOp::Le => (Some(1), lhs_val > rhs),
-                ComparisonOp::Ge => (Some(-1), lhs_val < rhs),
-                ComparisonOp::Eq => (None, true),
-            };
-
-            constraint_infos.push(ConstraintInfo {
-                coeffs: coeffs.clone(),
-                rhs,
-                lhs_val,
-                slack_var_coeff,
-                need_art_var,
-            });
+            basic_var_vals.push(rhs - lhs_val);
         }
 
-        let num_constraints = constraint_infos.len();
-
-        let num_slack_vars = constraint_infos
-            .iter()
-            .filter(|c| c.slack_var_coeff.is_some())
-            .count();
-        let num_artificial_vars = constraint_infos.iter().filter(|c| c.need_art_var).count();
-        let num_total_vars = num_vars + num_slack_vars + num_artificial_vars;
+        let num_constraints = constraint_coeffs.len();
+        let num_total_vars = num_vars + num_constraints;
 
         let mut orig_obj_coeffs = obj_coeffs.to_vec();
         orig_obj_coeffs.resize(num_total_vars, 0.0);
 
-        // slack and artificial vars are always [0, inf)
-        orig_var_mins.resize(num_total_vars, 0.0);
-        orig_var_maxs.resize(num_total_vars, f64::INFINITY);
-        // will be updated later
-        var_states.resize(num_total_vars, VarState::NonBasic(0usize.wrapping_sub(1)));
-
-        let mut cur_slack_var = num_vars;
-        let mut cur_artificial_var = num_vars + num_slack_vars;
-
-        let mut artificial_multipliers = CsVec::empty(num_constraints);
-        let mut artificial_obj_val = 0.0;
-
         let mut orig_constraints = CsMat::empty(CompressedStorage::CSR, num_total_vars);
-        let mut orig_rhs = Vec::with_capacity(num_constraints);
-        let mut basic_vars = vec![];
-        let mut basic_var_vals = Vec::with_capacity(num_constraints);
-
-        for constr in constraint_infos.into_iter() {
-            if constr.need_art_var {
-                if constr.slack_var_coeff.is_some() {
-                    var_states[cur_slack_var] = VarState::NonBasic(nb_vars.len());
-                    nb_vars.push(cur_slack_var);
-                    nb_var_vals.push(0.0);
-                }
-
-                var_states[cur_artificial_var] = VarState::Basic(basic_vars.len());
-                basic_vars.push(cur_artificial_var);
-            } else {
-                var_states[cur_slack_var] = VarState::Basic(basic_vars.len());
-                basic_vars.push(cur_slack_var);
-            }
-
-            let mut coeffs = into_resized(constr.coeffs, num_total_vars);
-            if let Some(coeff) = constr.slack_var_coeff {
-                coeffs.append(cur_slack_var, coeff as f64);
-                cur_slack_var += 1;
-            }
-            if constr.need_art_var {
-                let diff = constr.rhs - constr.lhs_val;
-                artificial_obj_val += diff.abs();
-                artificial_multipliers.append(basic_vars.len() - 1, diff.signum());
-                coeffs.append(cur_artificial_var, diff.signum());
-                cur_artificial_var += 1;
-            }
-
+        for (cur_slack_var, coeffs) in constraint_coeffs.into_iter().enumerate() {
+            let mut coeffs = into_resized(coeffs, num_total_vars);
+            coeffs.append(num_vars + cur_slack_var, 1.0);
             orig_constraints = orig_constraints.append_outer_csvec(coeffs.view());
-            orig_rhs.push(constr.rhs);
-            basic_var_vals.push(f64::abs(constr.rhs - constr.lhs_val));
         }
-
         let orig_constraints_csc = orig_constraints.to_csc();
+
+        let is_primal_feasible = basic_vars
+            .iter()
+            .zip(&basic_var_vals)
+            .all(|(&var, &val)| val >= orig_var_mins[var] && val <= orig_var_maxs[var]);
+
+        let need_artificial_obj = !is_primal_feasible && !is_dual_feasible;
 
         let mut nb_var_obj_coeffs = vec![];
         let mut nb_col_sq_norms = vec![];
-        for &var in &nb_vars {
+        for (&var, &val) in nb_vars.iter().zip(&nb_var_vals) {
             let col = orig_constraints_csc.outer_view(var).unwrap();
 
-            if num_artificial_vars > 0 {
-                nb_var_obj_coeffs.push(-artificial_multipliers.dot(&col));
+            if need_artificial_obj {
+                let coeff = if val == orig_var_mins[var] { 1.0 } else { -1.0 };
+                nb_var_obj_coeffs.push(coeff);
             } else {
                 nb_var_obj_coeffs.push(orig_obj_coeffs[var]);
             }
@@ -251,11 +235,7 @@ impl Solver {
             }
         }
 
-        let cur_obj_val = if num_artificial_vars > 0 {
-            artificial_obj_val
-        } else {
-            obj_val
-        };
+        let cur_obj_val = if need_artificial_obj { 0.0 } else { obj_val };
 
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
         let lu_factors = lu_factorize(
@@ -276,8 +256,8 @@ impl Solver {
 
         let res = Self {
             num_vars,
-            num_slack_vars,
-            num_artificial_vars,
+            is_primal_feasible,
+            is_dual_feasible,
             orig_obj_coeffs,
             orig_var_mins,
             orig_var_maxs,
@@ -308,11 +288,11 @@ impl Solver {
         };
 
         debug!(
-            "initialized solver: num_vars={} num_slack_vars={} num_artificial_vars={} num_constraints={}, constraints nnz={}",
+            "initialized solver: vars: {}, constraints: {}, primal feasible: {}, dual feasible: {}, nnz: {}",
             res.num_vars,
-            res.num_slack_vars,
-            res.num_artificial_vars,
             res.orig_constraints.rows(),
+            res.is_primal_feasible,
+            res.is_dual_feasible,
             res.orig_constraints.nnz(),
         );
 
@@ -327,8 +307,6 @@ impl Solver {
     }
 
     pub(crate) fn fix_var(&mut self, var: usize, val: f64) -> Result<(), Error> {
-        assert_eq!(self.num_artificial_vars, 0);
-
         if val < self.orig_var_mins[var] || val > self.orig_var_maxs[var] {
             return Err(Error::Infeasible);
         }
@@ -359,9 +337,7 @@ impl Solver {
 
         self.nb_var_is_fixed[col] = true;
 
-        self.restore_feasibility()?;
-        self.optimize().unwrap();
-        Ok(())
+        self.restore_feasibility()
     }
 
     /// Return true if the var was really unset.
@@ -407,92 +383,23 @@ impl Solver {
     }
 
     fn num_total_vars(&self) -> usize {
-        self.num_vars + self.num_slack_vars + self.num_artificial_vars
+        self.num_vars + self.num_constraints()
     }
 
     fn find_initial_bfs(&mut self) -> Result<(), Error> {
-        assert_ne!(self.num_artificial_vars, 0);
+        if !self.is_primal_feasible {
+            self.restore_feasibility()?;
 
-        let mut cur_artificial_vars = self.num_artificial_vars;
-        for iter in 0.. {
-            if iter % 100 == 0 {
-                debug!(
-                    "find initial BFS iter {}: art. objective: {}, art. vars: {}, nnz: {}",
-                    iter,
-                    self.cur_obj_val,
-                    cur_artificial_vars,
-                    self.nnz(),
-                );
-            }
-
-            if cur_artificial_vars == 0 {
-                debug!(
-                    "found initial BFS in {} iters, nnz: {}",
-                    iter + 1,
-                    self.nnz()
-                );
-                break;
-            }
-
-            if let Some(pivot_info) = self.choose_pivot()? {
-                if let Some(pivot_elem) = &pivot_info.elem {
-                    let entering_var = self.nb_vars[pivot_info.col];
-                    let leaving_var = self.basic_vars[pivot_elem.row];
-                    let art_vars_start = self.num_vars + self.num_slack_vars;
-                    match (entering_var < art_vars_start, leaving_var < art_vars_start) {
-                        (true, false) => cur_artificial_vars -= 1,
-                        (false, true) => cur_artificial_vars += 1,
-                        _ => {}
-                    }
-                }
-
-                self.pivot(&pivot_info);
-            } else {
-                break;
+            if !self.is_dual_feasible {
+                self.recalc_obj_coeffs();
             }
         }
 
-        if self.cur_obj_val > EPS {
-            return Err(Error::Infeasible);
-        }
-
-        if cur_artificial_vars > 0 {
-            panic!("{} artificial vars not eliminated!", cur_artificial_vars);
-        }
-
-        self.remove_artificial_vars();
-
-        self.var_states.truncate(self.num_total_vars());
-
-        let mut new_nb_vars = vec![];
-        let mut new_nb_vals = vec![];
-        let mut new_sq_norms = vec![];
-        for (i, &var) in self.nb_vars.iter().enumerate() {
-            if var < self.num_total_vars() {
-                self.var_states[var] = VarState::NonBasic(new_nb_vars.len());
-                new_nb_vars.push(var);
-                new_nb_vals.push(self.nb_var_vals[i]);
-                if self.enable_steepest_edge {
-                    new_sq_norms.push(self.nb_col_sq_norms[i]);
-                }
-            }
-        }
-        self.nb_vars = new_nb_vars;
-        self.nb_col_sq_norms = new_sq_norms;
-        self.nb_var_vals = new_nb_vals;
-
-        self.row_coeffs.clear_and_resize(self.nb_vars.len());
-        self.sq_norms_update_helper
-            .clear_and_resize(self.nb_vars.len());
-
-        self.recalc_obj_coeffs();
         Ok(())
     }
 
     pub(crate) fn optimize(&mut self) -> Result<(), Error> {
-        if self.num_artificial_vars > 0 {
-            self.find_initial_bfs()?;
-        }
+        self.find_initial_bfs()?;
 
         for iter in 0.. {
             if iter % 100 == 0 {
@@ -517,18 +424,25 @@ impl Solver {
             }
         }
 
+        self.is_dual_feasible = true;
         Ok(())
     }
 
     pub(crate) fn restore_feasibility(&mut self) -> Result<(), Error> {
-        assert_eq!(self.num_artificial_vars, 0);
-
         for iter in 0.. {
             if iter % 100 == 0 {
+                let mut num_infeasible = 0;
+                for (&var, &val) in self.basic_vars.iter().zip(&self.basic_var_vals) {
+                    if val < self.orig_var_mins[var] - EPS || val > self.orig_var_maxs[var] + EPS {
+                        num_infeasible += 1;
+                    }
+                }
+
                 debug!(
-                    "restore feasibility iter {}: objective: {}, nnz: {}",
+                    "restore feasibility iter {}: objective: {}, num infeasible: {}, nnz: {}",
                     iter,
                     self.cur_obj_val,
+                    num_infeasible,
                     self.nnz(),
                 );
             }
@@ -548,6 +462,7 @@ impl Solver {
             }
         }
 
+        self.is_primal_feasible = true;
         Ok(())
     }
 
@@ -555,13 +470,16 @@ impl Solver {
         &mut self,
         mut coeffs: CsVec,
         cmp_op: ComparisonOp,
-        bound: f64,
+        rhs: f64,
     ) -> Result<(), Error> {
+        assert!(self.is_primal_feasible);
+        assert!(self.is_dual_feasible);
+
         if coeffs.indices().is_empty() {
             let is_tautological = match cmp_op {
-                ComparisonOp::Eq => 0.0 == bound,
-                ComparisonOp::Le => 0.0 <= bound,
-                ComparisonOp::Ge => 0.0 >= bound,
+                ComparisonOp::Eq => 0.0 == rhs,
+                ComparisonOp::Le => 0.0 <= rhs,
+                ComparisonOp::Ge => 0.0 >= rhs,
             };
 
             if is_tautological {
@@ -571,39 +489,40 @@ impl Solver {
             }
         }
 
-        // each >=/<= constraint adds a slack var
-        let new_num_total_vars = self.num_total_vars() + 1;
-
-        let slack_var_coeff = match cmp_op {
-            ComparisonOp::Le => 1,
-            ComparisonOp::Ge => -1,
-            ComparisonOp::Eq => unimplemented!(),
+        let slack_var = self.num_total_vars();
+        let (slack_var_min, slack_var_max) = match cmp_op {
+            ComparisonOp::Le => (0.0, f64::INFINITY),
+            ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
+            ComparisonOp::Eq => (0.0, 0.0),
         };
 
-        assert_eq!(self.num_artificial_vars, 0);
-        // TODO: assert optimality.
+        self.orig_obj_coeffs.push(0.0);
+        self.orig_var_mins.push(slack_var_min);
+        self.orig_var_maxs.push(slack_var_max);
+        self.var_states.push(VarState::Basic(self.basic_vars.len()));
+        self.basic_vars.push(slack_var);
 
+        let mut lhs_val = 0.0;
+        for (var, &coeff) in coeffs.iter() {
+            let val = match self.var_states[var] {
+                VarState::Basic(idx) => self.basic_var_vals[idx],
+                VarState::NonBasic(idx) => self.nb_var_vals[idx],
+            };
+            lhs_val += val * coeff;
+        }
+        self.basic_var_vals.push(rhs - lhs_val);
+
+        let new_num_total_vars = self.num_total_vars() + 1;
         let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_num_total_vars);
         for row in self.orig_constraints.outer_iterator() {
             new_orig_constraints =
                 new_orig_constraints.append_outer_csvec(resized_view(&row, new_num_total_vars));
         }
-
-        let slack_var = self.num_vars + self.num_slack_vars;
-        self.num_slack_vars += 1;
-
-        self.orig_obj_coeffs.push(0.0);
-        self.orig_var_mins.push(0.0);
-        self.orig_var_maxs.push(f64::INFINITY);
-
         coeffs = into_resized(coeffs, new_num_total_vars);
-        coeffs.append(slack_var, slack_var_coeff as f64);
+        coeffs.append(slack_var, 1.0);
         new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
 
-        self.orig_rhs.push(bound);
-
-        self.var_states.push(VarState::Basic(self.basic_vars.len()));
-        self.basic_vars.push(slack_var);
+        self.orig_rhs.push(rhs);
 
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
@@ -611,20 +530,17 @@ impl Solver {
         self.basis_solver
             .reset(&self.orig_constraints_csc, &self.basic_vars);
 
-        self.recalc_basic_var_vals();
-
         if self.enable_steepest_edge {
             // existing tableau rows didn't change, so we calc the last row
             // and add its contribution to the sq. norms.
             self.calc_row_coeffs(self.num_constraints() - 1);
+
             for (c, &coeff) in self.row_coeffs.iter() {
                 self.nb_col_sq_norms[c] += coeff * coeff;
             }
         }
 
-        self.restore_feasibility()?;
-        self.optimize().unwrap();
-        Ok(())
+        self.restore_feasibility()
     }
 
     fn nnz(&self) -> usize {
@@ -674,12 +590,9 @@ impl Solver {
                     continue;
                 }
 
-                let score = if self.num_artificial_vars == 0 && self.enable_steepest_edge {
+                let score = if self.enable_steepest_edge {
                     obj_coeff * obj_coeff / (self.nb_col_sq_norms[col] + 1.0)
                 } else {
-                    // TODO: simple "biggest coeff" rule seems to perform much better than
-                    // the steepest edge rule for minimizing artificial objective (phase 1).
-                    // Why is that?
                     obj_coeff.abs()
                 };
                 if score > best_score {
@@ -995,23 +908,7 @@ impl Solver {
         }
     }
 
-    fn remove_artificial_vars(&mut self) {
-        if self.num_artificial_vars == 0 {
-            return;
-        }
-
-        self.num_artificial_vars = 0;
-        self.orig_obj_coeffs.truncate(self.num_total_vars());
-
-        let mut new_constraints = CsMat::empty(CompressedStorage::CSR, self.num_total_vars());
-        for row in self.orig_constraints.outer_iterator() {
-            new_constraints =
-                new_constraints.append_outer_csvec(resized_view(&row, self.num_total_vars()));
-        }
-        self.orig_constraints = new_constraints;
-        self.orig_constraints_csc = self.orig_constraints.to_csc();
-    }
-
+    #[allow(dead_code)]
     fn recalc_basic_var_vals(&mut self) {
         let mut cur_vals = self.orig_rhs.clone();
         for (i, var) in self.nb_vars.iter().enumerate() {
@@ -1241,47 +1138,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(sol.num_vars, 2);
-        assert_eq!(sol.num_slack_vars, 3);
-        assert_eq!(sol.num_artificial_vars, 2);
+        assert!(!sol.is_primal_feasible);
+        assert!(!sol.is_dual_feasible);
 
-        assert_eq!(&sol.orig_obj_coeffs, &[2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&sol.orig_obj_coeffs, &[2.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
 
         assert_eq!(
             &sol.orig_var_mins,
-            &[f64::NEG_INFINITY, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            &[f64::NEG_INFINITY, 5.0, 0.0, 0.0, f64::NEG_INFINITY, 0.0,]
         );
         assert_eq!(
             &sol.orig_var_maxs,
-            &[
-                0.0,
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::INFINITY
-            ]
+            &[0.0, f64::INFINITY, f64::INFINITY, f64::INFINITY, 0.0, 0.0]
         );
 
         let orig_constraints_ref = vec![
-            vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-            vec![1.0, 2.0, 0.0, 1.0, 0.0, -1.0, 0.0],
-            vec![1.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+            vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 2.0, 0.0, 1.0, 0.0, 0.0],
+            vec![1.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         ];
         assert_matrix_eq(&sol.orig_constraints, &orig_constraints_ref);
 
         assert_eq!(&sol.orig_rhs, &[6.0, 8.0, 2.0, 3.0]);
 
-        assert_eq!(&sol.basic_vars, &[2, 5, 4, 6]);
-        assert_eq!(&sol.basic_var_vals, &[1.0, 2.0, 3.0, 2.0]);
+        assert_eq!(&sol.basic_vars, &[2, 3, 4, 5]);
+        assert_eq!(&sol.basic_var_vals, &[1.0, -2.0, -3.0, -2.0]);
 
-        assert_eq!(&sol.nb_vars, &[0, 1, 3]);
-        assert_eq!(&sol.nb_var_obj_coeffs, &[1.0, 3.0, 1.0]);
-        assert_eq!(&sol.nb_var_vals, &[0.0, 5.0, 0.0]);
-        assert_eq!(&sol.nb_col_sq_norms, &[3.0, 7.0, 1.0]);
+        assert_eq!(&sol.nb_vars, &[0, 1]);
+        assert_eq!(&sol.nb_var_obj_coeffs, &[-1.0, 1.0]);
+        assert_eq!(&sol.nb_var_vals, &[0.0, 5.0]);
+        assert_eq!(&sol.nb_col_sq_norms, &[3.0, 7.0]);
 
-        assert_eq!(sol.cur_obj_val, 4.0);
+        assert_eq!(sol.cur_obj_val, 0.0);
     }
 
     #[test]
@@ -1298,15 +1187,14 @@ mod tests {
         .unwrap();
         sol.find_initial_bfs().unwrap();
 
-        assert_eq!(sol.num_vars, 2);
-        assert_eq!(sol.num_slack_vars, 2);
-        assert_eq!(sol.num_artificial_vars, 0);
+        assert!(sol.is_primal_feasible);
+        assert!(!sol.is_dual_feasible);
 
         assert_eq!(&sol.basic_vars, &[0, 3]);
         assert_eq!(&sol.basic_var_vals, &[15.0, 15.0]);
-        assert_eq!(&sol.nb_vars, &[1, 2]);
-        assert_eq!(&sol.nb_var_vals, &[5.0, 0.0]);
-        assert_eq!(&sol.nb_var_obj_coeffs, &[-1.0, 3.0]);
+        assert_eq!(&sol.nb_vars, &[2, 1]);
+        assert_eq!(&sol.nb_var_vals, &[0.0, 5.0]);
+        assert_eq!(&sol.nb_var_obj_coeffs, &[3.0, -1.0]);
         assert_eq!(sol.cur_obj_val, -65.0);
 
         let infeasible = Solver::try_new(
