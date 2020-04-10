@@ -431,18 +431,20 @@ impl Solver {
     pub(crate) fn restore_feasibility(&mut self) -> Result<(), Error> {
         for iter in 0.. {
             if iter % 100 == 0 {
-                let mut num_infeasible = 0;
+                let mut infeasibility = 0.0;
                 for (&var, &val) in self.basic_vars.iter().zip(&self.basic_var_vals) {
-                    if val < self.orig_var_mins[var] - EPS || val > self.orig_var_maxs[var] + EPS {
-                        num_infeasible += 1;
+                    if val < self.orig_var_mins[var] - EPS {
+                        infeasibility += self.orig_var_mins[var] - val;
+                    } else if val > self.orig_var_maxs[var] + EPS {
+                        infeasibility += val - self.orig_var_maxs[var];
                     }
                 }
 
                 debug!(
-                    "restore feasibility iter {}: objective: {}, num infeasible: {}, nnz: {}",
+                    "restore feasibility iter {}: objective: {}, infeasibility: {}, nnz: {}",
                     iter,
                     self.cur_obj_val,
-                    num_infeasible,
+                    infeasibility,
                     self.nnz(),
                 );
             }
@@ -703,10 +705,11 @@ impl Solver {
             let max = self.orig_var_maxs[var];
             // If we choose this var as leaving, its new val will be at the boundary
             // which is violated.
-            // Why is that? We must maintain primal optimality (a.k.a. dual feasibility)
-            // thus new_obj_coeff must be >= 0 if new_val is min, and <= 0 if new_val is max.
+            // Why is that? We must maintain primal optimality (a.k.a. dual feasibility) for
+            // the leaving variable, thus new_obj_coeff must be >= 0 if new_val is min, and <= 0
+            // if new_val is max. Sign of the leaving var obj coeff:
             // sign(new_obj_coeff) = -sign(old_obj_coeff) * sign(pivot_coeff).
-            // Another constraint is that we must increase primal feasibility (and thus objective).
+            // Another constraint is that we must not decrease primal objective.
             // As sign(obj_val_diff) = -sign(old_obj_coeff) * sign(leaving_diff) * sign(pivot_coeff)
             // must be >= 0, we conclude that sign(new_obj_coeff) = sign(leaving_diff).
             // From this we see that if old val was < min, dual feasibility is maintained if the
@@ -739,7 +742,7 @@ impl Solver {
         row: usize,
         leaving_new_val: f64,
     ) -> Result<PivotInfo, Error> {
-        let is_positive_direction = leaving_new_val > self.basic_var_vals[row];
+        let is_positive_lv_direction = leaving_new_val > self.basic_var_vals[row];
 
         let mut entering_c = None;
         let mut min_obj_coeff_diff_abs = f64::INFINITY;
@@ -755,16 +758,22 @@ impl Solver {
                 continue;
             }
 
+            let var = self.nb_vars[c];
+            if self.orig_var_mins[var] == self.orig_var_maxs[var] {
+                // For fixed primal variables dual variables are free:
+                // we can vary obj. coefficient without impacting dual feasibility.
+                continue;
+            }
+
+            let val = self.nb_var_vals[c];
+            let is_positive_oc_direction = val == self.orig_var_mins[var];
+
             let obj_coeff = self.nb_var_obj_coeffs[c];
-            if (is_positive_direction
-                && ((coeff > 0.0 && obj_coeff > 0.0) || (coeff < 0.0 && obj_coeff < 0.0)))
-                || (!is_positive_direction
-                    && ((coeff < 0.0 && obj_coeff > 0.0) || (coeff > 0.0 && obj_coeff < 0.0)))
+            if (coeff > 0.0 && is_positive_lv_direction == is_positive_oc_direction)
+                || (coeff < 0.0 && is_positive_lv_direction != is_positive_oc_direction)
             {
-                // We want to find entering variable that will *increase* objective function.
-                // (less optimal BFS means more feasible BFS).
-                // Because obj_val_diff = obj_coeff * entering_diff = -obj_coeff * leaving_diff / pivot_coeff,
-                // sign(obj_val_diff) = -sign(obj_coeff) * sign(leaving_diff) * sign(coeff).
+                // If we end up here, for any chosen pivot this variable will only become
+                // farther from dual infeasibility. Thus we can skip it.
                 continue;
             }
 
@@ -985,6 +994,7 @@ enum VarState {
     NonBasic(usize),
 }
 
+#[derive(Debug)]
 struct PivotInfo {
     col: usize,
     entering_new_val: f64,
@@ -996,6 +1006,7 @@ struct PivotInfo {
     elem: Option<PivotElem>,
 }
 
+#[derive(Debug)]
 struct PivotElem {
     row: usize,
     coeff: f64,
