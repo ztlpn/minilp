@@ -120,30 +120,38 @@ impl Solver {
             var_states.push(VarState::NonBasic(nb_vars.len()));
             nb_vars.push(v);
 
-            // try to choose dual-feasible values.
-            // XXX: what to do in case of free variables?
-            let init_val = if obj_coeffs[v] >= 0.0 {
+            // Try to choose values to achieve dual feasibility.
+            let init_val = if min == max {
+                // Fixed variable, the obj. coeff doesn't matter.
+                min
+            } else if min.is_infinite() && max.is_infinite() {
+                // Free variable, if we are lucky and obj. coeff is zero, then dual-feasible.
+                if obj_coeffs[v] != 0.0 {
+                    is_dual_feasible = false;
+                }
+                0.0
+            } else if obj_coeffs[v] > 0.0 {
+                // We need a finite value and prefer min for dual feasibility.
                 if min.is_finite() {
                     min
                 } else {
                     is_dual_feasible = false;
-                    if max.is_finite() {
-                        max
-                    } else {
-                        0.0
-                    }
+                    max
                 }
-            } else {
+            } else if obj_coeffs[v] < 0.0 {
+                // We need a finite value and prefer max for dual feasibility.
                 if max.is_finite() {
                     max
                 } else {
                     is_dual_feasible = false;
-                    if min.is_finite() {
-                        min
-                    } else {
-                        0.0
-                    }
+                    min
                 }
+            } else if min.is_finite() {
+                // Obj. coeff is zero, just take any finite value,
+                // dual feasibility will be satisfied.
+                min
+            } else {
+                max
             };
 
             nb_var_vals.push(init_val);
@@ -224,7 +232,13 @@ impl Solver {
             let col = orig_constraints_csc.outer_view(var).unwrap();
 
             if need_artificial_obj {
-                let coeff = if val == orig_var_mins[var] { 1.0 } else { -1.0 };
+                let coeff = if val == orig_var_mins[var] {
+                    1.0
+                } else if val == orig_var_maxs[var] {
+                    -1.0
+                } else {
+                    0.0
+                };
                 nb_var_obj_coeffs.push(coeff);
             } else {
                 nb_var_obj_coeffs.push(orig_obj_coeffs[var]);
@@ -403,11 +417,10 @@ impl Solver {
 
         for iter in 0.. {
             if iter % 100 == 0 {
+                let (num_vars, infeasibility) = self.calc_dual_infeasibility();
                 debug!(
-                    "optimize iter {}: objective: {}, nnz: {}",
-                    iter,
-                    self.cur_obj_val,
-                    self.nnz()
+                    "optimize iter {}: obj.: {}, non-optimal coeffs: {} ({})",
+                    iter, self.cur_obj_val, num_vars, infeasibility,
                 );
             }
 
@@ -415,10 +428,9 @@ impl Solver {
                 self.pivot(&pivot_info);
             } else {
                 debug!(
-                    "found optimum: {} in {} iterations, nnz: {}",
-                    self.cur_obj_val,
+                    "found optimum in {} iterations, obj.: {}",
                     iter + 1,
-                    self.nnz(),
+                    self.cur_obj_val,
                 );
                 break;
             }
@@ -431,21 +443,15 @@ impl Solver {
     pub(crate) fn restore_feasibility(&mut self) -> Result<(), Error> {
         for iter in 0.. {
             if iter % 100 == 0 {
-                let mut infeasibility = 0.0;
-                for (&var, &val) in self.basic_vars.iter().zip(&self.basic_var_vals) {
-                    if val < self.orig_var_mins[var] - EPS {
-                        infeasibility += self.orig_var_mins[var] - val;
-                    } else if val > self.orig_var_maxs[var] + EPS {
-                        infeasibility += val - self.orig_var_maxs[var];
-                    }
-                }
-
+                let (num_vars, infeasibility) = self.calc_primal_infeasibility();
+                let obj_str = if self.is_dual_feasible {
+                    "obj."
+                } else {
+                    "artificial obj."
+                };
                 debug!(
-                    "restore feasibility iter {}: objective: {}, infeasibility: {}, nnz: {}",
-                    iter,
-                    self.cur_obj_val,
-                    infeasibility,
-                    self.nnz(),
+                    "restore feasibility iter {}: {}: {}, infeas. vars: {} ({})",
+                    iter, obj_str, self.cur_obj_val, num_vars, infeasibility,
                 );
             }
 
@@ -456,9 +462,9 @@ impl Solver {
                 self.pivot(&pivot_info);
             } else {
                 debug!(
-                    "restored feasibility in in {} iterations, nnz: {}",
+                    "restored feasibility in {} iterations, obj.: {}",
                     iter + 1,
-                    self.nnz(),
+                    self.cur_obj_val,
                 );
                 break;
             }
@@ -545,8 +551,47 @@ impl Solver {
         self.restore_feasibility()
     }
 
-    fn nnz(&self) -> usize {
-        self.basis_solver.lu_factors.nnz() + self.basis_solver.eta_matrices.coeff_cols.nnz()
+    /// Number of infeasible basic vars and sum of their infeasibilities.
+    fn calc_primal_infeasibility(&self) -> (usize, f64) {
+        let mut num_vars = 0;
+        let mut infeasibility = 0.0;
+        for (&var, &val) in self.basic_vars.iter().zip(&self.basic_var_vals) {
+            if val < self.orig_var_mins[var] - EPS {
+                num_vars += 1;
+                infeasibility += self.orig_var_mins[var] - val;
+            } else if val > self.orig_var_maxs[var] + EPS {
+                num_vars += 1;
+                infeasibility += val - self.orig_var_maxs[var];
+            }
+        }
+        (num_vars, infeasibility)
+    }
+
+    /// Number of infeasible obj. coeffs and sum of their infeasibilities.
+    fn calc_dual_infeasibility(&self) -> (usize, f64) {
+        let mut num_vars = 0;
+        let mut infeasibility = 0.0;
+        for ((&var, &val), &obj_coeff) in self
+            .nb_vars
+            .iter()
+            .zip(&self.nb_var_vals)
+            .zip(&self.nb_var_obj_coeffs)
+        {
+            let min = self.orig_var_mins[var];
+            let max = self.orig_var_maxs[var];
+            if min == max {
+                continue;
+            } else if min.is_finite() || max.is_finite() {
+                if (val == min && obj_coeff <= -EPS) || (val == max && obj_coeff >= EPS) {
+                    num_vars += 1;
+                    infeasibility += obj_coeff.abs();
+                }
+            } else {
+                num_vars += 1;
+                infeasibility += obj_coeff.abs();
+            }
+        }
+        (num_vars, infeasibility)
     }
 
     /// Calculate current coeffs column for a single non-basic variable.
@@ -772,7 +817,7 @@ impl Solver {
                 continue;
             } else if min.is_finite() || max.is_finite() {
                 let val = self.nb_var_vals[c];
-                 // true if old obj. coeff must be nonnegative for dual-feasible configuration.
+                // true if old obj. coeff must be nonnegative for dual-feasible configuration.
                 let old_obj_coeff_sign = val == self.orig_var_mins[var];
 
                 if (coeff > 0.0 && new_obj_coeff_sign != old_obj_coeff_sign)
@@ -970,7 +1015,8 @@ impl Solver {
         for &var in &self.nb_vars {
             let col = self.orig_constraints_csc.outer_view(var).unwrap();
             let dot_prod: f64 = col.iter().map(|(r, val)| val * multipliers[r]).sum();
-            self.nb_var_obj_coeffs.push(self.orig_obj_coeffs[var] - dot_prod);
+            self.nb_var_obj_coeffs
+                .push(self.orig_obj_coeffs[var] - dot_prod);
         }
 
         self.cur_obj_val = 0.0;
