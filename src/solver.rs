@@ -929,15 +929,15 @@ impl Solver {
             }
         }
 
+        if self.basis_solver.eta_matrices.len() > 0 {
+            self.basis_solver
+                .reset(&self.orig_constraints_csc, &self.basic_vars);
+        }
+
         self.basis_solver
             .lu_factors
             .solve_dense(&mut cur_vals, &mut self.basis_solver.scratch);
         self.basic_var_vals = cur_vals;
-        for b in &mut self.basic_var_vals {
-            if f64::abs(*b) < EPS {
-                *b = 0.0;
-            }
-        }
     }
 
     fn recalc_obj_coeffs(&mut self) {
@@ -961,11 +961,7 @@ impl Solver {
         for &var in &self.nb_vars {
             let col = self.orig_constraints_csc.outer_view(var).unwrap();
             let dot_prod: f64 = col.iter().map(|(r, val)| val * multipliers[r]).sum();
-            let mut val = self.orig_obj_coeffs[var] - dot_prod;
-            if f64::abs(val) < EPS {
-                val = 0.0;
-            }
-            self.nb_var_obj_coeffs.push(val);
+            self.nb_var_obj_coeffs.push(self.orig_obj_coeffs[var] - dot_prod);
         }
 
         self.cur_obj_val = 0.0;
