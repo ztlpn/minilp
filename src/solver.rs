@@ -742,7 +742,8 @@ impl Solver {
         row: usize,
         leaving_new_val: f64,
     ) -> Result<PivotInfo, Error> {
-        let is_positive_lv_direction = leaving_new_val > self.basic_var_vals[row];
+        // True if the new obj. coeff. must be nonnegative in a dual-feasible configuration.
+        let new_obj_coeff_sign = leaving_new_val < self.basic_var_vals[row];
 
         let mut entering_c = None;
         let mut min_obj_coeff_diff_abs = f64::INFINITY;
@@ -759,34 +760,42 @@ impl Solver {
             }
 
             let var = self.nb_vars[c];
-            if self.orig_var_mins[var] == self.orig_var_maxs[var] {
-                // For fixed primal variables dual variables are free:
-                // we can vary obj. coefficient without impacting dual feasibility.
-                continue;
-            }
-
-            let val = self.nb_var_vals[c];
-            let is_positive_oc_direction = val == self.orig_var_mins[var];
-
-            let obj_coeff = self.nb_var_obj_coeffs[c];
-            if (coeff > 0.0 && is_positive_lv_direction == is_positive_oc_direction)
-                || (coeff < 0.0 && is_positive_lv_direction != is_positive_oc_direction)
-            {
-                // If we end up here, for any chosen pivot this variable will only become
-                // farther from dual infeasibility. Thus we can skip it.
-                continue;
-            }
+            let min = self.orig_var_mins[var];
+            let max = self.orig_var_maxs[var];
 
             // If we change obj. coeff of the leaving variable by this amount,
             // obj. coeff if the current variable will reach the bound of dual infeasibility.
             // Variable with the tightest such bound is the entering variable.
-            let cur_diff_abs = f64::abs(obj_coeff / coeff);
+            let cur_diff_abs = if min == max {
+                // For fixed primal variables dual variables are free:
+                // we can vary obj. coefficient without impacting dual feasibility.
+                continue;
+            } else if min.is_finite() || max.is_finite() {
+                let val = self.nb_var_vals[c];
+                 // true if old obj. coeff must be nonnegative for dual-feasible configuration.
+                let old_obj_coeff_sign = val == self.orig_var_mins[var];
+
+                if (coeff > 0.0 && new_obj_coeff_sign != old_obj_coeff_sign)
+                    || (coeff < 0.0 && new_obj_coeff_sign == old_obj_coeff_sign)
+                {
+                    // If we end up here, for any chosen pivot this variable will only become
+                    // farther from dual infeasibility. Thus we can skip it.
+                    continue;
+                }
+
+                let obj_coeff = self.nb_var_obj_coeffs[c];
+                f64::abs(obj_coeff / coeff)
+            } else {
+                // Free primal variables correspond to fixed duals - we can't change the obj. coeff.
+                // without losing dual feasibility.
+                0.0
+            };
 
             // See comments in `choose_pivot_row` concerning numeric stability.
             let should_choose = cur_diff_abs < min_obj_coeff_diff_abs - EPS
                 || (cur_diff_abs < min_obj_coeff_diff_abs + EPS
                     && (coeff_abs > pivot_coeff_abs + EPS
-                        || coeff_abs > pivot_coeff_abs - EPS && c < entering_c.unwrap()));
+                        || (coeff_abs > pivot_coeff_abs - EPS && c < entering_c.unwrap())));
 
             if should_choose {
                 entering_c = Some(c);
