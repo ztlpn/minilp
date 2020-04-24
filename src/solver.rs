@@ -48,9 +48,22 @@ pub(crate) struct Solver {
     nb_var_obj_coeffs: Vec<f64>,
     nb_var_vals: Vec<f64>,
     nb_col_sq_norms: Vec<f64>,
+    nb_var_states: Vec<NonBasicVarState>,
     nb_var_is_fixed: Vec<bool>,
 
     pub(crate) cur_obj_val: f64,
+}
+
+#[derive(Clone, Debug)]
+enum VarState {
+    Basic(usize),
+    NonBasic(usize),
+}
+
+#[derive(Clone, Debug)]
+struct NonBasicVarState {
+    at_min: bool,
+    at_max: bool,
 }
 
 impl std::fmt::Debug for Solver {
@@ -102,6 +115,7 @@ impl Solver {
 
         let mut nb_vars = vec![];
         let mut nb_var_vals = vec![];
+        let mut nb_var_states = vec![];
 
         let mut obj_val = 0.0;
 
@@ -156,6 +170,11 @@ impl Solver {
 
             nb_var_vals.push(init_val);
             obj_val += init_val * obj_coeffs[v];
+
+            nb_var_states.push(NonBasicVarState {
+                at_min: init_val == min,
+                at_max: init_val == max,
+            });
         }
 
         let mut constraint_coeffs = vec![];
@@ -228,13 +247,13 @@ impl Solver {
 
         let mut nb_var_obj_coeffs = vec![];
         let mut nb_col_sq_norms = vec![];
-        for (&var, &val) in nb_vars.iter().zip(&nb_var_vals) {
+        for (&var, state) in nb_vars.iter().zip(&nb_var_states) {
             let col = orig_constraints_csc.outer_view(var).unwrap();
 
             if need_artificial_obj {
-                let coeff = if val == orig_var_mins[var] {
+                let coeff = if state.at_min && !state.at_max {
                     1.0
-                } else if val == orig_var_maxs[var] {
+                } else if state.at_max && !state.at_min {
                     -1.0
                 } else {
                     0.0
@@ -297,6 +316,7 @@ impl Solver {
             nb_var_obj_coeffs,
             nb_var_vals,
             nb_col_sq_norms,
+            nb_var_states,
             nb_var_is_fixed,
             cur_obj_val,
         };
@@ -349,6 +369,10 @@ impl Solver {
             }
         };
 
+        self.nb_var_states[col] = NonBasicVarState {
+            at_min: true,
+            at_max: true,
+        };
         self.nb_var_is_fixed[col] = true;
 
         self.restore_feasibility()
@@ -360,6 +384,12 @@ impl Solver {
             if !std::mem::replace(&mut self.nb_var_is_fixed[col], false) {
                 return false;
             }
+
+            let cur_val = self.nb_var_vals[col];
+            self.nb_var_states[col] = NonBasicVarState {
+                at_min: cur_val == self.orig_var_mins[var],
+                at_max: cur_val == self.orig_var_maxs[var],
+            };
 
             // Shouldn't result in error, presumably problem was solvable before this variable
             // was fixed.
@@ -622,18 +652,10 @@ impl Solver {
         let entering_c = {
             let mut best_col = None;
             let mut best_score = f64::NEG_INFINITY;
-            for col in 0..self.nb_var_obj_coeffs.len() {
-                if self.nb_var_is_fixed[col] {
-                    continue;
-                }
-
-                let var = self.nb_vars[col];
-                let obj_coeff = self.nb_var_obj_coeffs[col];
-
+            for (col, &obj_coeff) in self.nb_var_obj_coeffs.iter().enumerate() {
                 // Choose only among non-basic vars that can be changed with objective decreasing.
-                if (obj_coeff > -EPS && self.nb_var_vals[col] == self.orig_var_mins[var])
-                    || (obj_coeff < EPS && self.nb_var_vals[col] == self.orig_var_maxs[var])
-                {
+                let var_state = &self.nb_var_states[col];
+                if (var_state.at_min && obj_coeff > -EPS) || (var_state.at_max && obj_coeff < EPS) {
                     continue;
                 }
 
@@ -642,6 +664,7 @@ impl Solver {
                 } else {
                     obj_coeff.abs()
                 };
+
                 if score > best_score {
                     best_col = Some(col);
                     best_score = score;
@@ -788,55 +811,43 @@ impl Solver {
         leaving_new_val: f64,
     ) -> Result<PivotInfo, Error> {
         // True if the new obj. coeff. must be nonnegative in a dual-feasible configuration.
-        let new_obj_coeff_sign = leaving_new_val < self.basic_var_vals[row];
+        let leaving_diff_sign = leaving_new_val > self.basic_var_vals[row];
 
         let mut entering_c = None;
         let mut min_obj_coeff_diff_abs = f64::INFINITY;
         let mut pivot_coeff_abs = f64::NEG_INFINITY;
         let mut pivot_coeff = 0.0;
         for (c, &coeff) in self.row_coeffs.iter() {
-            if self.nb_var_is_fixed[c] {
-                continue;
-            }
-
-            let coeff_abs = coeff.abs();
-            if coeff_abs < EPS {
-                continue;
-            }
-
-            let var = self.nb_vars[c];
-            let min = self.orig_var_mins[var];
-            let max = self.orig_var_maxs[var];
-
-            // If we change obj. coeff of the leaving variable by this amount,
-            // obj. coeff if the current variable will reach the bound of dual infeasibility.
-            // Variable with the tightest such bound is the entering variable.
-            let cur_diff_abs = if min == max {
+            let var_state = &self.nb_var_states[c];
+            if var_state.at_min && var_state.at_max {
                 // For fixed primal variables dual variables are free:
                 // we can vary obj. coefficient without impacting dual feasibility.
                 continue;
-            } else if min.is_finite() || max.is_finite() {
-                let val = self.nb_var_vals[c];
-                // true if old obj. coeff must be nonnegative for dual-feasible configuration.
-                let old_obj_coeff_sign = val == self.orig_var_mins[var];
+            }
 
-                if (coeff > 0.0 && new_obj_coeff_sign != old_obj_coeff_sign)
-                    || (coeff < 0.0 && new_obj_coeff_sign == old_obj_coeff_sign)
-                {
-                    // If we end up here, for any chosen pivot this variable will only become
-                    // farther from dual infeasibility. Thus we can skip it.
-                    continue;
-                }
-
-                let obj_coeff = self.nb_var_obj_coeffs[c];
-                f64::abs(obj_coeff / coeff)
+            let entering_diff_sign = if coeff >= EPS {
+                !leaving_diff_sign
+            } else if coeff <= -EPS {
+                leaving_diff_sign
             } else {
-                // Free primal variables correspond to fixed duals - we can't change the obj. coeff.
-                // without losing dual feasibility.
-                0.0
+                continue;
             };
 
+            if (var_state.at_min && !entering_diff_sign) || (var_state.at_max && entering_diff_sign)
+            {
+                // If the current variable is chosen as entering, obj. value will decrease,
+                // and we want it to increase to reach primal feasibility.
+                continue;
+            }
+
+            let obj_coeff = self.nb_var_obj_coeffs[c];
+            // If we change obj. coeff of the leaving variable by this amount,
+            // obj. coeff if the current variable will reach the bound of dual infeasibility.
+            // Variable with the tightest such bound is the entering variable.
+            let cur_diff_abs = (obj_coeff / coeff).abs();
+
             // See comments in `choose_pivot_row` concerning numeric stability.
+            let coeff_abs = coeff.abs();
             let should_choose = cur_diff_abs < min_obj_coeff_diff_abs - EPS
                 || (cur_diff_abs < min_obj_coeff_diff_abs + EPS
                     && (coeff_abs > pivot_coeff_abs + EPS
@@ -875,6 +886,8 @@ impl Solver {
 
         self.cur_obj_val += self.nb_var_obj_coeffs[pivot_info.col] * pivot_info.entering_diff;
 
+        let entering_var = self.nb_vars[pivot_info.col];
+
         if pivot_info.elem.is_none() {
             // "entering" var is still non-basic, it just changes value from one limit
             // to the other.
@@ -882,6 +895,9 @@ impl Solver {
             for (r, coeff) in self.col_coeffs.iter() {
                 self.basic_var_vals[r] -= pivot_info.entering_diff * coeff;
             }
+            let var_state = &mut self.nb_var_states[pivot_info.col];
+            var_state.at_min = pivot_info.entering_new_val == self.orig_var_mins[entering_var];
+            var_state.at_max = pivot_info.entering_new_val == self.orig_var_maxs[entering_var];
             return;
         }
         let pivot_elem = pivot_info.elem.as_ref().unwrap();
@@ -894,7 +910,12 @@ impl Solver {
             }
         }
 
+        let leaving_var = self.basic_vars[pivot_elem.row];
+
         self.nb_var_vals[pivot_info.col] = pivot_elem.leaving_new_val;
+        let leaving_var_state = &mut self.nb_var_states[pivot_info.col];
+        leaving_var_state.at_min = pivot_elem.leaving_new_val == self.orig_var_mins[leaving_var];
+        leaving_var_state.at_max = pivot_elem.leaving_new_val == self.orig_var_maxs[leaving_var];
 
         let pivot_obj = self.nb_var_obj_coeffs[pivot_info.col] / pivot_elem.coeff;
         for (c, &coeff) in self.row_coeffs.iter() {
@@ -937,9 +958,6 @@ impl Solver {
                 }
             }
         }
-
-        let entering_var = self.nb_vars[pivot_info.col];
-        let leaving_var = self.basic_vars[pivot_elem.row];
 
         self.basic_vars[pivot_elem.row] = entering_var;
         self.var_states[entering_var] = VarState::Basic(pivot_elem.row);
@@ -1037,12 +1055,6 @@ impl Solver {
             self.nb_col_sq_norms.push(sq_norm);
         }
     }
-}
-
-#[derive(Clone, Debug)]
-enum VarState {
-    Basic(usize),
-    NonBasic(usize),
 }
 
 #[derive(Debug)]
