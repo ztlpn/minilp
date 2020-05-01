@@ -813,51 +813,80 @@ impl Solver {
         // True if the new obj. coeff. must be nonnegative in a dual-feasible configuration.
         let leaving_diff_sign = leaving_new_val > self.basic_var_vals[row];
 
-        let mut entering_c = None;
-        let mut min_obj_coeff_diff_abs = f64::INFINITY;
-        let mut pivot_coeff_abs = f64::NEG_INFINITY;
-        let mut pivot_coeff = 0.0;
-        for (c, &coeff) in self.row_coeffs.iter() {
-            let var_state = &self.nb_var_states[c];
-            if var_state.at_min && var_state.at_max {
-                // For fixed primal variables dual variables are free:
-                // we can vary obj. coefficient without impacting dual feasibility.
-                continue;
+        fn clamp_obj_coeff(mut obj_coeff: f64, var_state: &NonBasicVarState) -> f64 {
+            if var_state.at_min && obj_coeff < 0.0 {
+                obj_coeff = 0.0;
             }
+            if var_state.at_max && obj_coeff > 0.0 {
+                obj_coeff = 0.0;
+            }
+            obj_coeff
+        }
 
+        let is_eligible_var = |coeff: f64, var_state: &NonBasicVarState| -> bool {
             let entering_diff_sign = if coeff >= EPS {
                 !leaving_diff_sign
             } else if coeff <= -EPS {
                 leaving_diff_sign
             } else {
-                continue;
+                return false;
             };
 
-            if (var_state.at_min && !entering_diff_sign) || (var_state.at_max && entering_diff_sign)
-            {
-                // If the current variable is chosen as entering, obj. value will decrease,
-                // and we want it to increase to reach primal feasibility.
+            if entering_diff_sign {
+                !var_state.at_max
+            } else {
+                !var_state.at_min
+            }
+        };
+
+        // Harris rule. See e.g.
+        // Gill, P. E., Murray, W., Saunders, M. A., & Wright, M. H. (1989).
+        // A practical anti-cycling procedure for linearly constrained optimization.
+        // Mathematical Programming, 45(1-3), 437-474.
+        //
+        // https://link.springer.com/content/pdf/10.1007/BF01589114.pdf
+
+        // First, we determine the max step (change in the leaving variable obj. coeff that still
+        // leaves us with a dual-feasible state) using relaxed bounds.
+        let mut max_step = f64::INFINITY;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            let var_state = &self.nb_var_states[c];
+            if !is_eligible_var(coeff, var_state) {
                 continue;
             }
 
-            let obj_coeff = self.nb_var_obj_coeffs[c];
+            let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], var_state);
+            let cur_step = (obj_coeff.abs() + EPS) / coeff.abs();
+            if cur_step < max_step {
+                max_step = cur_step;
+            }
+        }
+
+        // Second, we choose among the variables satisfying the relaxed step bound
+        // the one with the biggest pivot coefficient. This allows for a much more
+        // numerically stable basis at the price of slight infeasibility in dual variables.
+        let mut entering_c = None;
+        let mut pivot_coeff_abs = f64::NEG_INFINITY;
+        let mut pivot_coeff = 0.0;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            let var_state = &self.nb_var_states[c];
+            if !is_eligible_var(coeff, var_state) {
+                continue;
+            }
+
+            let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], var_state);
+
             // If we change obj. coeff of the leaving variable by this amount,
             // obj. coeff if the current variable will reach the bound of dual infeasibility.
             // Variable with the tightest such bound is the entering variable.
-            let cur_diff_abs = (obj_coeff / coeff).abs();
-
-            // See comments in `choose_pivot_row` concerning numeric stability.
-            let coeff_abs = coeff.abs();
-            let should_choose = cur_diff_abs < min_obj_coeff_diff_abs - EPS
-                || (cur_diff_abs < min_obj_coeff_diff_abs + EPS
-                    && (coeff_abs > pivot_coeff_abs + EPS
-                        || (coeff_abs > pivot_coeff_abs - EPS && c < entering_c.unwrap())));
-
-            if should_choose {
-                entering_c = Some(c);
-                min_obj_coeff_diff_abs = cur_diff_abs;
-                pivot_coeff_abs = coeff_abs;
-                pivot_coeff = coeff;
+            let cur_step = obj_coeff.abs() / coeff.abs();
+            if cur_step <= max_step {
+                let coeff_abs = coeff.abs();
+                if coeff_abs > pivot_coeff_abs {
+                    entering_c = Some(c);
+                    pivot_coeff_abs = coeff_abs;
+                    pivot_coeff = coeff;
+                }
             }
         }
 
