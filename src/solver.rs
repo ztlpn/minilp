@@ -679,9 +679,9 @@ impl Solver {
         };
 
         let entering_cur_val = self.nb_var_vals[entering_c];
-        // If true, variable will increase and the objective function will decrease.
-        let is_positive_direction = self.nb_var_obj_coeffs[entering_c] < 0.0;
-        let entering_other_val = if is_positive_direction {
+        // If true, entering variable will increase (because the objective function must decrease).
+        let entering_diff_sign = self.nb_var_obj_coeffs[entering_c] < 0.0;
+        let entering_other_val = if entering_diff_sign {
             self.orig_var_maxs[self.nb_vars[entering_c]]
         } else {
             self.orig_var_mins[self.nb_vars[entering_c]]
@@ -689,46 +689,77 @@ impl Solver {
 
         self.calc_col_coeffs(entering_c);
 
-        let mut leaving_r = None;
-        let mut min_entering_diff_abs = f64::abs(entering_cur_val - entering_other_val);
-        let mut pivot_coeff = 0.0f64;
-        let mut leaving_new_val = 0.0;
+        let get_leaving_var_step = |r: usize, coeff: f64| -> f64 {
+            let val = self.basic_var_vals[r];
+            // leaving_diff = -entering_diff * coeff. From this we can determine
+            // in which direction this basic var will change and select appropriate bound.
+            let var = self.basic_vars[r];
+            if (entering_diff_sign && coeff < 0.0) || (!entering_diff_sign && coeff > 0.0) {
+                let max = self.orig_var_maxs[var];
+                if val < max {
+                    max - val
+                } else {
+                    0.0
+                }
+            } else {
+                let min = self.orig_var_mins[var];
+                if val > min {
+                    val - min
+                } else {
+                    0.0
+                }
+            }
+        };
+
+        // Harris rule. See e.g.
+        // Gill, P. E., Murray, W., Saunders, M. A., & Wright, M. H. (1989).
+        // A practical anti-cycling procedure for linearly constrained optimization.
+        // Mathematical Programming, 45(1-3), 437-474.
+        //
+        // https://link.springer.com/content/pdf/10.1007/BF01589114.pdf
+
+        // First, we determine the max change in entering variable so that basic variables
+        // remain feasible using relaxed bounds.
+        let mut max_step = (entering_other_val - entering_cur_val).abs();
         for (r, &coeff) in self.col_coeffs.iter() {
-            if coeff.abs() < EPS {
+            let coeff_abs = coeff.abs();
+            if coeff_abs < EPS {
                 continue;
             }
 
-            // leaving_diff = -entering_diff * coeff. From this we can determine
-            // in which direction this basic var will change if we choose it as leaving.
-            let var = self.basic_vars[r];
-            let limit_val = if (is_positive_direction && coeff < 0.0)
-                || (!is_positive_direction && coeff > 0.0)
-            {
-                self.orig_var_maxs[var]
-            } else {
-                self.orig_var_mins[var]
-            };
-
             // By which amount can we change the entering variable so that the limit on this
             // basic var is not violated. The var with the minimum such amount becomes leaving.
-            let entering_diff_abs = f64::abs((limit_val - self.basic_var_vals[r]) / coeff);
+            let cur_step = (get_leaving_var_step(r, coeff) + EPS) / coeff_abs;
+            if cur_step < max_step {
+                max_step = cur_step;
+            }
+        }
 
-            let should_choose = entering_diff_abs < min_entering_diff_abs - EPS
-                || (entering_diff_abs < min_entering_diff_abs + EPS
-                    // There is uncertainty in choosing the leaving variable.
-                    // Choose the one with the biggest absolute coeff for the reasons of
-                    // numerical stability.
-                    && (coeff.abs() > pivot_coeff.abs() + EPS
-                        || coeff.abs() > pivot_coeff.abs() - EPS
-                            // There is still uncertainty, choose based on the column index.
-                            // NOTE: this still doesn't guarantee the absence of cycling.
-                            && leaving_r.is_none() || r < leaving_r.unwrap()));
+        // Second, we choose among variables with steps less than max_step a variable with the biggest
+        // abs. coefficient as the leaving variable. This means that we get numerically more stable
+        // basis at the price of slight infeasibility of some basic variables.
+        let mut leaving_r = None;
+        let mut leaving_new_val = 0.0;
+        let mut pivot_coeff_abs = f64::NEG_INFINITY;
+        let mut pivot_coeff = 0.0;
+        for (r, &coeff) in self.col_coeffs.iter() {
+            let coeff_abs = coeff.abs();
+            if coeff_abs < EPS {
+                continue;
+            }
 
-            if should_choose {
+            let cur_step = get_leaving_var_step(r, coeff) / coeff_abs;
+            if cur_step <= max_step && coeff_abs > pivot_coeff_abs {
                 leaving_r = Some(r);
-                min_entering_diff_abs = entering_diff_abs;
+                leaving_new_val = if (entering_diff_sign && coeff < 0.0)
+                    || (!entering_diff_sign && coeff > 0.0)
+                {
+                    self.orig_var_maxs[self.basic_vars[r]]
+                } else {
+                    self.orig_var_mins[self.basic_vars[r]]
+                };
                 pivot_coeff = coeff;
-                leaving_new_val = limit_val;
+                pivot_coeff_abs = coeff_abs;
             }
         }
 
