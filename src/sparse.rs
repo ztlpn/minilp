@@ -63,7 +63,7 @@ impl ScatteredVec {
     }
 
     #[inline]
-    pub fn get(&mut self, i: usize) -> &f64 {
+    pub fn get(&self, i: usize) -> &f64 {
         &self.values[i]
     }
 

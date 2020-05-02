@@ -33,6 +33,7 @@ pub(crate) struct Solver {
     col_coeffs: SparseVec,
     eta_matrix_coeffs: SparseVec,
     sq_norms_update_helper: ScatteredVec,
+    inv_basis_row_coeffs: SparseVec,
     row_coeffs: ScatteredVec,
 
     // Updated on each pivot
@@ -42,14 +43,15 @@ pub(crate) struct Solver {
     /// For each constraint the corresponding basic var.
     basic_vars: Vec<usize>,
     basic_var_vals: Vec<f64>,
+    dual_edge_sq_norms: Vec<f64>,
 
     /// Remaining variables. (idx -> var), 'nb' means 'non-basic'
     nb_vars: Vec<usize>,
     nb_var_obj_coeffs: Vec<f64>,
     nb_var_vals: Vec<f64>,
-    nb_col_sq_norms: Vec<f64>,
     nb_var_states: Vec<NonBasicVarState>,
     nb_var_is_fixed: Vec<bool>,
+    primal_edge_sq_norms: Vec<f64>,
 
     pub(crate) cur_obj_val: f64,
 }
@@ -87,9 +89,15 @@ impl std::fmt::Debug for Solver {
         write!(f, "orig_rhs:\n{:?}\n", self.orig_rhs)?;
         write!(f, "basic_vars:\n{:?}\n", self.basic_vars)?;
         write!(f, "basic_var_vals:\n{:?}\n", self.basic_var_vals)?;
+        write!(f, "dual_edge_sq_norms:\n{:?}\n", self.dual_edge_sq_norms)?;
         write!(f, "nb_vars:\n{:?}\n", self.nb_vars)?;
         write!(f, "nb_var_vals:\n{:?}\n", self.nb_var_vals)?;
         write!(f, "nb_var_obj_coeffs:\n{:?}\n", self.nb_var_obj_coeffs)?;
+        write!(
+            f,
+            "primal_edge_sq_norms:\n{:?}\n",
+            self.primal_edge_sq_norms
+        )?;
         write!(f, "cur_obj_val: {:?}\n", self.cur_obj_val)?;
         Ok(())
     }
@@ -224,6 +232,12 @@ impl Solver {
             basic_var_vals.push(rhs - lhs_val);
         }
 
+        let dual_edge_sq_norms = if enable_steepest_edge {
+            vec![1.0; basic_vars.len()]
+        } else {
+            vec![]
+        };
+
         let num_constraints = constraint_coeffs.len();
         let num_total_vars = num_vars + num_constraints;
 
@@ -246,7 +260,7 @@ impl Solver {
         let need_artificial_obj = !is_primal_feasible && !is_dual_feasible;
 
         let mut nb_var_obj_coeffs = vec![];
-        let mut nb_col_sq_norms = vec![];
+        let mut primal_edge_sq_norms = vec![];
         for (&var, state) in nb_vars.iter().zip(&nb_var_states) {
             let col = orig_constraints_csc.outer_view(var).unwrap();
 
@@ -264,7 +278,7 @@ impl Solver {
             }
 
             if enable_steepest_edge {
-                nb_col_sq_norms.push(col.squared_l2_norm());
+                primal_edge_sq_norms.push(col.squared_l2_norm() + 1.0);
             }
         }
 
@@ -308,14 +322,16 @@ impl Solver {
             col_coeffs: SparseVec::new(),
             eta_matrix_coeffs: SparseVec::new(),
             sq_norms_update_helper: ScatteredVec::empty(num_total_vars - num_constraints),
+            inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
             var_states,
             basic_vars,
             basic_var_vals,
+            dual_edge_sq_norms,
             nb_vars,
             nb_var_obj_coeffs,
             nb_var_vals,
-            nb_col_sq_norms,
+            primal_edge_sq_norms,
             nb_var_states,
             nb_var_is_fixed,
             cur_obj_val,
@@ -573,8 +589,11 @@ impl Solver {
             // and add its contribution to the sq. norms.
             self.calc_row_coeffs(self.num_constraints() - 1);
 
+            self.dual_edge_sq_norms
+                .push(self.inv_basis_row_coeffs.sq_norm());
+
             for (c, &coeff) in self.row_coeffs.iter() {
-                self.nb_col_sq_norms[c] += coeff * coeff;
+                self.primal_edge_sq_norms[c] += coeff * coeff;
             }
         }
 
@@ -635,11 +654,12 @@ impl Solver {
 
     /// Calculate current coeffs row for a single constraint (permuted according to nb_vars).
     fn calc_row_coeffs(&mut self, r_constr: usize) {
-        let tmp = self
-            .basis_solver
-            .solve_transp(std::iter::once((r_constr, &1.0)));
+        self.basis_solver
+            .solve_transp(std::iter::once((r_constr, &1.0)))
+            .to_sparse_vec(&mut self.inv_basis_row_coeffs);
+
         self.row_coeffs.clear_and_resize(self.nb_vars.len());
-        for (r, &coeff) in tmp.iter() {
+        for (r, &coeff) in self.inv_basis_row_coeffs.iter() {
             for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
                 if let VarState::NonBasic(idx) = self.var_states[v] {
                     *self.row_coeffs.get_mut(idx) += val * coeff;
@@ -660,7 +680,7 @@ impl Solver {
                 }
 
                 let score = if self.enable_steepest_edge {
-                    obj_coeff * obj_coeff / (self.nb_col_sq_norms[col] + 1.0)
+                    obj_coeff * obj_coeff / self.primal_edge_sq_norms[col]
                 } else {
                     obj_coeff.abs()
                 };
@@ -795,7 +815,7 @@ impl Solver {
 
     fn choose_pivot_row_dual(&self) -> Option<(usize, f64)> {
         let mut leaving_r = None;
-        let mut max_infeasibility = f64::NEG_INFINITY;
+        let mut max_score = f64::NEG_INFINITY;
         let mut leaving_new_val = f64::NAN;
         for r in 0..self.num_constraints() {
             let var = self.basic_vars[r];
@@ -821,10 +841,17 @@ impl Solver {
                 continue;
             };
 
-            // Simple heuristic: choose the basic variable with max distance to violated bound.
-            if cur_infeasibility > max_infeasibility {
+            let score = if self.enable_steepest_edge {
+                // Dual steepest edge heuristic.
+                cur_infeasibility * cur_infeasibility / self.dual_edge_sq_norms[r]
+            } else {
+                // Simple heuristic: choose the basic variable with max distance to violated bound.
+                cur_infeasibility
+            };
+
+            if score > max_score {
                 leaving_r = Some(r);
-                max_infeasibility = cur_infeasibility;
+                max_score = score;
                 leaving_new_val = new_val;
             }
         }
@@ -961,6 +988,7 @@ impl Solver {
             return;
         }
         let pivot_elem = pivot_info.elem.as_ref().unwrap();
+        let pivot_coeff = pivot_elem.coeff;
 
         for (r, coeff) in self.col_coeffs.iter() {
             if r == pivot_elem.row {
@@ -977,7 +1005,7 @@ impl Solver {
         leaving_var_state.at_min = pivot_elem.leaving_new_val == self.orig_var_mins[leaving_var];
         leaving_var_state.at_max = pivot_elem.leaving_new_val == self.orig_var_maxs[leaving_var];
 
-        let pivot_obj = self.nb_var_obj_coeffs[pivot_info.col] / pivot_elem.coeff;
+        let pivot_obj = self.nb_var_obj_coeffs[pivot_info.col] / pivot_coeff;
         for (c, &coeff) in self.row_coeffs.iter() {
             if c == pivot_info.col {
                 self.nb_var_obj_coeffs[c] = -pivot_obj;
@@ -986,19 +1014,19 @@ impl Solver {
             }
         }
 
-        self.calc_eta_matrix_coeffs(pivot_elem.row, pivot_elem.coeff);
+        self.calc_eta_matrix_coeffs(pivot_elem.row, pivot_coeff);
 
         if self.enable_steepest_edge {
             // Computations for the steepest edge pivoting rule. See
-            // Vanderbei, Robert J. "Linear Programming: Foundations and Extensions." (2001).
-            // p. 149.
+            // Forrest, J. J., & Goldfarb, D. (1992).
+            // Steepest-edge simplex algorithms for linear programming.
+            // Mathematical programming, 57(1-3), 341-374.
+            //
+            // https://link.springer.com/content/pdf/10.1007/BF01581089.pdf
 
-            let tmp = self
-                .basis_solver
-                .solve_transp(self.eta_matrix_coeffs.iter());
-            // now tmp contains the (w - v)/x_i vector.
+            let tmp = self.basis_solver.solve_transp(self.col_coeffs.iter());
+            // now tmp contains the v vector from the article.
 
-            // Calculate transp(N) * (w - v) / x_1
             self.sq_norms_update_helper.clear();
             for (r, &coeff) in tmp.iter() {
                 for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
@@ -1007,15 +1035,46 @@ impl Solver {
                     }
                 }
             }
+            // now sq_norms_update_helper contains transp(N) * v vector.
 
-            let eta_sq_norm = self.eta_matrix_coeffs.sq_norm();
+            // Calculate pivot_sq_norm directly to avoid loss of precision.
+            let pivot_sq_norm = self.col_coeffs.sq_norm() + 1.0;
+            // assert!((self.primal_edge_sq_norms[pivot_info.col] - pivot_sq_norm).abs() < 0.1);
+
+            let pivot_coeff_sq = pivot_coeff * pivot_coeff;
             for (c, &r_coeff) in self.row_coeffs.iter() {
                 if c == pivot_info.col {
-                    self.nb_col_sq_norms[c] = eta_sq_norm - 1.0 + 2.0 / pivot_elem.coeff;
+                    self.primal_edge_sq_norms[c] = pivot_sq_norm / pivot_coeff_sq;
                 } else {
-                    self.nb_col_sq_norms[c] += -2.0 * r_coeff * self.sq_norms_update_helper.get(c)
-                        + eta_sq_norm * r_coeff * r_coeff;
+                    self.primal_edge_sq_norms[c] +=
+                        -2.0 * r_coeff * self.sq_norms_update_helper.get(c) / pivot_coeff
+                            + pivot_sq_norm * r_coeff * r_coeff / pivot_coeff_sq;
                 }
+
+                assert!(self.primal_edge_sq_norms[c].is_finite());
+            }
+        }
+
+        if self.enable_steepest_edge {
+            // Computations for the dual steepest edge pivoting rule.
+            // See the same reference (Forrest, Goldfarb).
+
+            let tau = self.basis_solver.solve(self.inv_basis_row_coeffs.iter());
+
+            // Calculate pivot_sq_norm directly to avoid loss of precision.
+            let pivot_sq_norm = self.inv_basis_row_coeffs.sq_norm();
+            // assert!((self.dual_edge_sq_norms[pivot_elem.row] - pivot_sq_norm).abs() < 0.1);
+
+            let pivot_coeff_sq = pivot_coeff * pivot_coeff;
+            for (r, &col_coeff) in self.col_coeffs.iter() {
+                if r == pivot_elem.row {
+                    self.dual_edge_sq_norms[r] = pivot_sq_norm / pivot_coeff_sq;
+                } else {
+                    self.dual_edge_sq_norms[r] += -2.0 * col_coeff * tau.get(r) / pivot_coeff
+                        + pivot_sq_norm * col_coeff * col_coeff / pivot_coeff_sq;
+                }
+
+                assert!(self.dual_edge_sq_norms[r].is_finite());
             }
         }
 
@@ -1041,7 +1100,7 @@ impl Solver {
         self.eta_matrix_coeffs.clear();
         for (r, &coeff) in self.col_coeffs.iter() {
             let val = if r == r_leaving {
-                (coeff - 1.0) / pivot_coeff
+                1.0 - 1.0 / pivot_coeff
             } else {
                 coeff / pivot_coeff
             };
@@ -1108,11 +1167,11 @@ impl Solver {
 
     #[allow(dead_code)]
     fn recalc_cur_sq_norms(&mut self) {
-        self.nb_col_sq_norms.clear();
+        self.primal_edge_sq_norms.clear();
         for &var in &self.nb_vars {
             let col = self.orig_constraints_csc.outer_view(var).unwrap();
             let sq_norm = self.basis_solver.solve(col.iter()).sq_norm();
-            self.nb_col_sq_norms.push(sq_norm);
+            self.primal_edge_sq_norms.push(sq_norm);
         }
     }
 }
@@ -1298,11 +1357,12 @@ mod tests {
 
         assert_eq!(&sol.basic_vars, &[2, 3, 4, 5]);
         assert_eq!(&sol.basic_var_vals, &[1.0, -2.0, -3.0, -2.0]);
+        assert_eq!(&sol.dual_edge_sq_norms, &[1.0, 1.0, 1.0, 1.0]);
 
         assert_eq!(&sol.nb_vars, &[0, 1]);
         assert_eq!(&sol.nb_var_obj_coeffs, &[-1.0, 1.0]);
         assert_eq!(&sol.nb_var_vals, &[0.0, 5.0]);
-        assert_eq!(&sol.nb_col_sq_norms, &[3.0, 7.0]);
+        assert_eq!(&sol.primal_edge_sq_norms, &[4.0, 8.0]);
 
         assert_eq!(sol.cur_obj_val, 0.0);
     }
