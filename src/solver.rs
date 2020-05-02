@@ -9,7 +9,7 @@ use sprs::CompressedStorage;
 
 type CsMat = sprs::CsMatI<f64, usize>;
 
-const EPS: f64 = 1e-8;
+const EPS: f64 = 1e-6;
 
 #[derive(Clone)]
 pub(crate) struct Solver {
