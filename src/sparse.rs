@@ -73,8 +73,7 @@ impl ScatteredVec {
 
     #[inline]
     pub fn get_mut(&mut self, i: usize) -> &mut f64 {
-        if !self.is_nonzero[i] {
-            self.is_nonzero[i] = true;
+        if !std::mem::replace(&mut self.is_nonzero[i], true) {
             self.nonzero.push(i);
         }
         &mut self.values[i]
