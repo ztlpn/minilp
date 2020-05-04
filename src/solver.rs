@@ -1180,11 +1180,11 @@ impl Solver {
     }
 
     #[allow(dead_code)]
-    fn recalc_cur_sq_norms(&mut self) {
+    fn recalc_primal_sq_norms(&mut self) {
         self.primal_edge_sq_norms.clear();
         for &var in &self.nb_vars {
             let col = self.orig_constraints_csc.outer_view(var).unwrap();
-            let sq_norm = self.basis_solver.solve(col.iter()).sq_norm();
+            let sq_norm = self.basis_solver.solve(col.iter()).sq_norm() + 1.0;
             self.primal_edge_sq_norms.push(sq_norm);
         }
     }
