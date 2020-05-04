@@ -987,6 +987,7 @@ impl Solver {
             var_state.at_max = pivot_info.entering_new_val == self.orig_var_maxs[entering_var];
             return;
         }
+
         let pivot_elem = pivot_info.elem.as_ref().unwrap();
         let pivot_coeff = pivot_elem.coeff;
 
@@ -1017,65 +1018,8 @@ impl Solver {
         self.calc_eta_matrix_coeffs(pivot_elem.row, pivot_coeff);
 
         if self.enable_steepest_edge {
-            // Computations for the steepest edge pivoting rule. See
-            // Forrest, J. J., & Goldfarb, D. (1992).
-            // Steepest-edge simplex algorithms for linear programming.
-            // Mathematical programming, 57(1-3), 341-374.
-            //
-            // https://link.springer.com/content/pdf/10.1007/BF01581089.pdf
-
-            let tmp = self.basis_solver.solve_transp(self.col_coeffs.iter());
-            // now tmp contains the v vector from the article.
-
-            self.sq_norms_update_helper.clear();
-            for (r, &coeff) in tmp.iter() {
-                for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
-                    if let VarState::NonBasic(idx) = self.var_states[v] {
-                        *self.sq_norms_update_helper.get_mut(idx) += val * coeff;
-                    }
-                }
-            }
-            // now sq_norms_update_helper contains transp(N) * v vector.
-
-            // Calculate pivot_sq_norm directly to avoid loss of precision.
-            let pivot_sq_norm = self.col_coeffs.sq_norm() + 1.0;
-            // assert!((self.primal_edge_sq_norms[pivot_info.col] - pivot_sq_norm).abs() < 0.1);
-
-            let pivot_coeff_sq = pivot_coeff * pivot_coeff;
-            for (c, &r_coeff) in self.row_coeffs.iter() {
-                if c == pivot_info.col {
-                    self.primal_edge_sq_norms[c] = pivot_sq_norm / pivot_coeff_sq;
-                } else {
-                    self.primal_edge_sq_norms[c] +=
-                        -2.0 * r_coeff * self.sq_norms_update_helper.get(c) / pivot_coeff
-                            + pivot_sq_norm * r_coeff * r_coeff / pivot_coeff_sq;
-                }
-
-                assert!(self.primal_edge_sq_norms[c].is_finite());
-            }
-        }
-
-        if self.enable_steepest_edge {
-            // Computations for the dual steepest edge pivoting rule.
-            // See the same reference (Forrest, Goldfarb).
-
-            let tau = self.basis_solver.solve(self.inv_basis_row_coeffs.iter());
-
-            // Calculate pivot_sq_norm directly to avoid loss of precision.
-            let pivot_sq_norm = self.inv_basis_row_coeffs.sq_norm();
-            // assert!((self.dual_edge_sq_norms[pivot_elem.row] - pivot_sq_norm).abs() < 0.1);
-
-            let pivot_coeff_sq = pivot_coeff * pivot_coeff;
-            for (r, &col_coeff) in self.col_coeffs.iter() {
-                if r == pivot_elem.row {
-                    self.dual_edge_sq_norms[r] = pivot_sq_norm / pivot_coeff_sq;
-                } else {
-                    self.dual_edge_sq_norms[r] += -2.0 * col_coeff * tau.get(r) / pivot_coeff
-                        + pivot_sq_norm * col_coeff * col_coeff / pivot_coeff_sq;
-                }
-
-                assert!(self.dual_edge_sq_norms[r].is_finite());
-            }
+            self.update_primal_sq_norms(pivot_info.col, pivot_coeff);
+            self.update_dual_sq_norms(pivot_elem.row, pivot_coeff);
         }
 
         self.basic_vars[pivot_elem.row] = entering_var;
@@ -1105,6 +1049,68 @@ impl Solver {
                 coeff / pivot_coeff
             };
             self.eta_matrix_coeffs.push(r, val);
+        }
+    }
+
+    fn update_primal_sq_norms(&mut self, entering_col: usize, pivot_coeff: f64) {
+        // Computations for the steepest edge pivoting rule. See
+        // Forrest, J. J., & Goldfarb, D. (1992).
+        // Steepest-edge simplex algorithms for linear programming.
+        // Mathematical programming, 57(1-3), 341-374.
+        //
+        // https://link.springer.com/content/pdf/10.1007/BF01581089.pdf
+
+        let tmp = self.basis_solver.solve_transp(self.col_coeffs.iter());
+        // now tmp contains the v vector from the article.
+
+        self.sq_norms_update_helper.clear();
+        for (r, &coeff) in tmp.iter() {
+            for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
+                if let VarState::NonBasic(idx) = self.var_states[v] {
+                    *self.sq_norms_update_helper.get_mut(idx) += val * coeff;
+                }
+            }
+        }
+        // now sq_norms_update_helper contains transp(N) * v vector.
+
+        // Calculate pivot_sq_norm directly to avoid loss of precision.
+        let pivot_sq_norm = self.col_coeffs.sq_norm() + 1.0;
+        // assert!((self.primal_edge_sq_norms[entering_col] - pivot_sq_norm).abs() < 0.1);
+
+        let pivot_coeff_sq = pivot_coeff * pivot_coeff;
+        for (c, &r_coeff) in self.row_coeffs.iter() {
+            if c == entering_col {
+                self.primal_edge_sq_norms[c] = pivot_sq_norm / pivot_coeff_sq;
+            } else {
+                self.primal_edge_sq_norms[c] += -2.0 * r_coeff * self.sq_norms_update_helper.get(c)
+                    / pivot_coeff
+                    + pivot_sq_norm * r_coeff * r_coeff / pivot_coeff_sq;
+            }
+
+            assert!(self.primal_edge_sq_norms[c].is_finite());
+        }
+    }
+
+    fn update_dual_sq_norms(&mut self, leaving_row: usize, pivot_coeff: f64) {
+        // Computations for the dual steepest edge pivoting rule.
+        // See the same reference (Forrest, Goldfarb).
+
+        let tau = self.basis_solver.solve(self.inv_basis_row_coeffs.iter());
+
+        // Calculate pivot_sq_norm directly to avoid loss of precision.
+        let pivot_sq_norm = self.inv_basis_row_coeffs.sq_norm();
+        // assert!((self.dual_edge_sq_norms[leaving_row] - pivot_sq_norm).abs() < 0.1);
+
+        let pivot_coeff_sq = pivot_coeff * pivot_coeff;
+        for (r, &col_coeff) in self.col_coeffs.iter() {
+            if r == leaving_row {
+                self.dual_edge_sq_norms[r] = pivot_sq_norm / pivot_coeff_sq;
+            } else {
+                self.dual_edge_sq_norms[r] += -2.0 * col_coeff * tau.get(r) / pivot_coeff
+                    + pivot_sq_norm * col_coeff * col_coeff / pivot_coeff_sq;
+            }
+
+            assert!(self.dual_edge_sq_norms[r].is_finite());
         }
     }
 
