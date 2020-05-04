@@ -462,7 +462,7 @@ impl Solver {
         self.find_initial_bfs()?;
 
         for iter in 0.. {
-            if iter % 100 == 0 {
+            if iter % 1000 == 0 {
                 let (num_vars, infeasibility) = self.calc_dual_infeasibility();
                 debug!(
                     "optimize iter {}: obj.: {}, non-optimal coeffs: {} ({})",
@@ -487,14 +487,15 @@ impl Solver {
     }
 
     pub(crate) fn restore_feasibility(&mut self) -> Result<(), Error> {
+        let obj_str = if self.is_dual_feasible {
+            "obj."
+        } else {
+            "artificial obj."
+        };
+
         for iter in 0.. {
-            if iter % 100 == 0 {
+            if iter % 1000 == 0 {
                 let (num_vars, infeasibility) = self.calc_primal_infeasibility();
-                let obj_str = if self.is_dual_feasible {
-                    "obj."
-                } else {
-                    "artificial obj."
-                };
                 debug!(
                     "restore feasibility iter {}: {}: {}, infeas. vars: {} ({})",
                     iter, obj_str, self.cur_obj_val, num_vars, infeasibility,
@@ -508,8 +509,9 @@ impl Solver {
                 self.pivot(&pivot_info);
             } else {
                 debug!(
-                    "restored feasibility in {} iterations, obj.: {}",
+                    "restored feasibility in {} iterations, {}: {}",
                     iter + 1,
+                    obj_str,
                     self.cur_obj_val,
                 );
                 break;
