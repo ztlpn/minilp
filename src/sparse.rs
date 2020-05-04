@@ -62,6 +62,10 @@ impl ScatteredVec {
         self.nonzero.iter().map(move |&i| (i, &self.values[i]))
     }
 
+    pub fn indices(&self) -> &[usize] {
+        &self.nonzero
+    }
+
     #[inline]
     pub fn get(&self, i: usize) -> &f64 {
         &self.values[i]

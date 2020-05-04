@@ -32,7 +32,7 @@ pub(crate) struct Solver {
     // Recomputed on each pivot
     col_coeffs: SparseVec,
     eta_matrix_coeffs: SparseVec,
-    sq_norms_update_helper: ScatteredVec,
+    sq_norms_update_helper: Vec<f64>,
     inv_basis_row_coeffs: SparseVec,
     row_coeffs: ScatteredVec,
 
@@ -321,7 +321,7 @@ impl Solver {
             },
             col_coeffs: SparseVec::new(),
             eta_matrix_coeffs: SparseVec::new(),
-            sq_norms_update_helper: ScatteredVec::empty(num_total_vars - num_constraints),
+            sq_norms_update_helper: vec![0.0; num_total_vars - num_constraints],
             inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
             var_states,
@@ -1063,11 +1063,19 @@ impl Solver {
         let tmp = self.basis_solver.solve_transp(self.col_coeffs.iter());
         // now tmp contains the v vector from the article.
 
-        self.sq_norms_update_helper.clear();
+        for &r in tmp.indices() {
+            for &v in self.orig_constraints.outer_view(r).unwrap().indices() {
+                if let VarState::NonBasic(idx) = self.var_states[v] {
+                    self.sq_norms_update_helper[idx] = 0.0;
+                }
+            }
+        }
+        // now significant positions in sq_norms_update_helper are cleared.
+
         for (r, &coeff) in tmp.iter() {
             for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
                 if let VarState::NonBasic(idx) = self.var_states[v] {
-                    *self.sq_norms_update_helper.get_mut(idx) += val * coeff;
+                    self.sq_norms_update_helper[idx] += val * coeff;
                 }
             }
         }
@@ -1082,7 +1090,7 @@ impl Solver {
             if c == entering_col {
                 self.primal_edge_sq_norms[c] = pivot_sq_norm / pivot_coeff_sq;
             } else {
-                self.primal_edge_sq_norms[c] += -2.0 * r_coeff * self.sq_norms_update_helper.get(c)
+                self.primal_edge_sq_norms[c] += -2.0 * r_coeff * self.sq_norms_update_helper[c]
                     / pivot_coeff
                     + pivot_sq_norm * r_coeff * r_coeff / pivot_coeff_sq;
             }
