@@ -25,7 +25,8 @@ pub(crate) struct Solver {
     orig_constraints_csc: CsMat,
     orig_rhs: Vec<f64>,
 
-    enable_steepest_edge: bool,
+    enable_primal_steepest_edge: bool,
+    enable_dual_steepest_edge: bool,
 
     basis_solver: BasisSolver,
 
@@ -232,12 +233,6 @@ impl Solver {
             basic_var_vals.push(rhs - lhs_val);
         }
 
-        let dual_edge_sq_norms = if enable_steepest_edge {
-            vec![1.0; basic_vars.len()]
-        } else {
-            vec![]
-        };
-
         let num_constraints = constraint_coeffs.len();
         let num_total_vars = num_vars + num_constraints;
 
@@ -259,6 +254,22 @@ impl Solver {
 
         let need_artificial_obj = !is_primal_feasible && !is_dual_feasible;
 
+        let enable_dual_steepest_edge = enable_steepest_edge;
+        let dual_edge_sq_norms = if enable_dual_steepest_edge {
+            vec![1.0; basic_vars.len()]
+        } else {
+            vec![]
+        };
+
+        // If is dual feasible at start, we don't need lengthy primal phase2.
+        // Thus we can skip expensive calculations for primal sq. norms.
+        let enable_primal_steepest_edge = enable_steepest_edge && !is_dual_feasible;
+        let sq_norms_update_helper = if enable_primal_steepest_edge {
+            vec![0.0; num_total_vars - num_constraints]
+        } else {
+            vec![]
+        };
+
         let mut nb_var_obj_coeffs = vec![];
         let mut primal_edge_sq_norms = vec![];
         for (&var, state) in nb_vars.iter().zip(&nb_var_states) {
@@ -277,7 +288,7 @@ impl Solver {
                 nb_var_obj_coeffs.push(orig_obj_coeffs[var]);
             }
 
-            if enable_steepest_edge {
+            if enable_primal_steepest_edge {
                 primal_edge_sq_norms.push(col.squared_l2_norm() + 1.0);
             }
         }
@@ -311,7 +322,8 @@ impl Solver {
             orig_constraints,
             orig_constraints_csc,
             orig_rhs,
-            enable_steepest_edge,
+            enable_primal_steepest_edge,
+            enable_dual_steepest_edge,
             basis_solver: BasisSolver {
                 lu_factors,
                 lu_factors_transp,
@@ -321,7 +333,7 @@ impl Solver {
             },
             col_coeffs: SparseVec::new(),
             eta_matrix_coeffs: SparseVec::new(),
-            sq_norms_update_helper: vec![0.0; num_total_vars - num_constraints],
+            sq_norms_update_helper,
             inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
             var_states,
@@ -391,6 +403,7 @@ impl Solver {
         };
         self.nb_var_is_fixed[col] = true;
 
+        self.is_primal_feasible = false;
         self.restore_feasibility()
     }
 
@@ -409,6 +422,7 @@ impl Solver {
 
             // Shouldn't result in error, presumably problem was solvable before this variable
             // was fixed.
+            self.is_dual_feasible = false;
             self.optimize().unwrap();
             true
         } else {
@@ -446,21 +460,24 @@ impl Solver {
         self.num_vars + self.num_constraints()
     }
 
-    fn find_initial_bfs(&mut self) -> Result<(), Error> {
+    pub(crate) fn initial_solve(&mut self) -> Result<(), Error> {
         if !self.is_primal_feasible {
             self.restore_feasibility()?;
-
-            if !self.is_dual_feasible {
-                self.recalc_obj_coeffs();
-            }
         }
+
+        if !self.is_dual_feasible {
+            self.recalc_obj_coeffs();
+            self.optimize()?;
+        }
+
+        // Disable updates of primal sq. norms, because lengthy primal simplex runs
+        // are unlikely after the initial solve.
+        self.enable_primal_steepest_edge = false;
 
         Ok(())
     }
 
-    pub(crate) fn optimize(&mut self) -> Result<(), Error> {
-        self.find_initial_bfs()?;
-
+    fn optimize(&mut self) -> Result<(), Error> {
         for iter in 0.. {
             if iter % 1000 == 0 {
                 let (num_vars, infeasibility) = self.calc_dual_infeasibility();
@@ -486,7 +503,7 @@ impl Solver {
         Ok(())
     }
 
-    pub(crate) fn restore_feasibility(&mut self) -> Result<(), Error> {
+    fn restore_feasibility(&mut self) -> Result<(), Error> {
         let obj_str = if self.is_dual_feasible {
             "obj."
         } else {
@@ -586,19 +603,24 @@ impl Solver {
         self.basis_solver
             .reset(&self.orig_constraints_csc, &self.basic_vars);
 
-        if self.enable_steepest_edge {
+        if self.enable_primal_steepest_edge || self.enable_dual_steepest_edge {
             // existing tableau rows didn't change, so we calc the last row
             // and add its contribution to the sq. norms.
             self.calc_row_coeffs(self.num_constraints() - 1);
 
-            self.dual_edge_sq_norms
-                .push(self.inv_basis_row_coeffs.sq_norm());
+            if self.enable_primal_steepest_edge {
+                for (c, &coeff) in self.row_coeffs.iter() {
+                    self.primal_edge_sq_norms[c] += coeff * coeff;
+                }
+            }
 
-            for (c, &coeff) in self.row_coeffs.iter() {
-                self.primal_edge_sq_norms[c] += coeff * coeff;
+            if self.enable_dual_steepest_edge {
+                self.dual_edge_sq_norms
+                    .push(self.inv_basis_row_coeffs.sq_norm());
             }
         }
 
+        self.is_primal_feasible = false;
         self.restore_feasibility()
     }
 
@@ -681,7 +703,7 @@ impl Solver {
                     continue;
                 }
 
-                let score = if self.enable_steepest_edge {
+                let score = if self.enable_primal_steepest_edge {
                     obj_coeff * obj_coeff / self.primal_edge_sq_norms[col]
                 } else {
                     obj_coeff.abs()
@@ -843,7 +865,7 @@ impl Solver {
                 continue;
             };
 
-            let score = if self.enable_steepest_edge {
+            let score = if self.enable_dual_steepest_edge {
                 // Dual steepest edge heuristic.
                 cur_infeasibility * cur_infeasibility / self.dual_edge_sq_norms[r]
             } else {
@@ -1019,9 +1041,12 @@ impl Solver {
 
         self.calc_eta_matrix_coeffs(pivot_elem.row, pivot_coeff);
 
-        if self.enable_steepest_edge {
-            self.update_primal_sq_norms(pivot_info.col, pivot_coeff);
+        if self.enable_dual_steepest_edge {
             self.update_dual_sq_norms(pivot_elem.row, pivot_coeff);
+        }
+
+        if self.enable_primal_steepest_edge {
+            self.update_primal_sq_norms(pivot_info.col, pivot_coeff);
         }
 
         self.basic_vars[pivot_elem.row] = entering_var;
@@ -1384,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn find_initial_bfs() {
+    fn initial_solve() {
         let mut sol = Solver::try_new(
             &[-3.0, -4.0],
             &[f64::NEG_INFINITY, 5.0],
@@ -1395,17 +1420,17 @@ mod tests {
             ],
         )
         .unwrap();
-        sol.find_initial_bfs().unwrap();
+        sol.initial_solve().unwrap();
 
         assert!(sol.is_primal_feasible);
-        assert!(!sol.is_dual_feasible);
+        assert!(sol.is_dual_feasible);
 
-        assert_eq!(&sol.basic_vars, &[0, 3]);
-        assert_eq!(&sol.basic_var_vals, &[15.0, 15.0]);
-        assert_eq!(&sol.nb_vars, &[2, 1]);
-        assert_eq!(&sol.nb_var_vals, &[0.0, 5.0]);
-        assert_eq!(&sol.nb_var_obj_coeffs, &[3.0, -1.0]);
-        assert_eq!(sol.cur_obj_val, -65.0);
+        assert_eq!(&sol.basic_vars, &[0, 1]);
+        assert_eq!(&sol.basic_var_vals, &[12.0, 8.0]);
+        assert_eq!(&sol.nb_vars, &[2, 3]);
+        assert_eq!(&sol.nb_var_vals, &[0.0, 0.0]);
+        assert_eq!(&sol.nb_var_obj_coeffs, &[3.2, 0.2]);
+        assert_eq!(sol.cur_obj_val, -68.0);
 
         let infeasible = Solver::try_new(
             &[1.0, 1.0],
@@ -1417,7 +1442,7 @@ mod tests {
             ],
         )
         .unwrap()
-        .find_initial_bfs();
+        .initial_solve();
         assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
     }
 }

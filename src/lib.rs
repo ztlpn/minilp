@@ -295,7 +295,7 @@ impl Problem {
             &self.var_maxs,
             &self.constraints,
         )?;
-        solver.optimize()?;
+        solver.initial_solve()?;
         Ok(Solution {
             num_vars: self.obj_coeffs.len(),
             direction: self.direction,
