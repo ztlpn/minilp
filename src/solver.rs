@@ -15,9 +15,6 @@ const EPS: f64 = 1e-6;
 pub(crate) struct Solver {
     pub(crate) num_vars: usize,
 
-    is_primal_feasible: bool,
-    is_dual_feasible: bool,
-
     orig_obj_coeffs: Vec<f64>,
     orig_var_mins: Vec<f64>,
     orig_var_maxs: Vec<f64>,
@@ -28,18 +25,13 @@ pub(crate) struct Solver {
     enable_primal_steepest_edge: bool,
     enable_dual_steepest_edge: bool,
 
-    basis_solver: BasisSolver,
-
-    // Recomputed on each pivot
-    col_coeffs: SparseVec,
-    eta_matrix_coeffs: SparseVec,
-    sq_norms_update_helper: Vec<f64>,
-    inv_basis_row_coeffs: SparseVec,
-    row_coeffs: ScatteredVec,
+    is_primal_feasible: bool,
+    is_dual_feasible: bool,
 
     // Updated on each pivot
     /// For each var: whether it is basic/non-basic and the corresponding index.
     var_states: Vec<VarState>,
+    basis_solver: BasisSolver,
 
     /// For each constraint the corresponding basic var.
     basic_vars: Vec<usize>,
@@ -55,6 +47,12 @@ pub(crate) struct Solver {
     primal_edge_sq_norms: Vec<f64>,
 
     pub(crate) cur_obj_val: f64,
+
+    // Recomputed on each pivot
+    col_coeffs: SparseVec,
+    sq_norms_update_helper: Vec<f64>,
+    inv_basis_row_coeffs: SparseVec,
+    row_coeffs: ScatteredVec,
 }
 
 #[derive(Clone, Debug)]
@@ -314,8 +312,6 @@ impl Solver {
 
         let res = Self {
             num_vars,
-            is_primal_feasible,
-            is_dual_feasible,
             orig_obj_coeffs,
             orig_var_mins,
             orig_var_maxs,
@@ -324,6 +320,9 @@ impl Solver {
             orig_rhs,
             enable_primal_steepest_edge,
             enable_dual_steepest_edge,
+            is_primal_feasible,
+            is_dual_feasible,
+            var_states,
             basis_solver: BasisSolver {
                 lu_factors,
                 lu_factors_transp,
@@ -331,22 +330,20 @@ impl Solver {
                 eta_matrices: EtaMatrices::new(num_constraints),
                 rhs: ScatteredVec::empty(num_constraints),
             },
-            col_coeffs: SparseVec::new(),
-            eta_matrix_coeffs: SparseVec::new(),
-            sq_norms_update_helper,
-            inv_basis_row_coeffs: SparseVec::new(),
-            row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
-            var_states,
             basic_vars,
             basic_var_vals,
             dual_edge_sq_norms,
             nb_vars,
             nb_var_obj_coeffs,
             nb_var_vals,
-            primal_edge_sq_norms,
             nb_var_states,
             nb_var_is_fixed,
+            primal_edge_sq_norms,
             cur_obj_val,
+            col_coeffs: SparseVec::new(),
+            sq_norms_update_helper,
+            inv_basis_row_coeffs: SparseVec::new(),
+            row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
         };
 
         debug!(
@@ -1015,6 +1012,8 @@ impl Solver {
         let pivot_elem = pivot_info.elem.as_ref().unwrap();
         let pivot_coeff = pivot_elem.coeff;
 
+        // Update basic vars stuff
+
         for (r, coeff) in self.col_coeffs.iter() {
             if r == pivot_elem.row {
                 self.basic_var_vals[r] = pivot_info.entering_new_val;
@@ -1022,6 +1021,12 @@ impl Solver {
                 self.basic_var_vals[r] -= pivot_info.entering_diff * coeff;
             }
         }
+
+        if self.enable_dual_steepest_edge {
+            self.update_dual_sq_norms(pivot_elem.row, pivot_coeff);
+        }
+
+        // Update non-basic vars stuff
 
         let leaving_var = self.basic_vars[pivot_elem.row];
 
@@ -1039,15 +1044,11 @@ impl Solver {
             }
         }
 
-        self.calc_eta_matrix_coeffs(pivot_elem.row, pivot_coeff);
-
-        if self.enable_dual_steepest_edge {
-            self.update_dual_sq_norms(pivot_elem.row, pivot_coeff);
-        }
-
         if self.enable_primal_steepest_edge {
             self.update_primal_sq_norms(pivot_info.col, pivot_coeff);
         }
+
+        // Update basis itself
 
         self.basic_vars[pivot_elem.row] = entering_var;
         self.var_states[entering_var] = VarState::Basic(pivot_elem.row);
@@ -1060,22 +1061,10 @@ impl Solver {
         let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
         if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() {
             self.basis_solver
-                .push_eta_matrix(pivot_elem.row, &self.eta_matrix_coeffs);
+                .push_eta_matrix(&self.col_coeffs, pivot_elem.row, pivot_coeff);
         } else {
             self.basis_solver
                 .reset(&self.orig_constraints_csc, &self.basic_vars);
-        }
-    }
-
-    fn calc_eta_matrix_coeffs(&mut self, r_leaving: usize, pivot_coeff: f64) {
-        self.eta_matrix_coeffs.clear();
-        for (r, &coeff) in self.col_coeffs.iter() {
-            let val = if r == r_leaving {
-                1.0 - 1.0 / pivot_coeff
-            } else {
-                coeff / pivot_coeff
-            };
-            self.eta_matrix_coeffs.push(r, val);
         }
     }
 
@@ -1247,7 +1236,15 @@ struct BasisSolver {
 }
 
 impl BasisSolver {
-    fn push_eta_matrix(&mut self, r_leaving: usize, coeffs: &SparseVec) {
+    fn push_eta_matrix(&mut self, col_coeffs: &SparseVec, r_leaving: usize, pivot_coeff: f64) {
+        let coeffs = col_coeffs.iter().map(|(r, &coeff)| {
+            let val = if r == r_leaving {
+                1.0 - 1.0 / pivot_coeff
+            } else {
+                coeff / pivot_coeff
+            };
+            (r, val)
+        });
         self.eta_matrices.push(r_leaving, coeffs);
     }
 
@@ -1329,9 +1326,9 @@ impl EtaMatrices {
         self.coeff_cols.clear_and_resize(n_rows);
     }
 
-    fn push(&mut self, leaving_row: usize, coeffs: &SparseVec) {
+    fn push(&mut self, leaving_row: usize, coeffs: impl Iterator<Item = (usize, f64)>) {
         self.leaving_rows.push(leaving_row);
-        self.coeff_cols.append_col(coeffs.iter());
+        self.coeff_cols.append_col(coeffs);
     }
 }
 

@@ -202,12 +202,12 @@ impl SparseMat {
             .zip(self.col_data(i_col))
     }
 
-    pub(crate) fn append_col<'a, T>(&mut self, col: T)
+    pub(crate) fn append_col<T>(&mut self, col: T)
     where
-        T: IntoIterator<Item = (usize, &'a f64)>,
+        T: IntoIterator<Item = (usize, f64)>,
     {
         assert_eq!(*self.indptr.last().unwrap(), self.indices.len()); // prev column is sealed
-        for (idx, &val) in col {
+        for (idx, val) in col {
             self.indices.push(idx);
             self.data.push(val);
         }
