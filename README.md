@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/minilp.svg)](https://crates.io/crates/minilp)
 [![Documentation](https://docs.rs/minilp/badge.svg)](https://docs.rs/minilp/)
 
-A library for solving linear programming problems.
+A fast linear programming solver library.
 
 [Linear programming](https://en.wikipedia.org/wiki/Linear_programming) is a technique for
 finding the minimum (or maximum) of a linear function of a set of continuous variables
@@ -17,7 +17,7 @@ subject to linear equality and inequality constraints.
 * Problems can be defined via an API or parsed from an
   [MPS](https://en.wikipedia.org/wiki/MPS_(format)) file.
 
-Warning: this is an early-stage project. Although the library is already quite powerful,
+Warning: this is an early-stage project. Although the library is already quite powerful and fast,
 it will probably cycle, lose precision or panic on some harder problems. Please report
 bugs and contribute code!
 

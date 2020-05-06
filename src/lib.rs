@@ -1,5 +1,5 @@
 /*!
-A library for solving linear programming problems.
+A fast linear programming solver library.
 
 [Linear programming](https://en.wikipedia.org/wiki/Linear_programming) is a technique for
 finding the minimum (or maximum) of a linear function of a set of continuous variables
