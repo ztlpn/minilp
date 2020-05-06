@@ -36,6 +36,8 @@ pub(crate) struct Solver {
     /// For each constraint the corresponding basic var.
     basic_vars: Vec<usize>,
     basic_var_vals: Vec<f64>,
+    basic_var_mins: Vec<f64>,
+    basic_var_maxs: Vec<f64>,
     dual_edge_sq_norms: Vec<f64>,
 
     /// Remaining variables. (idx -> var), 'nb' means 'non-basic'
@@ -190,6 +192,8 @@ impl Solver {
         // Initially, all slack vars are basic.
         let mut basic_vars = vec![];
         let mut basic_var_vals = vec![];
+        let mut basic_var_mins = vec![];
+        let mut basic_var_maxs = vec![];
 
         for (coeffs, cmp_op, rhs) in constraints {
             let rhs = *rhs;
@@ -220,6 +224,9 @@ impl Solver {
             orig_var_mins.push(slack_var_min);
             orig_var_maxs.push(slack_var_max);
 
+            basic_var_mins.push(slack_var_min);
+            basic_var_maxs.push(slack_var_max);
+
             let cur_slack_var = var_states.len();
             var_states.push(VarState::Basic(basic_vars.len()));
             basic_vars.push(cur_slack_var);
@@ -245,10 +252,11 @@ impl Solver {
         }
         let orig_constraints_csc = orig_constraints.to_csc();
 
-        let is_primal_feasible = basic_vars
+        let is_primal_feasible = basic_var_vals
             .iter()
-            .zip(&basic_var_vals)
-            .all(|(&var, &val)| val >= orig_var_mins[var] && val <= orig_var_maxs[var]);
+            .zip(&basic_var_mins)
+            .zip(&basic_var_maxs)
+            .all(|((&val, &min), &max)| val >= min && val <= max);
 
         let need_artificial_obj = !is_primal_feasible && !is_dual_feasible;
 
@@ -332,6 +340,8 @@ impl Solver {
             },
             basic_vars,
             basic_var_vals,
+            basic_var_mins,
+            basic_var_maxs,
             dual_edge_sq_norms,
             nb_vars,
             nb_var_obj_coeffs,
@@ -571,6 +581,8 @@ impl Solver {
         self.orig_var_maxs.push(slack_var_max);
         self.var_states.push(VarState::Basic(self.basic_vars.len()));
         self.basic_vars.push(slack_var);
+        self.basic_var_mins.push(slack_var_min);
+        self.basic_var_maxs.push(slack_var_max);
 
         let mut lhs_val = 0.0;
         for (var, &coeff) in coeffs.iter() {
@@ -625,13 +637,18 @@ impl Solver {
     fn calc_primal_infeasibility(&self) -> (usize, f64) {
         let mut num_vars = 0;
         let mut infeasibility = 0.0;
-        for (&var, &val) in self.basic_vars.iter().zip(&self.basic_var_vals) {
-            if val < self.orig_var_mins[var] - EPS {
+        for ((&val, &min), &max) in self
+            .basic_var_vals
+            .iter()
+            .zip(&self.basic_var_mins)
+            .zip(&self.basic_var_maxs)
+        {
+            if val < min - EPS {
                 num_vars += 1;
-                infeasibility += self.orig_var_mins[var] - val;
-            } else if val > self.orig_var_maxs[var] + EPS {
+                infeasibility += min - val;
+            } else if val > max + EPS {
                 num_vars += 1;
-                infeasibility += val - self.orig_var_maxs[var];
+                infeasibility += val - max;
             }
         }
         (num_vars, infeasibility)
@@ -734,16 +751,15 @@ impl Solver {
             let val = self.basic_var_vals[r];
             // leaving_diff = -entering_diff * coeff. From this we can determine
             // in which direction this basic var will change and select appropriate bound.
-            let var = self.basic_vars[r];
             if (entering_diff_sign && coeff < 0.0) || (!entering_diff_sign && coeff > 0.0) {
-                let max = self.orig_var_maxs[var];
+                let max = self.basic_var_maxs[r];
                 if val < max {
                     max - val
                 } else {
                     0.0
                 }
             } else {
-                let min = self.orig_var_mins[var];
+                let min = self.basic_var_mins[r];
                 if val > min {
                     val - min
                 } else {
@@ -795,9 +811,9 @@ impl Solver {
                 leaving_new_val = if (entering_diff_sign && coeff < 0.0)
                     || (!entering_diff_sign && coeff > 0.0)
                 {
-                    self.orig_var_maxs[self.basic_vars[r]]
+                    self.basic_var_maxs[r]
                 } else {
-                    self.orig_var_mins[self.basic_vars[r]]
+                    self.basic_var_mins[r]
                 };
                 pivot_coeff = coeff;
                 pivot_coeff_abs = coeff_abs;
@@ -835,14 +851,47 @@ impl Solver {
     }
 
     fn choose_pivot_row_dual(&self) -> Option<(usize, f64)> {
+        let infeasibilities = self
+            .basic_var_vals
+            .iter()
+            .zip(&self.basic_var_mins)
+            .zip(&self.basic_var_maxs)
+            .enumerate()
+            .filter_map(|(r, ((&val, &min), &max))| {
+                if val < min - EPS {
+                    Some((r, min - val))
+                } else if val > max + EPS {
+                    Some((r, val - max))
+                } else {
+                    None
+                }
+            });
+
         let mut leaving_r = None;
         let mut max_score = f64::NEG_INFINITY;
-        let mut leaving_new_val = f64::NAN;
-        for r in 0..self.num_constraints() {
-            let var = self.basic_vars[r];
+        if self.enable_dual_steepest_edge {
+            for (r, infeasibility) in infeasibilities {
+                let sq_norm = self.dual_edge_sq_norms[r];
+                let score = infeasibility * infeasibility / sq_norm;
+                if score > max_score {
+                    leaving_r = Some(r);
+                    max_score = score;
+                }
+            }
+        } else {
+            for (r, infeasibility) in infeasibilities {
+                if infeasibility > max_score {
+                    leaving_r = Some(r);
+                    max_score = infeasibility;
+                }
+            }
+        }
+
+        leaving_r.map(|r| {
             let val = self.basic_var_vals[r];
-            let min = self.orig_var_mins[var];
-            let max = self.orig_var_maxs[var];
+            let min = self.basic_var_mins[r];
+            let max = self.basic_var_maxs[r];
+
             // If we choose this var as leaving, its new val will be at the boundary
             // which is violated.
             // Why is that? We must maintain primal optimality (a.k.a. dual feasibility) for
@@ -854,34 +903,15 @@ impl Solver {
             // must be >= 0, we conclude that sign(new_obj_coeff) = sign(leaving_diff).
             // From this we see that if old val was < min, dual feasibility is maintained if the
             // new var is min (analogously for max).
-            let (cur_infeasibility, new_val) = if val < min - EPS {
-                (min - val, min)
-            } else if val > max + EPS {
-                (val - max, max)
+            let new_val = if val < min {
+                min
+            } else if val > max {
+                max
             } else {
-                continue;
+                unreachable!();
             };
-
-            let score = if self.enable_dual_steepest_edge {
-                // Dual steepest edge heuristic.
-                cur_infeasibility * cur_infeasibility / self.dual_edge_sq_norms[r]
-            } else {
-                // Simple heuristic: choose the basic variable with max distance to violated bound.
-                cur_infeasibility
-            };
-
-            if score > max_score {
-                leaving_r = Some(r);
-                max_score = score;
-                leaving_new_val = new_val;
-            }
-        }
-
-        if let Some(r) = leaving_r {
-            Some((r, leaving_new_val))
-        } else {
-            None
-        }
+            (r, new_val)
+        })
     }
 
     fn choose_entering_col_dual(
@@ -1021,6 +1051,9 @@ impl Solver {
                 self.basic_var_vals[r] -= pivot_info.entering_diff * coeff;
             }
         }
+
+        self.basic_var_mins[pivot_elem.row] = self.orig_var_mins[entering_var];
+        self.basic_var_maxs[pivot_elem.row] = self.orig_var_maxs[entering_var];
 
         if self.enable_dual_steepest_edge {
             self.update_dual_sq_norms(pivot_elem.row, pivot_coeff);
