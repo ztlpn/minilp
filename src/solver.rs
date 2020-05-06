@@ -658,22 +658,8 @@ impl Solver {
     fn calc_dual_infeasibility(&self) -> (usize, f64) {
         let mut num_vars = 0;
         let mut infeasibility = 0.0;
-        for ((&var, &val), &obj_coeff) in self
-            .nb_vars
-            .iter()
-            .zip(&self.nb_var_vals)
-            .zip(&self.nb_var_obj_coeffs)
-        {
-            let min = self.orig_var_mins[var];
-            let max = self.orig_var_maxs[var];
-            if min == max {
-                continue;
-            } else if min.is_finite() || max.is_finite() {
-                if (val == min && obj_coeff <= -EPS) || (val == max && obj_coeff >= EPS) {
-                    num_vars += 1;
-                    infeasibility += obj_coeff.abs();
-                }
-            } else {
+        for (&obj_coeff, var_state) in self.nb_var_obj_coeffs.iter().zip(&self.nb_var_states) {
+            if !(var_state.at_min && obj_coeff > -EPS) && !(var_state.at_max && obj_coeff < EPS) {
                 num_vars += 1;
                 infeasibility += obj_coeff.abs();
             }
@@ -708,24 +694,40 @@ impl Solver {
 
     fn choose_pivot(&mut self) -> Result<Option<PivotInfo>, Error> {
         let entering_c = {
+            let filtered_obj_coeffs = self
+                .nb_var_obj_coeffs
+                .iter()
+                .zip(&self.nb_var_states)
+                .enumerate()
+                .filter_map(|(col, (&obj_coeff, var_state))| {
+                    // Choose only among non-basic vars that can be changed
+                    // with objective decreasing.
+                    if (var_state.at_min && obj_coeff > -EPS)
+                        || (var_state.at_max && obj_coeff < EPS)
+                    {
+                        None
+                    } else {
+                        Some((col, obj_coeff))
+                    }
+                });
+
             let mut best_col = None;
             let mut best_score = f64::NEG_INFINITY;
-            for (col, &obj_coeff) in self.nb_var_obj_coeffs.iter().enumerate() {
-                // Choose only among non-basic vars that can be changed with objective decreasing.
-                let var_state = &self.nb_var_states[col];
-                if (var_state.at_min && obj_coeff > -EPS) || (var_state.at_max && obj_coeff < EPS) {
-                    continue;
+            if self.enable_primal_steepest_edge {
+                for (col, obj_coeff) in filtered_obj_coeffs {
+                    let score = obj_coeff * obj_coeff / self.primal_edge_sq_norms[col];
+                    if score > best_score {
+                        best_col = Some(col);
+                        best_score = score;
+                    }
                 }
-
-                let score = if self.enable_primal_steepest_edge {
-                    obj_coeff * obj_coeff / self.primal_edge_sq_norms[col]
-                } else {
-                    obj_coeff.abs()
-                };
-
-                if score > best_score {
-                    best_col = Some(col);
-                    best_score = score;
+            } else {
+                for (col, obj_coeff) in filtered_obj_coeffs {
+                    let score = obj_coeff.abs();
+                    if score > best_score {
+                        best_col = Some(col);
+                        best_score = score;
+                    }
                 }
             }
 
